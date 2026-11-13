@@ -91,6 +91,42 @@ pub const Buf = struct {
     pub const empty: Buf = .{ .ptr = undefined, .len = 0 };
 };
 
+/// Storage format of one full-attention layer's KV cache rows.
+///
+/// `f32` is the historical layout (one float per element).  `f16` is the
+/// default: 2 B/elem, 10-bit mantissa, near-lossless for post-norm K/V
+/// values.  `q8_0`/`q4_0` reuse the project's OWN block layouts (the same
+/// ones the weight tensors use): 34 B per 32 elements (f16 `d` + 32 x i8,
+/// dequant `d*q`) and 18 B per 32 elements (f16 `d` + 16 nibbles, symmetric
+/// `(q-8)*d`) -- see `quant_dequant.zig` for the canonical formulas.  The
+/// block types need `kv_dim % 32 == 0` (`kvTypeFits`); every model has it,
+/// because `kv_dim` is a multiple of `head_dim` and `head_dim` of 64.
+pub const KvType = enum { f32, f16, q8_0, q4_0 };
+
+/// Bytes of ONE KV row (one token, `kv_dim` elements) in format `t`.
+pub fn kvRowBytes(kv_dim: usize, t: KvType) usize {
+    return switch (t) {
+        .f32 => kv_dim * @sizeOf(f32),
+        .f16 => kv_dim * 2,
+        .q8_0 => (kv_dim / 32) * 34,
+        .q4_0 => (kv_dim / 32) * 18,
+    };
+}
+
+/// Whether a `kv_dim`-wide row is representable in format `t`.
+pub fn kvTypeFits(kv_dim: usize, t: KvType) bool {
+    return switch (t) {
+        .f32, .f16 => true,
+        .q8_0, .q4_0 => kv_dim % 32 == 0,
+    };
+}
+
+/// The two halves of one layer's KV cache, as the engine sees them.
+pub const KvRegion = struct {
+    k: Buf,
+    v: Buf,
+};
+
 /// Errors every backend can report while loading weights.
 pub const LoadError = error{
     MissingTensor,
@@ -144,6 +180,37 @@ pub const Exec = struct {
         /// backend allocates on the device.  Regions live as long as the model
         /// run, released by `freeScratch` (all of them at once).
         allocBuf: *const fn (ctx: *anyopaque, len: usize) anyerror!Buf,
+
+        // ---- KV cache -------------------------------------------------------
+        //
+        // The full-attention KV cache is the one backend-owned region whose
+        // LAYOUT depends on a model-level choice (`KvType`), so the engine
+        // never does pointer arithmetic on it: it allocates through `allocKv`,
+        // writes rows through `kvAppend`, and hands the WHOLE regions to
+        // `attnDecode`/`attnChunk` (which already carry `slot`/`slot0` and
+        // `kv_dim`, and so know how many rows are live).  `Buf.len` on the
+        // returned regions is in f32 units (`ceil(bytes/4)`); only the
+        // backend interprets the bytes.
+
+        /// Storage format for this model's KV cache.  Must be set before the
+        /// first `allocKv`/`kvAppend`/attention call; the backend keeps it for
+        /// the whole run (one model load has one format).
+        setKvType: *const fn (ctx: *anyopaque, t: KvType) void,
+        /// Allocate one layer's KV cache: `max_seq` rows of `kv_dim` elements,
+        /// in the format `setKvType` chose.  Replaces the historical two
+        /// `allocBuf(max_seq * kv_dim)` calls; only the backend knows the
+        /// format-dependent byte size.
+        allocKv: *const fn (ctx: *anyopaque, kv_dim: usize, max_seq: usize) anyerror!KvRegion,
+        /// Quantize `rows` f32 rows (in `src`, `kv_dim` wide, row-major) into
+        /// the cache `dst` starting at row `slot`.  `dst` is the layer's WHOLE
+        /// k or v region -- the backend strides it by its own row bytes, so the
+        /// caller does no format-dependent arithmetic.
+        ///
+        /// Decode calls this with `rows = 1` per token; on a graph-replaying
+        /// backend the destination advances one row per token exactly like the
+        /// historical `copyRangeSlot` KV append (which this replaces).  Prefill
+        /// calls it with `rows = k` for the chunk, outside any capture.
+        kvAppend: *const fn (ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void,
 
         // ---- dequantization -------------------------------------------------
         /// Expand one row of a packed weight into `dst` (f32, `cols` wide).
@@ -325,8 +392,9 @@ pub const Exec = struct {
 
         /// Full-attention decode for one token: scores against the KV rows,
         /// softmax, PV accumulation into `gout`, then the sigmoid gate.  `kcache`
-        /// / `vcache` are this layer's KV rows (`kv_dim` wide per token,
-        /// `slot+1` tokens already written).
+        /// / `vcache` are this layer's WHOLE KV regions (`kv_dim` elements per
+        /// token row, `slot+1` rows written so far); the backend strides them in
+        /// its own `KvType` layout.
         attnDecode: *const fn (ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
             kv_dim: usize, scale: f32) void,
@@ -341,8 +409,9 @@ pub const Exec = struct {
         ///
         /// PRECONDITIONS the caller owns (this does the score/softmax/PV/gate
         /// only): q/k RoPE, q_norm/k_norm and the [q|gate] deinterleave are done
-        /// chunk-wide already, and `kcache`/`vcache` hold rows `[0, slot0+rows)`
-        /// (the chunk's own k/v included).  `att` is scratch, unused by the CUDA
+        /// chunk-wide already, and `kcache`/`vcache` are the layer's WHOLE
+        /// regions, holding rows `[0, slot0+rows)` (the chunk's own k/v
+        /// included).  `att` is scratch, unused by the CUDA
         /// path; a backend may need it and may grow it.
         ///
         /// Equivalent to calling `attnDecode` once per row with
@@ -381,7 +450,7 @@ pub const Exec = struct {
             tokens: usize, conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
             ab_stride: usize, gamma_stride: usize,
             kq_dim: usize, nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void,
-        /// Region-to-region copy (KV writes, MTP state snapshots): a device
+        /// Region-to-region copy (KV writes, GDN state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
         /// `copyRange` whose destination advances once per token: the KV cache
@@ -423,7 +492,7 @@ pub const Exec = struct {
         /// the backend, which `gdnStepRows` now takes as `Buf`s and reads on
         /// the device.  It survives for diagnostics and for callers that
         /// genuinely need a host copy of a small region (tests, `QWEN35_DUMP_*`
-        /// style tooling, MTP debug paths).  Never use it to bring activations
+        /// style tooling, debug paths).  Never use it to bring activations
         /// back -- that is what P2c removed, and a device->host copy also
         /// serialises the stream.
         copyToHost: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
@@ -540,6 +609,17 @@ pub const Exec = struct {
     }
     pub fn allocBuf(self: Exec, len: usize) anyerror!Buf {
         return self.vtable.allocBuf(self.ptr, len);
+    }
+    pub fn setKvType(self: Exec, t: KvType) void {
+        self.vtable.setKvType(self.ptr, t);
+    }
+    pub fn allocKv(self: Exec, kv_dim: usize, max_seq: usize) anyerror!KvRegion {
+        return self.vtable.allocKv(self.ptr, kv_dim, max_seq);
+    }
+    /// Quantize `rows` f32 rows into the KV cache `dst` at row `slot`; see
+    /// `VTable.kvAppend`.
+    pub fn kvAppend(self: Exec, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+        self.vtable.kvAppend(self.ptr, dst, src, slot, kv_dim, rows);
     }
     pub fn dequantRow(self: Exec, dst: Buf, w: QuantRow, row: usize) void {
         self.vtable.dequantRow(self.ptr, dst, w, row);

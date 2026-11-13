@@ -288,6 +288,11 @@ pub fn build(b: *std.Build) void {
         // change the AVX2 kernels' output). Dispatch is runtime
         // (cpu_has_avx512_vnni()).
         .{ .name = "qwen35_kernels_avx512", .file = "src/kernels/x86/kernels512.c", .isa = .avx512 },
+        // KV-cache row quantize/dequant (f16 / q4_0; the q8_0 quantize is
+        // quantize_q8_0 in kernels32.c).  Scalar: the rows are written once
+        // per token (decode) or once per chunk (prefill), so the element-wise
+        // f16 cast is the whole kernel — there is no reduction to SIMD.
+        .{ .name = "qwen35_kv_kernels", .file = "src/kernels/x86/kv.c", .isa = .baseline },
         // Table cross-check: reads the tables through the extern declarations
         // and counts mismatches against upstream anchors. Baseline ISA on
         // purpose -- it must link even when no SIMD tier is available.

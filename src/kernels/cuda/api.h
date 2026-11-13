@@ -330,6 +330,15 @@ int q35_launch_gdn_gamma_rows(const float *d_a_raw, float *d_b_raw,
                               float *d_gamma, int nv, int tokens, int a_stride,
                               int b_stride, int gamma_stride, void *stream);
 
+// --- KV-cache quantize (src/kernels/cuda/convert.cu) -----------------------
+// f32 rows -> the cache byte layout, one thread per 32-element block.
+// `nblocks` counts 32-element blocks; `kind` is 0=f16, 1=block_q8_0,
+// 2=block_q4_0 (block bytes 64/34/18).  Byte-identical to the CPU's
+// `q35_kv_quant_*`; the attention kernels decode it with `q35_kv_block_elem`.
+int q35_launch_kv_quant(const float *d_x, void *d_out, int nblocks, int kind,
+                        void *stream);
+void *q35_func_kv_quant(void);
+
 // --- Full-attention decode -------------------------------------------------
 // scores(q,K) -> softmax -> P.V -> sigmoid gate, for every head, in ONE launch.
 // d_q / d_gate / d_gout are heads*hd; d_kcache / d_vcache are (slot+1) rows of
@@ -338,7 +347,7 @@ int q35_launch_attn_decode(const float *d_q, const float *d_gate,
                            const float *d_kcache, const float *d_vcache,
                            float *d_att, float *d_gout, int slot, int heads,
                            int gqa, int hd, int kv_dim, float scale,
-                           void *stream);
+                           int kv_kind, void *stream);
 
 // Chunk-wide causal attention for PREFILL: one launch for `rows` tokens instead
 // of `rows` launches.  `d_q`/`d_gate`/`d_gout` are `rows * heads * hd` (row r at
@@ -355,7 +364,7 @@ int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
                           const float *d_kcache, const float *d_vcache,
                           float *d_gout, int slot0, int rows, int heads,
                           int gqa, int hd, int kv_dim, float scale,
-                          void *stream);
+                          int kv_kind, void *stream);
 int q35_attn_chunk_max_rows(int slot0);
 
 // Same kernel, but `slot` is read from DEVICE memory (`d_slot`, one int) and the
@@ -372,7 +381,7 @@ int q35_launch_attn_decode_dyn(const float *d_q, const float *d_gate,
                                const float *d_kcache, const float *d_vcache,
                                float *d_att, float *d_gout, const int *d_slot,
                                int heads, int gqa, int hd, int kv_dim,
-                               float scale, void *stream);
+                               float scale, int kv_kind, void *stream);
 
 // Warp-tiled decode attention: the row loop is re-tiled so a warp reads ONE
 // contiguous run of a KV row instead of 32 rows 4 KB apart (which over-fetches
@@ -384,7 +393,7 @@ int q35_launch_attn_decode_coal(const float *d_q, const float *d_gate,
                                 const float *d_kcache, const float *d_vcache,
                                 float *d_att, float *d_gout, int slot, int heads,
                                 int gqa, int hd, int kv_dim, float scale,
-                                void *stream);
+                                int kv_kind, void *stream);
 
 // Split decode attention: BOTH walks (score and PV) divide the row range across
 // `split` blocks per head, so the kernel stops being 24-blocks-on-114-SMs.
@@ -405,13 +414,13 @@ int q35_launch_attn_decode_split_dyn(const float *d_q, const float *d_gate,
                                      float *d_att, float *d_gout, float *d_part,
                                      const int *d_slot, int heads, int gqa, int hd,
                                      int kv_dim, float scale, int split,
-                                     void *stream);
+                                     int kv_kind, void *stream);
 int q35_launch_attn_decode_split2(const float *d_q, const float *d_gate,
                                   const float *d_kcache, const float *d_vcache,
                                   float *d_att, float *d_gout, float *d_part,
                                   int slot, int heads, int gqa, int hd,
                                   int kv_dim, float scale, int split,
-                                  void *stream);
+                                  int kv_kind, void *stream);
 
 // --- IQ codebook upload (call ONCE, before the first IQ kernel) -------------
 //

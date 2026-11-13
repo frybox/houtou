@@ -51,6 +51,16 @@ test {
     _ = @import("simd_tests256.zig");
 }
 
+// KV-cache type support (`--kv-type f32|f16|q8_0|q4_0`): the C row
+// quantize/dequant kernels (src/kernels/x86/kv.c) are checked against the
+// weight-side oracles in quant_dequant.zig (byte-exact where the pair was
+// written expression-for-expression, bit-exact dequant on shared bytes), and
+// the dequant-on-read attention path (`backend_cpu.attnDecodeKv`) against the
+// f32 reference within each format's element error bound.
+test {
+    _ = @import("kv_tests.zig");
+}
+
 test {
     _ = @import("simd_tests_iq_a.zig");
 }

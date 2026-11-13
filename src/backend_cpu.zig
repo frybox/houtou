@@ -17,6 +17,7 @@ const quant = @import("quant_dequant.zig");
 const pool_mod = @import("pool.zig");
 const simd = @import("simd_dispatch.zig");
 const simd_api = @import("simd_api.zig");
+const c_kernels = @import("c_kernels.zig");
 
 const LinearW = backend.LinearW;
 const QuantRow = backend.QuantRow;
@@ -678,6 +679,98 @@ pub fn dequantRowInto(dst: []f32, w: QuantRow, row: usize) void {
     }
 }
 
+/// Dequantized K/V rows for quantized-KV attention: one f32 row of K and of
+/// V per cached token, so `attnDecodeKv` can run the f32 attention oracle
+/// unchanged over the byte-packed cache.  Grown by `ensure`; the CPU backend
+/// sizes it in `vAllocKv` (the only call that knows `max_seq`).
+pub const KvDequantScratch = struct {
+    k: []f32 = &.{},
+    v: []f32 = &.{},
+
+    pub fn ensure(self: *KvDequantScratch, alloc: std.mem.Allocator, rows: usize) anyerror!void {
+        if (self.k.len >= rows) return;
+        if (self.k.len > 0) alloc.free(self.k);
+        if (self.v.len > 0) alloc.free(self.v);
+        self.k = try alloc.alloc(f32, rows);
+        self.v = try alloc.alloc(f32, rows);
+    }
+};
+
+/// Quantize `rows` f32 rows (each `kv_dim` wide, row-major in `src`) into
+/// `dst` starting at row `slot`, per `kv_type`.  `dst` is the layer's WHOLE
+/// k/v region: an f32 view over the backend's byte allocation
+/// (`len = ceil(bytes/4)`), so this does the byte math — f32 is the plain
+/// f32 row copy, the packed formats go through the C kernels (the q8_0
+/// quantize is the weight-side `quantize_q8_0`).  Public so the row
+/// addressing is testable without a live backend; `vKvAppend` is a thin
+/// wrapper over it.
+pub fn kvAppendRows(
+    kv_type: backend.KvType,
+    dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize,
+) void {
+    const src_f: [*]const f32 = src.slice().ptr;
+    const dst_f: [*]f32 = dst.slice().ptr;
+    const dst_b: [*]u8 = @ptrCast(dst_f);
+    const row_bytes = backend.kvRowBytes(kv_dim, kv_type);
+    for (0..rows) |r| {
+        const s = src_f[r * kv_dim ..][0..kv_dim];
+        const df = dst_f + (slot + r) * kv_dim;
+        const db = dst_b + (slot + r) * row_bytes;
+        switch (kv_type) {
+            .f32 => @memcpy(df[0..kv_dim], s),
+            .f16 => c_kernels.kvQuantF16(kv_dim, s.ptr, db),
+            .q8_0 => c_kernels.quantizeQ8_0(kv_dim, s.ptr, db),
+            .q4_0 => c_kernels.kvQuantQ4_0(kv_dim, s.ptr, db),
+        }
+    }
+}
+
+/// Dequant-on-read attention over a byte-packed KV cache in format
+/// `kv_type`: rows `[0, slot]` of `kcache_b` / `vcache_b` (each
+/// `kvRowBytes(kv_dim, kv_type)` bytes per row, row-major) are expanded into
+/// f32 rows in `scratch.k` / `scratch.v` by the C kernels
+/// (`q35_kv_dequant_f16/q8_0/q4_0`), then the f32 oracle
+/// (`ew.bufAttnDecode`, the same loop as `ew.bufAttnDecode`'s
+/// `attnDecodeKernel`) runs over those rows — so only the K/V reads change
+/// from the f32 path.
+///
+/// `scratch` must already hold at least `(slot+1)*kv_dim` rows: on the CPU
+/// backend `vAllocKv` sized it (the only call that knows `max_seq`), and a
+/// vtable slot cannot surface an allocation failure mid-attention.
+pub fn attnDecodeKv(
+    kv_type: backend.KvType,
+    q: Buf, gate: Buf, kcache_b: [*]const u8, vcache_b: [*]const u8,
+    att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
+    kv_dim: usize, scale: f32, scratch: *KvDequantScratch,
+) void {
+    const need = (slot + 1) * kv_dim;
+    std.debug.assert(scratch.k.len >= need and scratch.v.len >= need);
+    const row_bytes = backend.kvRowBytes(kv_dim, kv_type);
+    for (0..slot + 1) |t| {
+        const kb = kcache_b + t * row_bytes;
+        const vb = vcache_b + t * row_bytes;
+        const kr = scratch.k[t * kv_dim ..][0..kv_dim].ptr;
+        const vr = scratch.v[t * kv_dim ..][0..kv_dim].ptr;
+        switch (kv_type) {
+            .f32 => unreachable, // f32 KV never reaches here (vAttnDecode branches)
+            .f16 => {
+                c_kernels.kvDequantF16(kv_dim, kb, kr);
+                c_kernels.kvDequantF16(kv_dim, vb, vr);
+            },
+            .q8_0 => {
+                c_kernels.kvDequantQ8_0(kv_dim, kb, kr);
+                c_kernels.kvDequantQ8_0(kv_dim, vb, vr);
+            },
+            .q4_0 => {
+                c_kernels.kvDequantQ4_0(kv_dim, kb, kr);
+                c_kernels.kvDequantQ4_0(kv_dim, vb, vr);
+            },
+        }
+    }
+    ew.bufAttnDecode(q, gate, Buf.wrap(scratch.k), Buf.wrap(scratch.v), att, gout,
+        slot, heads, gqa, hd, kv_dim, scale);
+}
+
 pub const CpuBackend = struct {
     alloc: std.mem.Allocator,
     g: *const gguf.File,
@@ -694,6 +787,14 @@ pub const CpuBackend = struct {
     /// individually; a device backend keeps the same contract (all regions
     /// released by `freeScratch`).
     bufs: std.ArrayList([]f32) = .empty,
+    /// KV cache storage format for this load (`setKvType` before the first
+    /// `allocKv`, one per model load): `allocKv` sizes, `kvAppend` writes,
+    /// `attnDecode`/`attnChunk` read the cache in this layout.  f32 is the
+    /// historical layout; f16/q8_0/q4_0 are byte-packed rows (see
+    /// `backend.kvRowBytes`).
+    kv_type: backend.KvType = .f32,
+    /// Dequantized K/V rows for quantized-KV attention, sized in `vAllocKv`.
+    kv_scratch: KvDequantScratch = .{},
 
     pub fn init(alloc: std.mem.Allocator, g: *const gguf.File) CpuBackend {
         // Bind the dispatch tables to the widest ISA tier this CPU supports
@@ -713,9 +814,20 @@ pub const CpuBackend = struct {
         self.pool = null;
     }
 
+    /// Set the KV cache format (one per model load, before the first
+    /// `allocKv`).  The CUDA backend forwards its own value to this
+    /// embedded CPU fallback.
+    pub fn setKvType(self: *CpuBackend, t: backend.KvType) void {
+        self.kv_type = t;
+    }
+
     fn freeScratch(self: *CpuBackend) void {
         const a = self.alloc;
         for ([_]*[]u8{ &self.q8, &self.q8k, &self.q8K, &self.q8kK }) |p| {
+            if (p.len > 0) a.free(p.*);
+            p.* = &.{};
+        }
+        for ([_]*[]f32{ &self.kv_scratch.k, &self.kv_scratch.v }) |p| {
             if (p.len > 0) a.free(p.*);
             p.* = &.{};
         }
@@ -791,6 +903,59 @@ pub const CpuBackend = struct {
         const s = try self.alloc.alloc(f32, len);
         self.bufs.append(self.alloc, s) catch return error.OutOfMemory;
         return Buf.wrap(s);
+    }
+
+    /// `VTable.setKvType`: one format per model load, set before the first
+    /// `allocKv`.
+    fn vSetKvType(ctx: *anyopaque, t: backend.KvType) void {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        self.kv_type = t;
+    }
+
+    /// `VTable.allocKv`: one layer's K and V, `max_seq` rows of `kv_dim`
+    /// elements in `kv_type`.  The returned `Buf`s are f32 views over the
+    /// byte allocation (`len = ceil(bytes/4)`); only this backend interprets
+    /// the bytes.  Both regions go into `bufs` so `freeScratch` releases
+    /// them, and the quantized-attention scratch is sized here — this call
+    /// is the only one that knows `max_seq`, and `attnDecodeKv` cannot
+    /// allocate.
+    fn vAllocKv(ctx: *anyopaque, kv_dim: usize, max_seq: usize) anyerror!backend.KvRegion {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        const bytes = backend.kvRowBytes(kv_dim, self.kv_type) * max_seq;
+        const flen = (bytes + 3) / 4;
+        // Allocate the f32-aligned size (last <= 3 bytes are padding) so the
+        // `[]f32` view below is exactly the allocation.
+        const total = 4 * flen;
+        const kb = try self.alloc.alloc(u8, total);
+        const vb = self.alloc.alloc(u8, total) catch {
+            self.alloc.free(kb);
+            return error.OutOfMemory;
+        };
+        if (self.kv_type != .f32) {
+            try self.kv_scratch.ensure(self.alloc, max_seq * kv_dim);
+        }
+        const kview: []f32 = @as([*]f32, @ptrCast(@alignCast(kb.ptr)))[0..flen];
+        const vview: []f32 = @as([*]f32, @ptrCast(@alignCast(vb.ptr)))[0..flen];
+        self.bufs.append(self.alloc, kview) catch {
+            self.alloc.free(kb);
+            self.alloc.free(vb);
+            return error.OutOfMemory;
+        };
+        self.bufs.append(self.alloc, vview) catch {
+            // kview is already tracked: untrack it, then free both regions
+            // (freeing the f32 views releases the underlying u8 allocations).
+            _ = self.bufs.pop();
+            self.alloc.free(kview);
+            self.alloc.free(vview);
+            return error.OutOfMemory;
+        };
+        return .{ .k = Buf.wrap(kview), .v = Buf.wrap(vview) };
+    }
+
+    /// `VTable.kvAppend`: see `kvAppendRows`.
+    fn vKvAppend(ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        kvAppendRows(self.kv_type, dst, src, slot, kv_dim, rows);
     }
 
     fn vSetThreads(ctx: *anyopaque, io: Io, nt: usize) void {
@@ -1022,8 +1187,17 @@ pub const CpuBackend = struct {
     fn vAttnDecode(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                    gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
                    kv_dim: usize, scale: f32) void {
-        _ = ctx;
-        ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        switch (self.kv_type) {
+            // f32 KV: the historical oracle loop, byte-exact.
+            .f32 => ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale),
+            // Byte-packed KV: dequant rows [0..slot] into `kv_scratch` (C
+            // kernels), then the SAME oracle loop over the dequantized rows.
+            else => attnDecodeKv(
+                self.kv_type, q, gate,
+                @ptrCast(kcache.slice().ptr), @ptrCast(vcache.slice().ptr),
+                att, gout, slot, heads, gqa, hd, kv_dim, scale, &self.kv_scratch),
+        }
     }
 
     /// CPU oracle for `VTable.gdnStepRowsChunk`: literally `rows` successive
@@ -1253,6 +1427,9 @@ pub const CpuBackend = struct {
         .loadVecF32 = vLoadVecF32,
         .freeVec = vFreeVec,
         .allocBuf = vAllocBuf,
+        .setKvType = vSetKvType,
+        .allocKv = vAllocKv,
+        .kvAppend = vKvAppend,
         .attnDecode = vAttnDecode,
         .attnChunk = vAttnChunk,
         .gdnGamma = vGdnGamma,

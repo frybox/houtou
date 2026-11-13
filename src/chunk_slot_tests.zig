@@ -47,7 +47,6 @@ test "attnChunk: one call for k rows == k per-row attnDecode calls" {
     const row_len = heads * hd;
     const n_tot = slot0 + rows;
 
-    var ctx_holder: u8 = 0;
     const alloc = std.testing.allocator;
     const q = try alloc.alloc(f32, rows * row_len);
     defer alloc.free(q);
@@ -69,10 +68,14 @@ test "attnChunk: one call for k rows == k per-row attnDecode calls" {
     fill(kc, 3);
     fill(vc, 4);
 
-    // The CPU vtable directly: `CpuBackend.init` needs a `gguf.File`, and every
-    // CPU slot ignores `ctx`, so this is the same code an `Exec` would reach.
+    // The CPU vtable directly.  attnDecode/attnChunk read the backend's
+    // `kv_type` (default .f32 = the historical oracle), so `ctx` must be a
+    // real backend; `CpuBackend.init` needs a `gguf.File`, which these tests
+    // don't have, so the struct is built directly with its defaults (the
+    // `g` pointer is never dereferenced on this path).
+    var be: backend_cpu.CpuBackend = .{ .alloc = alloc, .g = undefined };
     const vt = backend_cpu.CpuBackend.vtable;
-    const ctx: *anyopaque = @ptrCast(&ctx_holder);
+    const ctx: *anyopaque = @ptrCast(&be);
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     // Chunk form: everything in ONE call.
@@ -120,7 +123,6 @@ test "attnChunk: row r sees a prefix that grows with r" {
     const row_len = heads * hd;
     const n_tot = slot0 + rows;
 
-    var ctx_holder: u8 = 0;
     const alloc = std.testing.allocator;
     const q = try alloc.alloc(f32, rows * row_len);
     defer alloc.free(q);
@@ -142,10 +144,10 @@ test "attnChunk: row r sees a prefix that grows with r" {
     fill(kc, 13);
     fill(vc, 14);
 
-    // The CPU vtable directly: `CpuBackend.init` needs a `gguf.File`, and every
-    // CPU slot ignores `ctx`, so this is the same code an `Exec` would reach.
+    // Real backend for `ctx`: see the note in the test above.
+    var be: backend_cpu.CpuBackend = .{ .alloc = alloc, .g = undefined };
     const vt = backend_cpu.CpuBackend.vtable;
-    const ctx: *anyopaque = @ptrCast(&ctx_holder);
+    const ctx: *anyopaque = @ptrCast(&be);
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     vt.attnChunk(ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },

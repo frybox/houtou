@@ -120,7 +120,9 @@ fn runInference(
                 "  -s  PRNG seed for sampling (default 12345)\n" ++
                 "  --threads N  intra-op worker count (0 = default)\n" ++
                 "  --backend cpu|cuda  execution backend; cuda runs the quantized\n" ++
-                "      matvecs on the GPU and keeps the weights device-resident\n",
+                "      matvecs on the GPU and keeps the weights device-resident\n" ++
+                "  --kv-type f32|f16|q8_0|q4_0  KV cache format for the\n" ++
+                "      full-attention layers (default: f16)\n",
             .{args[0]},
         );
         try err_out.flush();
@@ -136,6 +138,7 @@ fn runInference(
     var seed: u64 = 12345;
     var n_threads: usize = 0; // 0 = default (min(16, cpus))
     var backend_kind: qwen35.backend.Kind = .cpu;
+    var kv_type: qwen35.backend.KvType = .f16;
     var i: usize = 4;
     while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
@@ -143,6 +146,17 @@ fn runInference(
             // valid values in the error is what makes a typo recoverable.
             backend_kind = std.meta.stringToEnum(qwen35.backend.Kind, args[i + 1]) orelse {
                 try err_out.print("error: --backend expects 'cpu' or 'cuda', got '{s}'\n", .{args[i + 1]});
+                try err_out.flush();
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--kv-type") and i + 1 < args.len) {
+            // KV cache storage format for the full-attention layers.  f16 is
+            // the default (halves the f32 footprint, near-lossless); q8_0 /
+            // q4_0 trade more precision for 2x / ~3.5x less KV memory; f32 is
+            // kept for A/B against the historical path.
+            kv_type = std.meta.stringToEnum(qwen35.backend.KvType, args[i + 1]) orelse {
+                try err_out.print("error: --kv-type expects 'f32', 'f16', 'q8_0' or 'q4_0', got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
                 return error.InvalidArgument;
             };
@@ -196,7 +210,7 @@ fn runInference(
         }
     }
 
-    var e = engine.Engine.load(arena, path, io, n_threads, backend_kind) catch |e2| {
+    var e = engine.Engine.load(arena, path, io, n_threads, backend_kind, kv_type) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;

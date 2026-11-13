@@ -744,7 +744,7 @@ pub const Engine = struct {
         backend_cpu.setSimdTier(name);
     }
 
-    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize, backend_kind: backend.Kind) !Engine {
+    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize, backend_kind: backend.Kind, kv_type: backend.KvType) !Engine {
         var nt = n_threads;
         if (nt == 0) {
             const ncpu = std.Thread.getCpuCount() catch 1;
@@ -786,6 +786,11 @@ pub const Engine = struct {
                 break :blk p.exec();
             },
         };
+
+        // KV cache format for this run (CLI `--kv-type`, default f16).  The
+        // engine only forwards it: allocation, quantization and dequantization
+        // all live in the backends, which own the cache bytes.
+        exec.setKvType(kv_type);
 
         var cfg = Config{};
         // block_count includes the trailing MTP/nextn prediction layer(s)
@@ -912,17 +917,19 @@ pub const Engine = struct {
         var inited: usize = 0;
         errdefer e.freeCachesUpTo(inited);
         const kv_dim: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
+        if (!backend.kvTypeFits(kv_dim, kv_type)) {
+            // Block-quantized KV needs whole 32-element blocks per row; the
+            // named failure is better than a silently truncated last block.
+            return error.KvTypeNotSupported;
+        }
         const gdn_kv: usize = @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim * cfg.gdn_head_dim;
         const gdn_conv_dim: usize =
             2 * @as(usize, cfg.gdn_num_k_heads) * cfg.gdn_head_dim +
             @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim;
         for (0..n_layers) |li| {
             if (cfg.isFullAttention(@intCast(li))) {
-                e.kv[li] = .{
-                    .k = try exec.allocBuf(@as(usize, max_seq) * kv_dim),
-                    .v = try exec.allocBuf(@as(usize, max_seq) * kv_dim),
-                    .len = 0,
-                };
+                const region = try exec.allocKv(kv_dim, max_seq);
+                e.kv[li] = .{ .k = region.k, .v = region.v, .len = 0 };
                 e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
             } else {
                 e.kv[li] = .{ .k = backend.Buf.empty, .v = backend.Buf.empty, .len = 0 };
@@ -1743,10 +1750,10 @@ pub const Engine = struct {
         //     `rmsnormRows` -- row r of qK is one head of token r, and every row
         //     uses the same weight row, so `k * heads` rows in one call is the
         //     identical per-row arithmetic (same eps, same single-pass sum).
-        //   * KV write: the destination is contiguous.  `cache.k` rows
-        //     [slot0, slot0+k) are exactly `kK[0 .. k*kv_dim)`, because both are
-        //     row-major with stride kv_dim and no gaps -- so this is ONE
-        //     `copyRange` of k*kv_dim floats, not k `copyRangeSlot`s.
+        //   * KV write: `cache.k` rows [slot0, slot0+k) are exactly the chunk's
+        //     `kK[0 .. k*kv_dim)` f32 rows -- so this is ONE `kvAppend` of `k`
+        //     rows, not k per-token appends (the backend strides its own row
+        //     bytes; f32 KV makes it the old single f32 copy).
         //
         // Doing these per token cost 525 * 2 rmsnorm + 525 * 2 KV launches per
         // full-attention layer (16 layers => 33,600 launches for a 525-token
@@ -1754,21 +1761,21 @@ pub const Engine = struct {
         // 50% GPU occupancy, i.e. half the wall clock was the host submitting
         // launches.  RoPE already ran chunk-wide in `forwardChunk`.
         //
-        // `copyRangeSlot` is NOT used here on purpose: its `slot` argument
-        // exists so the DECODE graph can retarget a captured KV append
+        // `kvAppend`'s explicit `slot`/`rows` serve the same purpose: the
+        // DECODE graph retargets a captured KV append row by row
         // (`g_op_seen.kv_append`), and prefill does not go through the graph.
         self.exec.rmsnormRows(self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
             lw.attn_q_norm, k * heads, c.rms_eps);
         self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
             lw.attn_k_norm, k * kv_heads, c.rms_eps);
-        self.exec.copyRange(cache.k.span(slot0 * kv_dim, k * kv_dim), self.kK.span(0, k * kv_dim));
-        self.exec.copyRange(cache.v.span(slot0 * kv_dim, k * kv_dim), self.vK.span(0, k * kv_dim));
+        self.exec.kvAppend(cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
+        self.exec.kvAppend(cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
         cache.len += @intCast(k);
 
         // Pass 2: scores -> softmax -> PV -> gate for all k rows, one launch.
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         self.exec.attnChunk(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
-            cache.k.span(0, (slot0 + k) * kv_dim), cache.v.span(0, (slot0 + k) * kv_dim),
+            cache.k, cache.v,
             self.attn.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
             slot0, k, heads, gqa, hd, kv_dim, scale);
     }
@@ -1976,12 +1983,14 @@ pub const Engine = struct {
         self.exec.rope64Rows(q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
         self.exec.rope64Rows(self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
 
-        // KV cache
+        // KV cache: quantize this token's rows into the cache (the backend
+        // strides its own layout; `slot` is the per-token row the decode
+        // graph retargets, exactly as it did for the old copy append).
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRangeSlot(cache.k.span(slot * kv_dim, kv_dim), self.k.span(0, kv_dim), slot);
-        self.exec.copyRangeSlot(cache.v.span(slot * kv_dim, kv_dim), self.v.span(0, kv_dim), slot);
+        self.exec.kvAppend(cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
@@ -1989,7 +1998,7 @@ pub const Engine = struct {
         const gout = self.gdn_out.span(0, q_dim);
         // scores -> softmax -> PV -> sigmoid gate in one backend call
         self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
-            cache.k.span(0, (slot + 1) * kv_dim), cache.v.span(0, (slot + 1) * kv_dim),
+            cache.k, cache.v,
             self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
         // o_proj [2048 -> 1024]

@@ -50,6 +50,16 @@ extern fn mxfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32
 extern fn nvfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 extern fn quantize_q8_0(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
 
+// KV-cache row quantize/dequant (src/kernels/x86/kv.c).  Row layouts are the
+// weight layouts (f16: 2 B/elem; q8_0: 34 B / 32 elems, d + 32 i8; q4_0:
+// 18 B / 32 elems, d + 16 packed nibbles, elem j low / elem 16+j high).
+// The q8_0 quantize is quantize_q8_0 above — kv.c has no q8_0 copy.
+extern fn q35_kv_quant_f16(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
+extern fn q35_kv_quant_q4_0(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
+extern fn q35_kv_dequant_f16(n: c_int, data: ?*const anyopaque, out: ?*anyopaque) void;
+extern fn q35_kv_dequant_q8_0(n: c_int, data: ?*const anyopaque, out: ?*anyopaque) void;
+extern fn q35_kv_dequant_q4_0(n: c_int, data: ?*const anyopaque, out: ?*anyopaque) void;
+
 // f16 / bf16 weight rows x Q8_0 activation (--threads-independent 32-block dots,
 // exact fp16 scaling: one f16 scale per row block, one per activation block)
 extern fn f16_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
@@ -236,6 +246,33 @@ pub fn quantizeQ8_0(n: usize, x: [*]const f32, out: [*]u8) callconv(.c) void {
 /// Quantize float array to Q8_K format.
 pub fn quantizeQ8_K(n: usize, x: [*]const f32, out: [*]u8) callconv(.c) void {
     quantize_q8_K(@intCast(n), x, out);
+}
+
+// KV-cache row quantize/dequant (src/kernels/x86/kv.c).
+
+/// f32 row -> f16 KV bytes (2 B/elem, round-to-nearest-even cast).
+pub fn kvQuantF16(n: usize, x: [*]const f32, out: [*]u8) callconv(.c) void {
+    q35_kv_quant_f16(@intCast(n), x, out);
+}
+
+/// f32 row -> q4_0 KV bytes (18 B / 32 elems, weight q4_0 layout).
+pub fn kvQuantQ4_0(n: usize, x: [*]const f32, out: [*]u8) callconv(.c) void {
+    q35_kv_quant_q4_0(@intCast(n), x, out);
+}
+
+/// f16 KV row bytes -> f32 (`n` elements).
+pub fn kvDequantF16(n: usize, data: [*]const u8, out: [*]f32) callconv(.c) void {
+    q35_kv_dequant_f16(@intCast(n), data, out);
+}
+
+/// q8_0 KV row bytes -> f32 (`n` elements; layout = weight q8_0).
+pub fn kvDequantQ8_0(n: usize, data: [*]const u8, out: [*]f32) callconv(.c) void {
+    q35_kv_dequant_q8_0(@intCast(n), data, out);
+}
+
+/// q4_0 KV row bytes -> f32 (`n` elements; layout = weight q4_0).
+pub fn kvDequantQ4_0(n: usize, data: [*]const u8, out: [*]f32) callconv(.c) void {
+    q35_kv_dequant_q4_0(@intCast(n), data, out);
 }
 
 // Test the C kernels

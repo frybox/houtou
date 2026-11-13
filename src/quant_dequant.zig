@@ -87,6 +87,44 @@ pub fn dequantQ4_0(row: []const u8, out: []f32) void {
     }
 }
 
+/// Quantize Q4_0 (symmetric, no min) into the same 18-byte/32-elem layout
+/// `dequantQ4_0` reads.  Per block: d32 = amax/8 (1 if amax==0), d = f16(d32)
+/// stored at @0, q[k] = clamp(round(x[k]*inv)+8, 0, 15) with inv = 1/d32 —
+/// the multiply-by-reciprocal form, expression-for-expression with the C
+/// kernel `q35_kv_quant_q4_0` (src/kernels/x86/kv.c), so the two are
+/// byte-identical.  (The q8_0 pair keeps the historical asymmetry: the C
+/// `quantize_q8_0` multiplies by the reciprocal while `quantizeQ8_0` divides.)
+pub fn quantizeQ4_0(data: []const f32, out: []u8) !void {
+    if (data.len % 32 != 0) return error.NotMultipleOfBlock;
+    if (out.len != data.len / 32 * 18) return error.SizeMismatch;
+    var i: usize = 0;
+    var ib: usize = 0;
+    while (i < data.len) : ({
+        i += 32;
+        ib += 18;
+    }) {
+        var amax: f32 = 0;
+        for (data[i..][0..32]) |d| {
+            const a = @abs(d);
+            if (a > amax) amax = a;
+        }
+        const d32: f32 = if (amax > 0) amax / 8.0 else 1.0;
+        const inv: f32 = if (amax > 0) 1.0 / d32 else 0.0;
+        std.mem.writeInt(u16, out[ib..][0..2], @bitCast(@as(f16, @floatCast(d32))), .little);
+        for (0..16) |k| {
+            var q0: f32 = @round(data[i + k] * inv) + 8;
+            var q1: f32 = @round(data[i + 16 + k] * inv) + 8;
+            if (q0 > 15) q0 = 15;
+            if (q0 < 0) q0 = 0;
+            if (q1 > 15) q1 = 15;
+            if (q1 < 0) q1 = 0;
+            const b0: u8 = @intCast(@as(i32, @intFromFloat(q0)) & 0x0F);
+            const b1: u8 = @intCast(@as(i32, @intFromFloat(q1)) & 0x0F);
+            out[ib + 2 + k] = b0 | (b1 << 4);
+        }
+    }
+}
+
 // ---------------- Q4_1: 8 x ( d(u16) @0,2; m(u16) @2,4; qs[16] @4..19 ) = 8*20 = 160
 // Per 32-elem sub-block: y[i]=((qs[i]&0xF))*d + m ; y[i+16]=((qs[i]>>4))*d + m.
 pub fn dequantQ4_1(row: []const u8, out: []f32) void {

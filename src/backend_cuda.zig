@@ -179,19 +179,19 @@ const Kernels = struct {
     extern fn q35_launch_gdn_gamma_rows(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_launch_attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_attn_chunk_max_rows(slot0: c_int) callconv(.c) c_int;
     /// Warp-tiled / split decode attention (see api.h for the measurements).
-    extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_attn_score_split_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_pv_split_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_softmax_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_reduce() callconv(.c) ?*anyopaque;
-    extern fn q35_launch_attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Device-`slot` form of the same kernel; see `dAttnDecode_body`.
-    extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Write one int32 from a 1-thread kernel (graph-safe per-token scalar).
     extern fn q35_launch_set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
@@ -215,6 +215,8 @@ const Kernels = struct {
     extern fn q35_func_attn_decode() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_decode_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_copy_range() callconv(.c) ?*anyopaque;
+    extern fn q35_launch_kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_func_kv_quant() callconv(.c) ?*anyopaque;
 };
 
 /// Row-range split factor for decode attention.  `0` disables it (one block per
@@ -298,6 +300,7 @@ const Launch = if (cuda_linked) struct {
     const l2norm_qk_scale = Kernels.q35_launch_l2norm_qk_scale;
     const add_resid = Kernels.q35_launch_add_resid;
     const copy_range = Kernels.q35_launch_copy_range;
+    const kv_quant = Kernels.q35_launch_kv_quant;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
     const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
     const zero_buf = Kernels.q35_launch_zero_buf;
@@ -409,6 +412,10 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
+    fn kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, d_out, nblocks, kind, stream };
+        return stubNoCudaKernels();
+    }
     fn deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_src, heads, hd, stream };
         return stubNoCudaKernels();
@@ -470,12 +477,12 @@ const Launch = if (cuda_linked) struct {
     fn sample_ctl_ints() callconv(.c) c_int {
         return 0;
     }
-    fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
+    fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, stream };
+    fn attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
     /// No chunk kernel means no chunking: 0 tells `dAttnChunk` to leave
@@ -495,20 +502,20 @@ const Launch = if (cuda_linked) struct {
     // added later breaks `zig build` (no -Dcuda) with `no member named ...` --
     // which is exactly how `set_int1` and the three `attn_decode_*` variants got
     // away: they were aliased and called long after this struct was last read.
-    fn attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, stream };
+    fn attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
+    fn attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, stream };
+    fn attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, stream };
+    fn attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
     }
     fn set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -908,7 +915,7 @@ const GraphState = enum { off, warm, rec, live };
 /// argument array trivially cheap (it runs once per kernel node, once per
 /// process, at capture time).
 /// Largest kernel signature this backend launches.  `attn_decode`'s device
-/// kernel takes 12 arguments and `gdn_step_rows`' takes 17; 24 leaves headroom
+/// kernel takes 13 arguments and `gdn_step_rows`' takes 17; 24 leaves headroom
 /// and costs `24 * 16` bytes per tracked node, i.e. nothing.
 const kernel_max_args: usize = 24;
 
@@ -942,6 +949,11 @@ pub const CudaBackend = struct {
     /// geometry, and the device launches need `cols`.  Every quant row -- f16
     /// and bf16 included -- carries its own rows/cols, so none of them uses this.
     g: *const gguf.File,
+    /// KV cache storage format for this load (`setKvType` before the first
+    /// `allocKv`): `allocKv` sizes, `kvAppend` writes, attention reads.
+    /// Mirrored into the embedded CPU fallback (it reads the same cache on
+    /// the CPU net path).
+    kv_type: backend.KvType = .f32,
     cu: ?cudart.Open = null,
     /// Why device init failed; re-reported from `allocScratch` so `Engine.load`
     /// turns it into a load error instead of silently running on the CPU.
@@ -2562,9 +2574,24 @@ pub const CudaBackend = struct {
                         // address on the very first append, and the resulting
                         // cross-layer writes corrupted the cache from the 4th
                         // replayed token on.
-                        const at = self.kvSlotOf(&p) orelse continue;
+                        const at = self.kvSlotOf(.kv, &p) orelse continue;
                         if (self.g_kv_nodes[at] != null) continue;
-                        if (!copyKvArgs(&p, &self.g_kv_argv[at], &self.g_kv_kptr[at], &self.g_kv_dst_cells[at])) continue;
+                        if (!copyKvArgs(.kv, &p, &self.g_kv_argv[at], &self.g_kv_kptr[at], &self.g_kv_dst_cells[at])) continue;
+                        self.g_kv_params[at] = p;
+                        self.g_kv_nodes[at] = node;
+                        kv_found += 1;
+                    },
+                    .kvq => {
+                        // Same matching as `.kv`: `graphNoteKvDst` recorded
+                        // the destination of every append in launch order, so
+                        // this node's destination argument (#1 here) is an
+                        // exact key.  A run uses ONE KV class only (f32 gives
+                        // `.kv` nodes, a quantized format gives `.kvq` nodes),
+                        // so the shared `kv_found` counter and the
+                        // `g_kv_dst_captured` table serve both arms.
+                        const at = self.kvSlotOf(.kvq, &p) orelse continue;
+                        if (self.g_kv_nodes[at] != null) continue;
+                        if (!copyKvArgs(.kvq, &p, &self.g_kv_argv[at], &self.g_kv_kptr[at], &self.g_kv_dst_cells[at])) continue;
                         self.g_kv_params[at] = p;
                         self.g_kv_nodes[at] = node;
                         kv_found += 1;
@@ -2709,7 +2736,7 @@ pub const CudaBackend = struct {
     /// runtime's array -- the alternative (scan until a null) reads unowned
     /// memory and segfaults, which is how this code first failed.
     const rope_arity: usize = 5;
-    const attn_arity: usize = 12;
+    const attn_arity: usize = 13;
     const kv_arity: usize = 3;
 
     /// `cudaHostAllocMapped`.  Spelled out rather than bound from the header:
@@ -2723,7 +2750,7 @@ pub const CudaBackend = struct {
     /// recorded for retargeting.  That is the entire point of the variant:
     /// retargeting the scalar-`slot` node cost one `SetParams` per LAYER per
     /// token, 14.3 ms of a 33.8 ms decode on the 27B.
-    const NodeClass = enum { rope, rope_dpos, attn, attn_dyn, attn_score, attn_reduce, kv };
+    const NodeClass = enum { rope, rope_dpos, attn, attn_dyn, attn_score, attn_reduce, kv, kvq };
 
 /// `(Q35_ATTN_MAX_ROWS + 2) * sizeof(float)` -- the fixed dynamic shared block of
 /// `q35_attn_decode_kernel_dyn` (src/kernels/cuda/attn.cu).  Both sides must
@@ -2732,8 +2759,8 @@ pub const CudaBackend = struct {
 const q35_attn_smem_dynslot: usize = (8192 + 2) * @sizeOf(f32);
 
 /// Widest split-path attention kernel: `q35_attn_score_split_kernel_dyn(d_q,
-/// d_kcache, d_att, d_slot, heads, gqa, hd, kv_dim, scale, split)`.
-const attn_score_arity: usize = 10;
+/// d_kcache, d_att, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind)`.
+const attn_score_arity: usize = 11;
 
     /// Decide whether a captured kernel node is one of the two retargetable
     /// launches, by matching its `func` against the host-stub address each
@@ -2770,9 +2797,12 @@ const attn_score_arity: usize = 10;
         if (f == KernelFns.attn_smax_dyn) return .attn_score;
         // `q35_attn_reduce_kernel(d_part, d_gate, d_gout, heads, hd, split)` --
         // six arguments, three pointers then three ints.  Its own class because
-        // `.attn_dyn`'s argument widths describe a twelve-argument kernel.
+        // `.attn_dyn`'s argument widths describe a thirteen-argument kernel.
         if (f == KernelFns.attn_reduce) return .attn_reduce;
         if (f == KernelFns.kv) return .kv;
+        // Quantized KV append: `q35_k_kv_quant(x, out, nblocks, kind)`, one
+        // 32-element block per thread; the destination is argument #1.
+        if (f == KernelFns.kvq) return .kvq;
         return null;
     }
 
@@ -2792,6 +2822,7 @@ const attn_score_arity: usize = 10;
         var attn_smax_dyn: ?*anyopaque = null;
         var attn_reduce: ?*anyopaque = null;
         var kv: ?*anyopaque = null;
+        var kvq: ?*anyopaque = null;
 
         fn resolve() void {
             if (resolved) return;
@@ -2810,6 +2841,7 @@ const attn_score_arity: usize = 10;
                 attn_smax_dyn = Kernels.q35_func_attn_softmax_dyn();
                 attn_reduce = Kernels.q35_func_attn_reduce();
                 kv = Kernels.q35_func_copy_range();
+                kvq = Kernels.q35_func_kv_quant();
             }
             resolved = true;
         }
@@ -2825,8 +2857,9 @@ const attn_score_arity: usize = 10;
     /// writes that one field.  `cls` selects the kernel's signature: arity from
     /// `arityOf`, per-argument widths from `argWidth`, and the launch-shape check
     /// above.  IT IS A REQUIRED PARAMETER ON PURPOSE: the kind can never be
-    /// inferred from `variable_at` again, because the KV variable is argument #0
-    /// and #0 is also what a caller with no variable would pass.
+    /// inferred from `variable_at` again, because the KV variable is argument
+    /// #0 (`copy_range`) or #1 (`kv_quant`), and #0 is also what a caller with
+    /// no variable would pass.
     /// Read a node's first argument as a pointer, without trusting anything
     /// about the kernel beyond the `copy_range(dst, src, n)` signature -- used
     /// only for nodes already matched to `k_copy_range` by stub address.
@@ -2883,17 +2916,19 @@ const attn_score_arity: usize = 10;
                 // not the node we think it is.
                 if (cls == .attn_dyn and p.shared_mem_bytes != q35_attn_smem_dynslot) return false;
             },
-            .kv => {
+            .kv, .kvq => {
                 // DELIBERATELY NOT the attn rule: `k_copy_range` is launched with
                 // 256 threads, not 128, and with one block per 256 elements --
                 // `dst` is a whole cache row (kv_dim >= 128), so grid_x is
-                // neither 1 nor `heads`.  Applying either neighbour's rule would
-                // reject every genuine KV node and the graph would abstain on
-                // every model.  What actually binds for this kind is the
-                // argument WIDTHS below (8/8/4, source of truth
-                // src/kernels/cuda/elementwise.cu:60).  Which append a node is
-                // comes from the execution order, not from here -- see
-                // `kvSlotFromCluster`.
+                // neither 1 nor `heads`.  `q35_k_kv_quant` (quantized KV
+                // append) runs 128 threads, one block per 128 quantized blocks;
+                // both fit the same loose non-degeneracy check.  Applying
+                // either neighbour's rule would reject every genuine KV node
+                // and the graph would abstain on every model.  What actually
+                // binds for this kind is the argument WIDTHS below (8/8/4,
+                // source of truth src/kernels/cuda/elementwise.cu:60).  Which
+                // append a node is comes from the execution order, not from
+                // here -- see `kvSlotFromCluster`.
                 if (p.grid_dim_x == 0 or p.block_dim_x == 0) return false;
                 if (p.grid_dim_y != 1 or p.block_dim_y != 1) return false;
                 if (p.shared_mem_bytes != 0) return false;
@@ -2942,13 +2977,16 @@ const attn_score_arity: usize = 10;
             .attn_score => attn_score_arity,
             .attn_reduce => 6,
             .kv => kv_arity,
+            // q35_k_kv_quant(const float *x, unsigned char *out, int nblocks, int kind)
+            .kvq => 4,
         };
     }
 
     /// KV-append entry point.  The per-token variable here is the destination
     /// POINTER, so its storage is a `?*anyopaque` cell (`g_kv_dst_cells[i]`):
     /// `graphReplay` writes the new address into that exact cell and relies on
-    /// the node's `kernelParams[0]` still pointing at it.
+    /// the node's `kernelParams` slot for the destination argument still
+    /// pointing at it.
     ///
     /// WHY A TYPED PARAMETER IN BETWEEN INSTEAD OF A CAST AT THE CALL SITE:
     /// `&cell` for a `?*anyopaque` is a `*?*anyopaque`, whose address is only
@@ -2960,26 +2998,31 @@ const attn_score_arity: usize = 10;
     /// address of something else that merely happens to be eight bytes wide and
     /// get a silently wrong destination (garbage KV rows, no error).
     fn copyKvArgs(
+        cls: NodeClass,
         p: *const cudart.KernelNodeParams,
         values: *[kernel_max_args]ArgSlot,
         ptrs: *[kernel_max_args]?*anyopaque,
         dst_cell: *?*anyopaque,
     ) bool {
-        return copyArgs(.kv, p, values, ptrs, &.{
-            .{ .at = kv_dst_arg, .cell = @ptrCast(@alignCast(dst_cell)) },
+        // The destination is argument #0 of `k_copy_range` (.kv) and argument
+        // #1 of `q35_k_kv_quant` (.kvq).
+        const at: usize = if (cls == .kv) kv_dst_arg else 1;
+        return copyArgs(cls, p, values, ptrs, &.{
+            .{ .at = at, .cell = @ptrCast(@alignCast(dst_cell)) },
         });
     }
 
     /// Slot index of a KV append node, from its captured destination address.
     ///
     /// `graphNoteKvDst` stored the address every append wrote during the capture,
-    /// in launch order, so the node's own argument #0 identifies it exactly --
+    /// in launch order, so the node's own destination argument identifies it
+    /// exactly --
     /// no dependence on the order `cudaGraphGetNodes` returns (which is not
     /// launch order and is not even stable across versions).  Returns null when
     /// no captured append used this address, which means the node is a plain
     /// tensor `copy_range` rather than a cache append.
-    fn kvSlotOf(self: *CudaBackend, p: *const cudart.KernelNodeParams) ?usize {
-        const want = kvDstOf(p) orelse return null;
+    fn kvSlotOf(self: *CudaBackend, cls: NodeClass, p: *const cudart.KernelNodeParams) ?usize {
+        const want = kvDstOf(cls, p) orelse return null;
         for (self.g_kv_dst_captured[0..self.g_expect_kv], 0..) |maybe, i| {
             const have = maybe orelse continue;
             if (have == want) return i;
@@ -2987,10 +3030,12 @@ const attn_score_arity: usize = 10;
         return null;
     }
 
-    /// The destination pointer argument of a `k_copy_range` node.
-    fn kvDstOf(p: *const cudart.KernelNodeParams) ?*anyopaque {
+    /// The destination pointer argument of a KV append node: #0 of
+    /// `k_copy_range` (.kv), #1 of `q35_k_kv_quant` (.kvq).
+    fn kvDstOf(cls: NodeClass, p: *const cudart.KernelNodeParams) ?*anyopaque {
         const kpl: [*]?*anyopaque = @ptrCast(p.kernel_params orelse return null);
-        const cell = kpl[kv_dst_arg] orelse return null;
+        const at: usize = if (cls == .kv) kv_dst_arg else 1;
+        const cell = kpl[at] orelse return null;
         var got: ?*anyopaque = null;
         @memcpy(std.mem.asBytes(&got), @as([*]const u8, @ptrCast(cell))[0..@sizeOf(?*anyopaque)]);
         return got;
@@ -3013,7 +3058,7 @@ const attn_score_arity: usize = 10;
             // q35_attn_decode_kernel(const float *d_q, const float *d_gate,
             //   const float *d_kcache, const float *d_vcache, float *d_att,
             //   const float *d_gout, int slot, int heads, int gqa, int hd,
-            //   int kv_dim, float scale)
+            //   int kv_dim, float scale, int kv_kind)
             .attn => switch (i) {
                 0, 1, 2, 3, 4, 5 => 8,
                 else => 4,
@@ -3031,10 +3076,10 @@ const attn_score_arity: usize = 10;
                 else => 4,
             },
             // The three split-path kernels: score_split(d_q, d_kcache, d_att,
-            // d_slot, heads, gqa, hd, kv_dim, scale, split) = 10 args;
+            // d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind) = 11 args;
             // softmax_dyn(d_att, d_slot, heads) = 3;
             // pv_split_dyn(d_vcache, d_part, d_prob, d_slot, heads, gqa, hd,
-            //   kv_dim, split) = 9.  Widths below cover the widest (10).
+            //   kv_dim, split, kv_kind) = 10.  Widths below cover the widest (11).
             .attn_score => switch (i) {
                 0, 1, 2, 3 => 8,           // pointers (score kernel)
                 else => 4,
@@ -3046,6 +3091,12 @@ const attn_score_arity: usize = 10;
             // attention signature and `copyArgs` would read nine slots past the
             // end of the runtime's array.
             .kv => switch (i) {
+                0, 1 => 8,
+                else => 4,
+            },
+            // q35_k_kv_quant(const float *x, unsigned char *out, int nblocks,
+            // int kind) -- same width pattern: two pointers, then two ints.
+            .kvq => switch (i) {
                 0, 1 => 8,
                 else => 4,
             },
@@ -4533,6 +4584,109 @@ const attn_score_arity: usize = 10;
         return backend.Buf.wrap(slice);
     }
 
+    /// `VTable.setKvType`: one format per model load, set before the first
+    /// `allocKv`.  Mirrored into the embedded CPU fallback so the CPU net path
+    /// reads the cache in the same layout.
+    fn vSetKvType(ctx: *anyopaque, t: backend.KvType) void {
+        const self = self_(ctx);
+        self.kv_type = t;
+        self.cpu.setKvType(t);
+    }
+
+    /// `VTable.allocKv`: one layer's K and V, `max_seq` rows of `kv_dim`
+    /// elements in `kv_type`.  Each region is a `cudaMalloc` of the f32-aligned
+    /// size (`4 * ceil(bytes/4)`) so the returned `[]f32` view is exactly the
+    /// allocation; the bytes are the cache in `kv_type` and only this backend
+    /// interprets them.  Both regions go into `dev_bufs` so `freeScratch`
+    /// releases them (a `Buf` carries no ownership flag).
+    fn vAllocKv(ctx: *anyopaque, kv_dim: usize, max_seq: usize) anyerror!backend.KvRegion {
+        const self = self_(ctx);
+        const cu = if (self.cu) |*c| c else {
+            std.debug.print("cuda backend: allocKv: {s}\n", .{self.needHelp()});
+            return error.DeviceUnavailable;
+        };
+        const row_bytes = backend.kvRowBytes(kv_dim, self.kv_type);
+        const bytes = row_bytes * max_seq;
+        const flen = (bytes + 3) / 4;
+        const total = 4 * flen;
+        var kp: ?*anyopaque = null;
+        const rc1 = cu.lib.Malloc(&kp, total);
+        if (rc1 != cudart.cudaSuccess or kp == null) {
+            std.debug.print("cuda backend: allocKv k region ({d} B) failed: {s}\n", .{ total, std.mem.span(cu.lib.errStr(rc1)) });
+            return error.OutOfMemory;
+        }
+        var vp: ?*anyopaque = null;
+        const rc2 = cu.lib.Malloc(&vp, total);
+        if (rc2 != cudart.cudaSuccess or vp == null) {
+            _ = cu.lib.Free(kp.?);
+            std.debug.print("cuda backend: allocKv v region ({d} B) failed: {s}\n", .{ total, std.mem.span(cu.lib.errStr(rc2)) });
+            return error.OutOfMemory;
+        }
+        const kview: []f32 = @as([*]f32, @ptrCast(@alignCast(kp.?)))[0..flen];
+        const vview: []f32 = @as([*]f32, @ptrCast(@alignCast(vp.?)))[0..flen];
+        self.dev_bufs.append(self.alloc, .{ .ptr = kp.?, .len = flen }) catch {
+            _ = cu.lib.Free(kp.?);
+            _ = cu.lib.Free(vp.?);
+            return error.OutOfMemory;
+        };
+        self.dev_bufs.append(self.alloc, .{ .ptr = vp.?, .len = flen }) catch {
+            _ = self.dev_bufs.pop();
+            _ = cu.lib.Free(kp.?);
+            _ = cu.lib.Free(vp.?);
+            return error.OutOfMemory;
+        };
+        return .{ .k = backend.Buf.wrap(kview), .v = backend.Buf.wrap(vview) };
+    }
+
+    /// `VTable.kvAppend`: quantize `rows` f32 rows (in `src`, `kv_dim` wide,
+    /// row-major) into the cache `dst` starting at row `slot`.
+    ///
+    /// f32 is the historical `copyRange`/`copyRangeSlot` path, byte-identical
+    /// and graph-identical (the same `copy_range` node the decode graph
+    /// retargets).  A quantized format launches `q35_k_kv_quant` (kind
+    /// 0=f16/1=q8_0/2=q4_0); while a capture is open the destination address is
+    /// recorded so the graph retargets it one row per token exactly like the
+    /// f32 append.  The CPU path is the correctness net for a broken/missing
+    /// device (mirrors `dCopyRange`), never the normal route.
+    fn dKvAppend_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
+        const self = self_(ctx);
+        if (self.gOpGate(&self.g_op_seen.kv_append)) return;
+        if (rows == 0) return;
+        // f32: the historical path, unchanged (and graph-identical).
+        if (self.kv_type == .f32) {
+            if (rows == 1) {
+                CudaBackend.dCopyRangeSlot_body(ctx, dst.span(slot * kv_dim, kv_dim), src, slot);
+            } else {
+                CudaBackend.dCopyRange_body(ctx, dst.span(slot * kv_dim, rows * kv_dim), src);
+            }
+            return;
+        }
+        const kind: c_int = switch (self.kv_type) {
+            .f16 => 0,
+            .q8_0 => 1,
+            else => 2,
+        };
+        const row_bytes = backend.kvRowBytes(kv_dim, self.kv_type);
+        const nblocks = rows * (kv_dim / 32);
+        if (self.cu == null or kv_dim % 32 != 0) {
+            cpu_mod.CpuBackend.vtable.kvAppend(@ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
+            return;
+        }
+        // `dst` is the layer's WHOLE region (an f32 view); the cache row for
+        // `slot` is `slot * row_bytes` bytes past the base.
+        const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst.ptr));
+        const out_ptr: [*]u8 = dst_bytes + slot * row_bytes;
+        // Record the captured destination (row `slot`) for graph retargeting.
+        if (self.capturing() and rows == 1) {
+            self.graphNoteKvDst(@ptrCast(out_ptr), row_bytes);
+        }
+        const rc = Launch.kv_quant(src.ptr, @ptrCast(out_ptr), @intCast(nblocks), kind, self.launchStream());
+        if (rc == cudart.cudaSuccess) return;
+        if (self.capturing()) self.graphAbandon("kv_quant launch failed");
+        self.ewLaunchFail("kv_quant", rc);
+        cpu_mod.CpuBackend.vtable.kvAppend(@ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
+    }
+
     /// Release every region `dAllocBuf` handed out, plus the reusable scratch
     /// (`d_act`/`d_xq`/`d_out`/`d_deq`) and the resident constant copies.
     ///
@@ -5712,6 +5866,18 @@ const attn_score_arity: usize = 10;
             nv, nk, kd, conv_k, eps);
     }
 
+    /// The `kv_kind` the attention kernels decode the cache with: -1 for f32
+    /// (the original path), else the `kind` the KV quantizer was launched with
+    /// (0=f16, 1=q8_0, 2=q4_0).
+    fn kvKind(self: *CudaBackend) c_int {
+        return switch (self.kv_type) {
+            .f32 => -1,
+            .f16 => 0,
+            .q8_0 => 1,
+            .q4_0 => 2,
+        };
+    }
+
     fn dAttnDecode_body(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
@@ -5775,7 +5941,7 @@ const attn_score_arity: usize = 10;
                                                 if (self.d_att_part) |ppart| {
                                                     const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
                                                     const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
-                                                    const rcs = Launch.attn_decode_split_dyn(pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.launchStream());
+                                                    const rcs = Launch.attn_decode_split_dyn(pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                                     if (rcs == cudart.cudaSuccess) {
                                                         // FOUR nodes (score, softmax,
                                                         // PV, reduce+gate), all
@@ -5789,7 +5955,7 @@ const attn_score_arity: usize = 10;
                                                     self.ewLaunchFail("attn_decode_split_dyn", rcs);
                                                 }
                                             }
-                                            const rc = Launch.attn_decode_dyn(pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.launchStream());
+                                            const rc = Launch.attn_decode_dyn(pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                             if (rc == cudart.cudaSuccess) {
                                                 // Counted, not recorded: the node is
                                                 // classified `.attn_dyn` and never
@@ -5819,12 +5985,12 @@ const attn_score_arity: usize = 10;
                                             const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
                                             // `d_att_prob`, NOT `patt`: see the field note.
                                             const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
-                                            const rc2 = Launch.attn_decode_split2(pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.launchStream());
+                                            const rc2 = Launch.attn_decode_split2(pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                             if (rc2 == cudart.cudaSuccess) return;
                                             self.ewLaunchFail("attn_decode split", rc2);
                                         }
                                     }
-                                    const rc = Launch.attn_decode(pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.launchStream());
+                                    const rc = Launch.attn_decode(pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                     if (rc == cudart.cudaSuccess) {
                                         if (self.capturing()) self.graphNoteAttn(slot);
                                         return;
@@ -7816,7 +7982,7 @@ const attn_score_arity: usize = 10;
                                         pgout + done * row_len,
                                         @intCast(slot0 + done), @intCast(take),
                                         @intCast(heads), @intCast(gqa), @intCast(hd),
-                                        @intCast(kv_dim), scale, self.launchStream());
+                                        @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                     if (rc != 0) {
                                         std.debug.print("cuda backend: attn_chunk launch failed ({d})\n", .{rc});
                                         break;
@@ -7951,5 +8117,9 @@ pub const vtable = backend.Exec.VTable{
     // Activations are PROPER device regions after P2c, so `allocBuf` is a real
     // `cudaMalloc` and `freeScratch` releases them (`dAllocBuf`/`dFreeScratch`).
     .allocBuf = CudaBackend.dAllocBuf,
+    // KV cache: one format per load, device-resident.
+    .setKvType = CudaBackend.vSetKvType,
+    .allocKv = CudaBackend.vAllocKv,
+    .kvAppend = CudaBackend.dKvAppend_body,
 
 };

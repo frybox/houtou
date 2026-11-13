@@ -105,6 +105,57 @@
 // so this is bounded by the 48 KB dynamic shared budget.
 #define Q35_ATTN_CHUNK_SMEM_MAX (48 * 1024 / (int)sizeof(float))
 
+// ---------------------------------------------------------------------------
+// Quantized-KV dequant, on read.  When the cache is not f32 the K/V rows are
+// the byte-packed layouts the CPU writes (`q35_kv_quant_*`, kv.c) and every
+// kernel below decodes an element as it reads it.  `kv_kind` is -1 for f32
+// (the original code path, unchanged) and 0/1/2 for f16/q8_0/q4_0, matching
+// the `kind` the quantizer was launched with.
+//
+// `q35_kv_f16_to_f32` mirrors the CPU's `kv_f16_to_f32` (kv.c) bit for bit --
+// the SAME manual subnormal/normal/inf decode, so a quantized element decoded
+// here equals the CPU's dequant of the same byte.  `q35_kv_block_elem`
+// decodes element `k` (0..31) of one 32-element block, expression-for-
+// expression with `q35_kv_dequant_q8_0` / `q35_kv_dequant_q4_0` /
+// `q35_kv_dequant_f16`.
+__device__ __forceinline__ float q35_kv_f16_to_f32(unsigned short h)
+{
+    const unsigned sign = (unsigned)(h & 0x8000u) << 16;
+    const unsigned exp = (unsigned)(h >> 10) & 0x1Fu;
+    const unsigned mant = (unsigned)(h & 0x3FFu);
+    unsigned out;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        unsigned m = mant;
+        unsigned lz = 0;
+        while (m < 0x200u) { m <<= 1; lz++; }
+        out = sign | ((112u - lz) << 23) | ((m & 0x1FFu) << 14);
+    } else if (exp == 31) {
+        out = sign | 0x7F800000u | ((mant << 14) & 0x7FFFFFu);
+    } else {
+        out = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return __uint_as_float(out);
+}
+
+__device__ __forceinline__ float q35_kv_block_elem(const unsigned char *block, int k, int kind)
+{
+    if (kind == 0) {
+        const unsigned short h = (unsigned short)block[2 * k] |
+                                 ((unsigned short)block[2 * k + 1] << 8);
+        return q35_kv_f16_to_f32(h);
+    }
+    const unsigned short h = (unsigned short)block[0] |
+                             ((unsigned short)block[1] << 8);
+    const float d = q35_kv_f16_to_f32(h);
+    if (kind == 1) {
+        return __fmul_rn(d, (float)(signed char)block[2 + k]);
+    }
+    const unsigned char q = (k < 16) ? (block[2 + k] & 0x0Fu)
+                                      : ((block[2 + (k - 16)] >> 4) & 0x0Fu);
+    return __fmul_rn(d, (float)((int)q - 8));
+}
+
 // One block per (row, head).  `d_q`/`d_gate`/`d_gout` are indexed by
 // (token, head): row r at `r * heads * hd + h * hd`, matching the chunk buffers
 // `qK`/`gateK`/`goutK` that engine.zig fills.
@@ -114,7 +165,7 @@ __global__ void q35_attn_chunk_kernel(
     const float *__restrict__ d_kcache,
     const float *__restrict__ d_vcache,
     float *__restrict__ d_gout,
-    int slot0, int heads, int gqa, int hd, int kv_dim, float scale)
+    int slot0, int heads, int gqa, int hd, int kv_dim, float scale, int kv_kind)
 {
     const int r = blockIdx.x;               // token within the chunk
     const int h = blockIdx.y;               // head
@@ -127,14 +178,29 @@ __global__ void q35_attn_chunk_kernel(
     const int row_len = heads * hd;
     const float *__restrict__ qs = d_q + (size_t)r * row_len + (size_t)h * hd;
 
+    // Quantized-cache geometry: row `row_b` bytes, 32-elem block `stride` bytes.
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
+
     extern __shared__ float s_scores[];
     float *const s_max = &s_scores[n];
     float *const s_sum = &s_scores[n + 1];
 
     for (int t = tid; t < n; t += nt) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = 0; j < hd; ++j) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         s_scores[t] = __fmul_rn(acc, scale);
     }
     __syncthreads();
@@ -160,10 +226,22 @@ __global__ void q35_attn_chunk_kernel(
     const float *__restrict__ gt = d_gate + (size_t)r * row_len + (size_t)h * hd;
     for (int j = tid; j < hd; j += nt) {
         float acc = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            const float w = s_scores[t];
-            const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
-            acc = __fadd_rn(acc, __fmul_rn(w, vv));
+        if (kv_kind < 0) {
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const unsigned char *vrow = vcache_b + (size_t)t * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
         }
         // Gate folded in: the per-token launcher ran this as a second kernel over
         // the whole head set.  Per-element and order-independent, so exact.
@@ -176,7 +254,7 @@ extern "C" int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
                                      const float *d_kcache, const float *d_vcache,
                                      float *d_gout, int slot0, int rows, int heads,
                                      int gqa, int hd, int kv_dim, float scale,
-                                     void *stream)
+                                     int kv_kind, void *stream)
 {
     if (rows <= 0 || heads <= 0 || hd <= 0) return (int)cudaSuccess;
     if (slot0 < 0 || slot0 + rows > Q35_ATTN_MAX_ROWS) return cudaErrorInvalidValue;
@@ -184,7 +262,7 @@ extern "C" int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
     const size_t smem = (size_t)(slot0 + rows + 2) * sizeof(float);
     dim3 grid((unsigned)rows, (unsigned)heads);
     q35_attn_chunk_kernel<<<grid, 128, smem, (cudaStream_t)stream>>>(
-        d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+        d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale, kv_kind);
     return (int)cudaGetLastError();
 }
 
@@ -204,7 +282,7 @@ __global__ void q35_attn_decode_kernel(
     const float *__restrict__ d_vcache,
     float *__restrict__ d_att,
     float *__restrict__ d_gout,
-    int slot, int heads, int gqa, int hd, int kv_dim, float scale)
+    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int kv_kind)
 {
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
@@ -213,6 +291,10 @@ __global__ void q35_attn_decode_kernel(
     const int n = slot + 1;             // rows written so far
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
 
     // Dynamic: `n` score floats plus two scalars, ONE allocation.
     //
@@ -234,9 +316,18 @@ __global__ void q35_attn_decode_kernel(
     // Thread t owns row t; the j-sum is SERIAL and increasing, like the CPU.
     // A thread must not spin past `n`; rows beyond it are simply not touched.
     for (int t = tid; t < n; t += nt) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = 0; j < hd; ++j) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         s_scores[t] = __fmul_rn(acc, scale);
     }
     __syncthreads();
@@ -274,10 +365,22 @@ __global__ void q35_attn_decode_kernel(
     float *__restrict__ gout = d_gout + (size_t)h * hd;
     for (int j = tid; j < hd; j += nt) {
         float acc = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            const float w = s_scores[t];
-            const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
-            acc = __fadd_rn(acc, __fmul_rn(w, vv));
+        if (kv_kind < 0) {
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const unsigned char *vrow = vcache_b + (size_t)t * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
         }
         gout[j] = acc;
     }
@@ -320,7 +423,7 @@ __global__ void q35_attn_decode_kernel_dyn(
     float *__restrict__ d_att,
     float *__restrict__ d_gout,
     const int *__restrict__ d_slot,
-    int heads, int gqa, int hd, int kv_dim, float scale)
+    int heads, int gqa, int hd, int kv_dim, float scale, int kv_kind)
 {
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
@@ -330,15 +433,28 @@ __global__ void q35_attn_decode_kernel_dyn(
 
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
 
     extern __shared__ float s_scores[];
     float *const s_max = &s_scores[n];
     float *const s_sum = &s_scores[n + 1];
 
     for (int t = tid; t < n; t += nt) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = 0; j < hd; ++j) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         s_scores[t] = __fmul_rn(acc, scale);
     }
     __syncthreads();
@@ -366,10 +482,22 @@ __global__ void q35_attn_decode_kernel_dyn(
     float *__restrict__ gout = d_gout + (size_t)h * hd;
     for (int j = tid; j < hd; j += nt) {
         float acc = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            const float w = s_scores[t];
-            const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
-            acc = __fadd_rn(acc, __fmul_rn(w, vv));
+        if (kv_kind < 0) {
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int t = 0; t < n; ++t) {
+                const float w = s_scores[t];
+                const unsigned char *vrow = vcache_b + (size_t)t * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+            }
         }
         gout[j] = acc;
     }
@@ -397,7 +525,7 @@ extern "C" int q35_launch_attn_decode(const float *d_q, const float *d_gate,
                                       const float *d_vcache, float *d_att,
                                       float *d_gout, int slot, int heads,
                                       int gqa, int hd, int kv_dim, float scale,
-                                      void *stream)
+                                      int kv_kind, void *stream)
 {
     if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
     const int n = slot + 1;
@@ -407,7 +535,7 @@ extern "C" int q35_launch_attn_decode(const float *d_q, const float *d_gate,
     // +2 floats: the two shared scalars that share the dynamic block.
     q35_attn_decode_kernel<<<heads, 128, (size_t)(n + 2) * sizeof(float), (cudaStream_t)stream>>>(
         d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd,
-        kv_dim, scale);
+        kv_dim, scale, kv_kind);
     int rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     const int total = heads * hd;
@@ -430,13 +558,13 @@ extern "C" int q35_launch_attn_decode_dyn(const float *d_q, const float *d_gate,
                                           const float *d_vcache, float *d_att,
                                           float *d_gout, const int *d_slot,
                                           int heads, int gqa, int hd, int kv_dim,
-                                          float scale, void *stream)
+                                          float scale, int kv_kind, void *stream)
 {
     if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
     if (d_slot == nullptr) return (int)cudaErrorInvalidValue;
     q35_attn_decode_kernel_dyn<<<heads, 128, (size_t)Q35_ATTN_SMEM_DYNSLOT, (cudaStream_t)stream>>>(
         d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd,
-        kv_dim, scale);
+        kv_dim, scale, kv_kind);
     int rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     const int total = heads * hd;
@@ -479,7 +607,7 @@ __global__ void q35_attn_decode_kernel_coal(
     const float *__restrict__ d_vcache,
     float *__restrict__ d_att,
     float *__restrict__ d_gout,
-    int slot, int heads, int gqa, int hd, int kv_dim, float scale)
+    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int kv_kind)
 {
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
@@ -490,6 +618,10 @@ __global__ void q35_attn_decode_kernel_coal(
     const int n = slot + 1;
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
 
     extern __shared__ float s_scores[];
     float *const s_max = &s_scores[n];
@@ -497,9 +629,18 @@ __global__ void q35_attn_decode_kernel_coal(
 
     // ---- scores: one warp per row, lanes tile j ----------------------------
     for (int t = warp; t < n; t += nwarps) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = lane; j < hd; j += 32) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, o));
         if (lane == 0) s_scores[t] = __fmul_rn(acc, scale);
     }
@@ -535,9 +676,20 @@ __global__ void q35_attn_decode_kernel_coal(
     const int jstep = nwarps * 32;
     for (; j < hd; j += jstep) {
         float a = 0.0f;
-        const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
-        for (int t = 0; t < n; ++t)
-            a = __fadd_rn(a, __fmul_rn(s_scores[t], vcol[(size_t)t * kv_dim]));
+        if (kv_kind < 0) {
+            const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
+            for (int t = 0; t < n; ++t)
+                a = __fadd_rn(a, __fmul_rn(s_scores[t], vcol[(size_t)t * kv_dim]));
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int t = 0; t < n; ++t) {
+                const unsigned char *vrow = vcache_b + (size_t)t * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                a = __fadd_rn(a, __fmul_rn(s_scores[t], vv));
+            }
+        }
         gout[j] = a;
     }
 }
@@ -552,14 +704,14 @@ extern "C" int q35_launch_attn_decode_coal(const float *d_q, const float *d_gate
                                            const float *d_vcache, float *d_att,
                                            float *d_gout, int slot, int heads,
                                            int gqa, int hd, int kv_dim, float scale,
-                                           void *stream)
+                                           int kv_kind, void *stream)
 {
     if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
     const int n = slot + 1;
     if (n > Q35_ATTN_MAX_ROWS) return cudaErrorInvalidValue;
     q35_attn_decode_kernel_coal<<<heads, 256, (size_t)(n + 2) * sizeof(float), (cudaStream_t)stream>>>(
         d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd,
-        kv_dim, scale);
+        kv_dim, scale, kv_kind);
     int rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     const int total = heads * hd;
@@ -595,7 +747,8 @@ __global__ void q35_attn_decode_kernel_split(
     float *__restrict__ d_gout,
     float *__restrict__ d_part,   // [heads][SPLIT][hd]
     const float *__restrict__ d_prob,  // [n] probabilities from the score kernel
-    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int split)
+    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int split,
+    int kv_kind)
 {
     const int h = blockIdx.x / split;
     const int s = blockIdx.x % split;
@@ -606,6 +759,9 @@ __global__ void q35_attn_decode_kernel_split(
     if (h >= heads) return;
     const int n = slot + 1;
     const int kvh = h / gqa;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
 
     // Contiguous slice of rows for this block (last block takes the remainder).
     const int per = (n + split - 1) / split;
@@ -624,9 +780,20 @@ __global__ void q35_attn_decode_kernel_split(
     float *__restrict__ part = d_part + ((size_t)h * split + s) * (size_t)hd;
     for (int j = warp * 32 + lane; j < hd; j += nwarps * 32) {
         float a = 0.0f;
-        const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
-        for (int i = 0; i < cnt; ++i)
-            a = __fadd_rn(a, __fmul_rn(prob[i], vcol[(size_t)(t0 + i) * kv_dim]));
+        if (kv_kind < 0) {
+            const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
+            for (int i = 0; i < cnt; ++i)
+                a = __fadd_rn(a, __fmul_rn(prob[i], vcol[(size_t)(t0 + i) * kv_dim]));
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int i = 0; i < cnt; ++i) {
+                const unsigned char *vrow = vcache_b + (size_t)(t0 + i) * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                a = __fadd_rn(a, __fmul_rn(prob[i], vv));
+            }
+        }
         part[j] = a;
     }
 }
@@ -681,7 +848,7 @@ __global__ void q35_attn_score_split_kernel_dyn(
     const float *__restrict__ d_kcache,
     float *__restrict__ d_att,
     const int *__restrict__ d_slot,
-    int heads, int gqa, int hd, int kv_dim, float scale, int split)
+    int heads, int gqa, int hd, int kv_dim, float scale, int split, int kv_kind)
 {
     const int h = blockIdx.x / split;
     const int s = blockIdx.x % split;
@@ -690,15 +857,27 @@ __global__ void q35_attn_score_split_kernel_dyn(
     const int n = *d_slot + 1;
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
     const int warp = tid >> 5, lane = tid & 31;
     const int nwarps = blockDim.x >> 5;
     const int per = (n + split - 1) / split;
     const int t0 = s * per, t1 = min(n, t0 + per);
     float *__restrict__ mine = d_att + (size_t)h * (size_t)Q35_ATTN_MAX_ROWS;
     for (int t = t0 + warp; t < t1; t += nwarps) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = lane; j < hd; j += 32) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, o));
         if (lane == 0) mine[t] = __fmul_rn(acc, scale);
     }
@@ -742,7 +921,7 @@ __global__ void q35_attn_pv_split_kernel_dyn(
     float *__restrict__ d_part,
     const float *__restrict__ d_prob,
     const int *__restrict__ d_slot,
-    int heads, int gqa, int hd, int kv_dim, int split)
+    int heads, int gqa, int hd, int kv_dim, int split, int kv_kind)
 {
     const int h = blockIdx.x / split;
     const int s = blockIdx.x % split;
@@ -750,6 +929,9 @@ __global__ void q35_attn_pv_split_kernel_dyn(
     if (h >= heads) return;
     const int n = *d_slot + 1;
     const int kvh = h / gqa;
+    const unsigned char *vcache_b = (const unsigned char *)d_vcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
     const int warp = tid >> 5, lane = tid & 31;
     const int nwarps = blockDim.x >> 5;
     const int per = (n + split - 1) / split;
@@ -759,9 +941,20 @@ __global__ void q35_attn_pv_split_kernel_dyn(
     float *__restrict__ part = d_part + ((size_t)h * split + s) * (size_t)hd;
     for (int j = warp * 32 + lane; j < hd; j += nwarps * 32) {
         float a = 0.0f;
-        const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
-        for (int i = 0; i < cnt; ++i)
-            a = __fadd_rn(a, __fmul_rn(prob[i], vcol[(size_t)(t0 + i) * kv_dim]));
+        if (kv_kind < 0) {
+            const float *__restrict__ vcol = d_vcache + (size_t)kvh * hd + j;
+            for (int i = 0; i < cnt; ++i)
+                a = __fadd_rn(a, __fmul_rn(prob[i], vcol[(size_t)(t0 + i) * kv_dim]));
+        } else {
+            const int base = kvh * hd + j;
+            const int blk = base / 32;
+            const int off = base % 32;
+            for (int i = 0; i < cnt; ++i) {
+                const unsigned char *vrow = vcache_b + (size_t)(t0 + i) * row_b;
+                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
+                a = __fadd_rn(a, __fmul_rn(prob[i], vv));
+            }
+        }
         part[j] = a;
     }
 }
@@ -777,21 +970,21 @@ extern "C" int q35_launch_attn_decode_split_dyn(
     const float *d_q, const float *d_gate, const float *d_kcache,
     const float *d_vcache, float *d_att, float *d_gout, float *d_part,
     const int *d_slot, int heads, int gqa, int hd, int kv_dim, float scale,
-    int split, void *stream)
+    int split, int kv_kind, void *stream)
 {
     if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
     if (d_slot == nullptr || d_part == nullptr) return (int)cudaErrorInvalidValue;
     if (split < 2) split = 2;
     if (split > Q35_ATTN_SPLIT_MAX) split = Q35_ATTN_SPLIT_MAX;
     q35_attn_score_split_kernel_dyn<<<heads * split, 256, 0, (cudaStream_t)stream>>>(
-        d_q, d_kcache, d_att, d_slot, heads, gqa, hd, kv_dim, scale, split);
+        d_q, d_kcache, d_att, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind);
     int rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     q35_attn_softmax_kernel_dyn<<<heads, 256, 0, (cudaStream_t)stream>>>(d_att, d_slot, heads);
     rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     q35_attn_pv_split_kernel_dyn<<<heads * split, 256, 0, (cudaStream_t)stream>>>(
-        d_vcache, d_part, d_att, d_slot, heads, gqa, hd, kv_dim, split);
+        d_vcache, d_part, d_att, d_slot, heads, gqa, hd, kv_dim, split, kv_kind);
     rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     const int total = heads * hd;
@@ -804,7 +997,7 @@ __global__ void q35_attn_score_split_kernel(
     const float *__restrict__ d_q,
     const float *__restrict__ d_kcache,
     float *__restrict__ d_att,
-    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int split)
+    int slot, int heads, int gqa, int hd, int kv_dim, float scale, int split, int kv_kind)
 {
     const int h = blockIdx.x / split;
     const int s = blockIdx.x % split;
@@ -813,15 +1006,27 @@ __global__ void q35_attn_score_split_kernel(
     const int n = slot + 1;
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;
+    const unsigned char *kcache_b = (const unsigned char *)d_kcache;
+    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t row_b = (size_t)(kv_dim / 32) * stride;
     const int warp = tid >> 5, lane = tid & 31;
     const int nwarps = blockDim.x >> 5;
     const int per = (n + split - 1) / split;
     const int t0 = s * per, t1 = min(n, t0 + per);
     float *__restrict__ mine = d_att + (size_t)h * (size_t)Q35_ATTN_MAX_ROWS;
     for (int t = t0 + warp; t < t1; t += nwarps) {
-        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
         float acc = 0.0f;
-        for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        if (kv_kind < 0) {
+            const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+            for (int j = lane; j < hd; j += 32) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        } else {
+            const unsigned char *krow = kcache_b + (size_t)t * row_b;
+            const int base = kvh * hd;
+            for (int j = lane; j < hd; j += 32) {
+                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
+                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            }
+        }
         for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, o));
         if (lane == 0) mine[t] = __fmul_rn(acc, scale);
     }
@@ -867,7 +1072,8 @@ extern "C" int q35_launch_attn_decode_split2(const float *d_q, const float *d_ga
                                              const float *d_vcache, float *d_att,
                                              float *d_gout, float *d_part, int slot,
                                              int heads, int gqa, int hd, int kv_dim,
-                                             float scale, int split, void *stream)
+                                             float scale, int split, int kv_kind,
+                                             void *stream)
 {
     if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
     const int n = slot + 1;
@@ -878,9 +1084,9 @@ extern "C" int q35_launch_attn_decode_split2(const float *d_q, const float *d_ga
     if (split == 1 || d_part == nullptr)
         return q35_launch_attn_decode_coal(d_q, d_gate, d_kcache, d_vcache, d_att,
                                            d_gout, slot, heads, gqa, hd, kv_dim,
-                                           scale, stream);
+                                           scale, kv_kind, stream);
     q35_attn_score_split_kernel<<<heads * split, 256, 0, (cudaStream_t)stream>>>(
-        d_q, d_kcache, d_att, slot, heads, gqa, hd, kv_dim, scale, split);
+        d_q, d_kcache, d_att, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind);
     int rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     q35_attn_softmax_kernel<<<heads, 256, 0, (cudaStream_t)stream>>>(d_att, slot, heads);
@@ -888,7 +1094,7 @@ extern "C" int q35_launch_attn_decode_split2(const float *d_q, const float *d_ga
     if (rc != (int)cudaSuccess) return rc;
     q35_attn_decode_kernel_split<<<heads * split, 256, 0, (cudaStream_t)stream>>>(
         d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_att, slot, heads,
-        gqa, hd, kv_dim, scale, split);
+        gqa, hd, kv_dim, scale, split, kv_kind);
     rc = (int)cudaGetLastError();
     if (rc != (int)cudaSuccess) return rc;
     const int total = heads * hd;

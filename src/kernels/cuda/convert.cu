@@ -72,6 +72,78 @@ __global__ void q35_k_quantize_q8_0(const float *__restrict__ x,
     }
 }
 
+// KV-cache quantizer: f32 rows -> the cache byte layout, ONE thread per
+// 32-element block.  `kind` selects the format -- 0 = f16 (64 B/block, no
+// header), 1 = block_q8_0 (34 B, d@0 + 32 x int8 @2), 2 = block_q4_0
+// (18 B, d@0 + 16 packed-nibble bytes @2).  Every byte is bit-identical to the
+// CPU's `q35_kv_quant_*` (src/kernels/x86/kv.c), which is the reference the
+// attention dequant below (`q35_kv_block_elem` in attn.cu) decodes:
+//   * f16 elements and both scale headers go through q35_st_scale_bits, i.e.
+//     k32_f32_to_f16bits (round-to-nearest-even), the SAME function the CPU
+//     writes with (kv.c `kv_f32_to_f16bits`);
+//   * q8_0 quants reuse `q35_k_quantize_q8_0`'s rounding expression for
+//     expression (kernels32.c:1059);
+//   * q4_0 quants use the same `(int)(v + (v>=0?0.5f:-0.5f)) + 8` and the
+//     byte-k packing (element k low, element 16+k high) that
+//     `quant.dequantQ4_0` reads.
+__global__ void q35_k_kv_quant(const float *__restrict__ x,
+                               unsigned char *__restrict__ out, int nblocks, int kind)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    const float *xb = x + (size_t)b * Q35_QK8_0;
+    if (kind == 0) {
+        unsigned char *ob = out + (size_t)b * 64;
+#pragma unroll
+        for (int k = 0; k < Q35_QK8_0; ++k) {
+            const unsigned short h = q35_st_scale_bits(xb[k]);
+            ob[2 * k] = (unsigned char)(h & 0xffu);
+            ob[2 * k + 1] = (unsigned char)(h >> 8);
+        }
+        return;
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (int k = 0; k < Q35_QK8_0; ++k) {
+        const float a = fabsf(xb[k]);
+        if (a > amax) amax = a;
+    }
+    if (kind == 1) {
+        // block_q8_0: identical to `q35_k_quantize_q8_0` above.
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        const float inv = amax > 0.0f ? 1.0f / scale : 0.0f;
+        unsigned char *ob = out + (size_t)b * Q35_Q8_0_BLOCK_BYTES;
+        q35_store_scale(ob, scale);
+        signed char *qs = (signed char *)(ob + 2);
+#pragma unroll
+        for (int k = 0; k < Q35_QK8_0; ++k) {
+            const float v = xb[k] * inv;
+            int q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            qs[k] = (signed char)q;
+        }
+    } else {
+        // kind == 2, block_q4_0: kv.c `q35_kv_quant_q4_0`.
+        const float scale = amax > 0.0f ? amax / 8.0f : 1.0f;
+        const float inv = amax > 0.0f ? 1.0f / scale : 0.0f;
+        unsigned char *ob = out + (size_t)b * 18;
+        q35_store_scale(ob, scale);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float v0 = xb[k] * inv;
+            const float v1 = xb[16 + k] * inv;
+            int q0 = (int)(v0 + (v0 >= 0.0f ? 0.5f : -0.5f)) + 8;
+            int q1 = (int)(v1 + (v1 >= 0.0f ? 0.5f : -0.5f)) + 8;
+            if (q0 > 15) q0 = 15;
+            if (q0 < 0) q0 = 0;
+            if (q1 > 15) q1 = 15;
+            if (q1 < 0) q1 = 0;
+            ob[2 + k] = (unsigned char)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // device kernels: dequantizers, one thread per NATIVE block
 //
@@ -682,6 +754,23 @@ extern "C" int q35_launch_quantize_q8_0(const float *d_x, void *d_out_v,
     const int threads = 128;
     const int blocks = (nblocks + threads - 1) / threads;
     q35_k_quantize_q8_0<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks);
+    return (int)cudaGetLastError();
+}
+
+// Host-stub address of the KV quantizer; the decode-graph path matches its
+// captured nodes on this value (see `q35_func_copy_range`).
+extern "C" void *q35_func_kv_quant(void) { return (void *)&q35_k_kv_quant; }
+
+// `nblocks` = number of 32-element blocks in the rows being written.
+extern "C" int q35_launch_kv_quant(const float *d_x, void *d_out_v, int nblocks,
+                                   int kind, void *stream_v)
+{
+    unsigned char *d_out = (unsigned char *)d_out_v;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    if (nblocks <= 0) return (int)cudaSuccess;
+    const int threads = 128;
+    const int blocks = (nblocks + threads - 1) / threads;
+    q35_k_kv_quant<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks, kind);
     return (int)cudaGetLastError();
 }
 
