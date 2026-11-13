@@ -638,37 +638,6 @@ pub const Engine = struct {
     sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
 
-    // ---- MTP / nextn speculative decoding (blk.64, present only on 27B) ----
-    /// nextn decoder-layer weights (blk.64, full-attention; same shape as a main
-    /// full-attn layer).  Null when the model has no nextn layer (0.8B/2B/4B).
-    nextn_layer: ?LayerWeights = null,
-    /// Independent KV cache for the nextn layer (blk.64 full attention).
-    nextn_kv: ?KvCache = null,
-    /// nextn-specific tensors (blk.64.nextn.*).
-    nextn_eh_proj: ?LinearW = null, // [2*hidden, hidden]
-    nextn_enorm: ?[]f32 = null, // [hidden]
-    nextn_hnorm: ?[]f32 = null, // [hidden]
-    nextn_shnorm: ?[]f32 = null, // [hidden] shared_head_norm
-    /// true once the model's nextn layer is loaded (27B).
-    has_nextn: bool = false,
-    /// scratch for nextn_forward: concat (2*hidden) + h/e/z rows (hidden each).
-    nxt_concat: backend.Buf = backend.Buf.empty,
-    nxt_h: backend.Buf = backend.Buf.empty,
-    nxt_e: backend.Buf = backend.Buf.empty,
-    nxt_z: backend.Buf = backend.Buf.empty,
-    /// per-position final-normed hidden states from the last batched verify
-    /// (K rows of `hidden`), plus per-position logits row for argmax.
-    verify_h: backend.Buf = backend.Buf.empty, // [K*hidden]
-    verify_logits: backend.Buf = backend.Buf.empty, // [K*vocab]
-    /// GDN rollback snapshots: `mtp_snap` holds, per GDN layer, K copies of the
-    /// state (delta-rule [nv*kd*kd] + conv [conv_dim*(conv_kernel-1)]) taken
-    /// after each consumed token during the batched verify.
-    mtp_snap_state: [][]f32 = &.{}, // [gdn_layers][K] state snapshots
-    mtp_snap_conv: [][]f32 = &.{}, // [gdn_layers][K] conv snapshots
-    mtp_snap_len: []u32 = &.{}, // [K] full-attn kv.len after each consumed token
-    /// number of draft tokens per MTP step (N).
-    mtp_n: usize = 3,
-
 
     /// Packed weight types are defined by the GGUF module (`gguf.QuantRow` is
     /// pure layout); the backend owns `LinearW` because whether a weight lives
@@ -822,6 +791,12 @@ pub const Engine = struct {
         // block_count includes the trailing MTP/nextn prediction layer(s)
         // (27B: block_count=65, nextn=1 -> main decoder = layers 0..63).
         // The 0.8B/2B/4B files have no nextn key -> 0 -> unchanged.
+        //
+        // This is NOT the dead speculative-decoding scaffolding that used to
+        // live next to it: the count has to shrink because blk.64 is a
+        // prediction head, not a decoder layer, and `LayerWeights` below is
+        // loaded per main layer.  Leave it even though nothing consumes
+        // blk.64's weights anymore.
         var n_nextn: u32 = 0;
         if (g.getUint("qwen35.block_count")) |v| {
             cfg.n_layers = @intCast(v);

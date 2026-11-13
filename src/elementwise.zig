@@ -384,7 +384,7 @@ pub fn gdnGammaKernel(a_raw: []const f32, b_raw: []f32, ssm_a: []const f32, dt_b
 }
 
 /// Copy `n` floats: a device backend maps this to cudaMemcpy; the host copy is
-/// the CPU case.  Used for KV-cache writes and the MTP state snapshots.
+/// the CPU case.  Used for KV-cache writes and GDN state snapshots.
 pub fn copyKernel(dst: []f32, src: []const f32) void {
     @memcpy(dst, src);
 }
