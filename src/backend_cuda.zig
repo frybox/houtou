@@ -317,6 +317,7 @@ const Launch = if (cuda_linked) struct {
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
     const attn_decode = Kernels.q35_launch_attn_decode;
     const attn_chunk = Kernels.q35_launch_attn_chunk;
+    const attn_chunk_max_rows = Kernels.q35_attn_chunk_max_rows;
     const attn_decode_dyn = Kernels.q35_launch_attn_decode_dyn;
     const attn_decode_coal = Kernels.q35_launch_attn_decode_coal;
     const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
@@ -476,6 +477,14 @@ const Launch = if (cuda_linked) struct {
     fn attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, stream };
         return stubNoCudaKernels();
+    }
+    /// No chunk kernel means no chunking: 0 tells `dAttnChunk` to leave
+    /// `maxrows` at zero and skip the sliced path entirely.  Returning a
+    /// positive number here would be the dangerous answer -- the slice loop
+    /// would then call the stubbed `attn_chunk` above.
+    fn attn_chunk_max_rows(slot0: c_int) c_int {
+        _ = slot0;
+        return 0;
     }
     fn deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_src, heads, hd, tokens, stream };
@@ -7783,7 +7792,7 @@ const attn_score_arity: usize = 10;
         // rows and the cache prefix it needs.
         var maxrows: usize = 0;
         if (self.cu != null and shapes_ok) {
-            const m = Kernels.q35_attn_chunk_max_rows(@intCast(slot0));
+            const m = Launch.attn_chunk_max_rows(@intCast(slot0));
             if (m > 0) maxrows = @intCast(m);
         }
 
@@ -7798,7 +7807,7 @@ const attn_score_arity: usize = 10;
                                     // `maxrows` shrinks as `slot0` grows, so
                                     // recompute it per slice rather than
                                     // trusting the first value.
-                                    const m2 = Kernels.q35_attn_chunk_max_rows(@intCast(slot0 + done));
+                                    const m2 = Launch.attn_chunk_max_rows(@intCast(slot0 + done));
                                     if (m2 <= 0) break;
                                     const take = @min(rows - done, @as(usize, @intCast(m2)));
                                     const rc = Launch.attn_chunk(

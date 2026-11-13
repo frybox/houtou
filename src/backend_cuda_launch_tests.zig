@@ -129,30 +129,61 @@ test "Launch: every CUDA alias has a fallback stub, and vice versa" {
     try std.testing.expectEqual(aliased.len, stubs.len);
 }
 
-test "Launch: no call site bypasses the seam with Kernels.q35_launch_*" {
-    // Legal places for `Kernels.q35_launch_*`: the `extern fn` declarations (no
+/// `const <name> = Kernels.<something>;` -- a seam alias, not a call.
+/// Requires an `=` and the statement to end at the `;`, so a call expression
+/// stored in a local (`const m = Kernels.q35_X(...)`) is NOT matched.
+fn isAlias(line: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, "const ")) return false;
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return false;
+    const rhs = std.mem.trim(u8, line[eq + 1 ..], " \t");
+    if (!std.mem.startsWith(u8, rhs, "Kernels.")) return false;
+    // `Kernels.name;` or `Kernels.name ,` -- never `Kernels.name(`.
+    const name = rhs["Kernels.".len..];
+    const end = std.mem.indexOfScalar(u8, name, ';') orelse return false;
+    return std.mem.indexOfScalar(u8, name[0..end], '(') == null;
+}
+
+test "Launch: no call site bypasses the seam with Kernels.q35_*" {
+    // Legal places for `Kernels.q35_*`: the `extern fn` declarations (no
     // `Kernels.` prefix, so they cannot match) and the `const ... = Kernels.
-    // q35_launch_*;` alias lines inside the CUDA branch.  Anything else is a call
-    // site, and a call site that names the extern directly has no fallback.
+    // q35_*;` alias lines inside the CUDA branch.  Anything else is a call site,
+    // and a call site that names the extern directly has no fallback.
+    //
+    // The prefix is `Kernels.q35_` and NOT `Kernels.q35_launch_`: query-style
+    // helpers are just as linkable-only-with-CUDA as the launchers.  A real miss
+    // slipped through under the narrower prefix -- `q35_attn_chunk_max_rows` was
+    // called as `Kernels.q35_attn_chunk_max_rows` from `dAttnChunk` while
+    // `Launch.attn_chunk` had a stub, so `make cpu` failed with
+    // `undefined symbol: q35_attn_chunk_max_rows` even though this test passed.
     var it = std.mem.splitScalar(u8, src_text, '\n');
     var line_no: usize = 0;
     var bad: [32]usize = undefined;
     var nbad: usize = 0;
     while (it.next()) |raw| {
         line_no += 1;
-        // Only the CODE part of the line: `Kernels.q35_launch_*` written in prose
+        // Only the CODE part of the line: `Kernels.q35_*` written in prose
         // (there is such a sentence in `backend_cuda.zig`'s own comment) is not a
         // call site.
         const code = raw[0 .. std.mem.indexOf(u8, raw, "//") orelse raw.len];
         const line = std.mem.trim(u8, code, " \t\r");
-        if (std.mem.indexOf(u8, line, "Kernels.q35_launch_") == null) continue;
-        if (std.mem.startsWith(u8, line, "const ")) continue; // an alias: that IS the seam
+        if (std.mem.indexOf(u8, line, "Kernels.q35_") == null) continue;
+        // An ALIAS is `const <name> = Kernels.<...>;` and nothing else.  Testing
+        // merely for a leading `const ` also swallowed ordinary
+        // `const m = Kernels.q35_X(...)` call sites -- which is exactly how the
+        // `q35_attn_chunk_max_rows` bypass below stayed invisible for a release.
+        if (isAlias(line)) continue; // that IS the seam
+        // `q35_func_*` returns a raw function pointer and is only ever used from
+        // inside `if (cuda_linked)`, so the CPU branch never analyses those lines
+        // (see `resolve()` in the graph-capture section).  They are a different
+        // seam -- `Launch` exists for launch calls, not for node classification --
+        // and they need no stub.
+        if (std.mem.indexOf(u8, line, "Kernels.q35_func_") != null) continue;
         if (nbad < bad.len) bad[nbad] = line_no;
         nbad += 1;
     }
     if (nbad != 0) {
         std.debug.print(
-            "\nLaunch seam bypassed: {d} call site(s) name `Kernels.q35_launch_*` directly.\n" ++
+            "\nLaunch seam bypassed: {d} call site(s) name `Kernels.q35_*` directly.\n" ++
                 "  -> the CPU-only build links against a symbol that only exists with -Dcuda=true.\n" ++
                 "     Call `Launch.<name>` instead, and give it a stub if it lacks one.\n",
             .{nbad},
