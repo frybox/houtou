@@ -107,12 +107,13 @@
 #define Q35_ATTN_CHUNK_SMEM_MAX (48 * 1024 / (int)sizeof(float))
 
 // Extra bytes the chunk kernel needs in its dynamic block beyond the scores and
-// the two scalars: the q8_0 copy of Q (`hd/4` words) plus two floats.  Only
-// reserved for the block formats; f16/f32 still request the plain size.
+// the two scalars: the q8_0 copy of Q (`hd/4` int) plus two floats plus one
+// per-32-element-block Q sum (`hd/32` int) for q4_0's offset correction.
+// f32 and f16 request the plain size.
 static inline size_t q35_attn_chunk_extra_smem(int hd, int kv_kind)
 {
     if (kv_kind != 1 && kv_kind != 2) return 0;
-    return (size_t)(hd / 4) * sizeof(int) + 2 * sizeof(float);
+    return (size_t)(hd / 4) * sizeof(int) + 2 * sizeof(float) + (size_t)(hd / 32) * sizeof(int);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,8 +398,7 @@ __global__ void q35_attn_chunk_kernel(
     if (int_dot and tid == 0) {
         q35_kv_prep_q(qs, hd, s_q8, s_qblk, s_qpar);
     }
-    // Only the formats that read `s_q8` need everyone to see it; f32/f16 skip
-    // the barrier AND the (unreached) shared-memory writes entirely.
+    // Only the block formats read shared Q scaffolding.
     if (int_dot) __syncthreads();
 
     for (int t = tid; t < n; t += nt) {
@@ -422,15 +422,42 @@ __global__ void q35_attn_chunk_kernel(
                     acc = __fadd_rn(acc, __fmul_rn(d * qd, (float)isum));
                 }
             } else {
-                for (int j = 0; j < hd; j += 4) {
-                    const unsigned char *blk = krow + (size_t)(j / 32) * stride;
-                    float v4[4];
-                    q35_kv_dequant4(blk, j % 32, kv_kind, v4);
-                    acc = __fadd_rn(acc, __fmul_rn(qs[j], v4[0]));
-                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 1], v4[1]));
-                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 2], v4[2]));
-                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 3], v4[3]));
+                // f16 cache: the bytes ARE the values, so an 8-half read feeds
+                // 8 MACs with no scale to apply.
+                //
+                // EIGHT accumulators: the dot is a LATENCY chain, not a
+                // throughput problem.  With 4 chains (and 64 steps each) f16
+                // measured 0.046 s against f32's 0.023 s for the same 517-token
+                // prefill, even though f16 issues fewer instructions -- every
+                // step waited on the previous `__fadd_rn`.
+                float a[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                // Walk the row with a POINTER, and read through `half2*`: with
+                // `__builtin_memcpy` from a `const unsigned char *` ptxas could
+                // not prove the 8-byte alignment and emitted 32 separate
+                // `LDG.E.U8` per block (measured in SASS).  A block is 64 B of
+                // contiguous halves starting at a `stride`-aligned address, so
+                // every 2-half piece here is 4-byte aligned.
+                const half2 *kp = (const half2 *)krow;
+                for (int j = 0; j < hd; j += 8) {
+                    const int off = (j & 31) >> 1; // half2 index inside the block
+                    const half2 *h2 = kp + off;
+                    const float2 f0 = __half22float2(h2[0]);
+                    const float2 f1 = __half22float2(h2[1]);
+                    const float2 f2 = __half22float2(h2[2]);
+                    const float2 f3 = __half22float2(h2[3]);
+                    if (off == 12) kp += (stride >> 2); // 32 halves = 16 half2
+                    a[0] = __fadd_rn(a[0], __fmul_rn(qs[j + 0], f0.x));
+                    a[1] = __fadd_rn(a[1], __fmul_rn(qs[j + 1], f0.y));
+                    a[2] = __fadd_rn(a[2], __fmul_rn(qs[j + 2], f1.x));
+                    a[3] = __fadd_rn(a[3], __fmul_rn(qs[j + 3], f1.y));
+                    a[4] = __fadd_rn(a[4], __fmul_rn(qs[j + 4], f2.x));
+                    a[5] = __fadd_rn(a[5], __fmul_rn(qs[j + 5], f2.y));
+                    a[6] = __fadd_rn(a[6], __fmul_rn(qs[j + 6], f3.x));
+                    a[7] = __fadd_rn(a[7], __fmul_rn(qs[j + 7], f3.y));
                 }
+                acc = __fadd_rn(
+                    __fadd_rn(__fadd_rn(a[0], a[1]), __fadd_rn(a[2], a[3])),
+                    __fadd_rn(__fadd_rn(a[4], a[5]), __fadd_rn(a[6], a[7])));
             }
         }
         s_scores[t] = __fmul_rn(acc, scale);
@@ -471,29 +498,45 @@ __global__ void q35_attn_chunk_kernel(
             gout[j] = acc * (1.0f / (1.0f + expf(-g)));
         }
     } else {
-        for (int j = tid; j < hd; j += nt) {
-            float acc = 0.0f;
-            // One V element per thread, t in increasing order -- the CPU's
-            // accumulation order, which the last bits depend on.  What changes
-            // is the DECODE: the element is fetched through a 4-element group
-            // (`q35_kv_dequant4`) instead of a lone per-element bit extract.
-            // Values are bit-identical to the scalar path; only the load width
-            // differs.
-            const int base = kvh * hd + j;
-            const int blk = base / 32;
-            const int lane = base & 3;
-            const int goff = (base % 32) & ~3;
+        // Four CONSECUTIVE j per thread, so one `q35_kv_dequant4` feeds four
+        // accumulators instead of being decoded and then 3/4 discarded.  That
+        // is llama.cpp's V layout (`dequantize_V<T, 4>`, fattn-common.cuh).
+        //
+        // ORDER: each of the four lanes keeps its own `t`-increasing sum, so
+        // every output element sees exactly the CPU's accumulation order --
+        // grouping by j changes which thread owns an element, never the order
+        // of its adds.
+        //
+        // MEASURED: the first version kept one element per thread and decoded
+        // the group anyway; f16 prefill attention then cost 0.056 s against
+        // f32's 0.028 s on a 517-token prompt, i.e. the cache that halves the
+        // bytes ran at half speed.
+        const int j0 = kvh * hd + tid * 4;
+        const int jstep = nt * 4;
+        const int jend = kvh * hd + hd;
+        for (int base = j0; base < jend; base += jstep) {
+            // Recompute from `base` every step: `jstep` is a multiple of 32 in
+            // every configuration used (nt=128 -> 512), but deriving the byte
+            // offsets from the absolute index keeps this right even if it is
+            // not.
+            const int b = base / 32;
+            const int go = (base % 32) & ~3;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
             for (int t = 0; t < n; ++t) {
                 const float w = s_scores[t];
                 const unsigned char *vrow = vcache_b + (size_t)t * row_b;
                 float v4[4];
-                q35_kv_dequant4(vrow + (size_t)blk * stride, goff, kv_kind, v4);
-                acc = __fadd_rn(acc, __fmul_rn(w, v4[lane]));
+                q35_kv_dequant4(vrow + (size_t)b * stride, go, kv_kind, v4);
+                a0 = __fadd_rn(a0, __fmul_rn(w, v4[0]));
+                a1 = __fadd_rn(a1, __fmul_rn(w, v4[1]));
+                a2 = __fadd_rn(a2, __fmul_rn(w, v4[2]));
+                a3 = __fadd_rn(a3, __fmul_rn(w, v4[3]));
             }
-            // Gate folded in: the per-token launcher ran this as a second kernel
-            // over the whole head set.  Per-element and order-independent, so exact.
-            const float g = gt[j];
-            gout[j] = acc * (1.0f / (1.0f + expf(-g)));
+            const int jj = base - kvh * hd;
+            gout[jj] = a0 * (1.0f / (1.0f + expf(-gt[jj])));
+            gout[jj + 1] = a1 * (1.0f / (1.0f + expf(-gt[jj + 1])));
+            gout[jj + 2] = a2 * (1.0f / (1.0f + expf(-gt[jj + 2])));
+            gout[jj + 3] = a3 * (1.0f / (1.0f + expf(-gt[jj + 3])));
         }
     }
 }
