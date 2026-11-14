@@ -5891,9 +5891,16 @@ const attn_score_arity: usize = 11;
         // contract; a violation is a bug, and the CPU reference's slicing would
         // trap on it, so fall through to it rather than launch on bad sizes.
         const nrows = slot + 1;
+        // The cache regions are f32 VIEWS over byte allocations, so a packed row
+        // is only `kvRowBytes/4` elements wide here.  Comparing against
+        // `nrows * kv_dim` rejected every quantized cache and dropped into the
+        // CPU reference, which then read DEVICE pointers on the host -- the
+        // 2026-11 prefill segfault (q8_0, slot0=1024).  `kv_dim` itself stays
+        // the kernel's logical row width; only the length check converts.
+        const cache_row_elems: usize = (backend.kvRowBytes(kv_dim, self.kv_type) + 3) / 4;
         if (self.cu != null and heads != 0 and hd != 0 and
             q.len >= heads * hd and gout.len >= heads * hd and
-            att.len >= nrows and kcache.len >= nrows * kv_dim and vcache.len >= nrows * kv_dim)
+            att.len >= nrows and kcache.len >= nrows * cache_row_elems and vcache.len >= nrows * cache_row_elems)
         {
             if (dBufPtr(q)) |pq| {
                 if (dBufPtr(gate)) |pgate| {
@@ -7945,12 +7952,20 @@ const attn_score_arity: usize = 11;
 
         const row_len = heads * hd;
         const n_tot = slot0 + rows;
+        // Bytes one cache row occupies in the format in use.  A cached region is
+        // an f32 VIEW over its byte allocation, so a packed row is only
+        // `row_bytes/4` elements long here; checking against `n_tot * kv_dim`
+        // would compare bytes with elements and reject every quantized cache.
+        // MEASURED (2026-11): with q8_0 the check was false at all times, so
+        // every prefill silently took the per-row fallback below, and at
+        // slot0=1024 that path handed device pointers to the CPU dequant.
+        const cache_row_elems: usize = (backend.kvRowBytes(kv_dim, self.kv_type) + 3) / 4;
         // The gate kernel that the per-row path runs separately is folded into
         // the chunk kernel, so this path is only taken when EVERY input lines up.
         const shapes_ok = rows != 0 and heads != 0 and hd != 0 and gqa != 0 and
             q.len >= rows * row_len and gate.len >= rows * row_len and
             gout.len >= rows * row_len and
-            kcache.len >= n_tot * kv_dim and vcache.len >= n_tot * kv_dim;
+            kcache.len >= n_tot * cache_row_elems and vcache.len >= n_tot * cache_row_elems;
 
         // A chunk appended to a long KV cache can need more `s_scores` than the
         // 48 KB dynamic budget allows; `q35_attn_chunk_max_rows` reports the
