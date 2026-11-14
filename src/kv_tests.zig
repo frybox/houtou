@@ -141,6 +141,117 @@ test "kv q4_0: C quantize/dequant match the weight-side oracles" {
     }
 }
 
+test "kv int dot: q8_0-quantized Q gives the same dot as float Q within int8 error" {
+    // The CUDA chunk kernel replaces `sum_j q[j] * kv[j]` with an integer dot
+    // product against a q8_0 copy of Q (`q35_kv_dot32_q8`, attn.cu).  This
+    // test states that algorithm in Zig -- it is the ONLY executable check of
+    // the q4_0 nibble/Q-word mapping and of the `-8 * sum(Q)` correction, since
+    // the device code cannot be called from here.
+    //
+    // Equivalence claimed: the integer result equals the dot of the QUANTIZED
+    // Q with the decoded KV block.  The difference from the float-Q dot is the
+    // quantization error of Q itself, bounded below.
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(97);
+    const rand = prng.random();
+
+    for ([_]backend.KvType{ .q8_0, .q4_0 }) |t| {
+        const block_bytes: usize = backend.kvRowBytes(32, t);
+        for (0..32) |_| {
+            const x = try randomRow(alloc, rand, 32);
+            defer alloc.free(x);
+            // KV block in the cache's own layout.
+            const kvb = try alloc.alloc(u8, block_bytes);
+            defer alloc.free(kvb);
+            switch (t) {
+                .q8_0 => c_kernels.quantizeQ8_0(32, x.ptr, kvb.ptr),
+                .q4_0 => c_kernels.kvQuantQ4_0(32, x.ptr, kvb.ptr),
+                else => unreachable,
+            }
+            const kv = try alloc.alloc(f32, 32);
+            defer alloc.free(kv);
+            switch (t) {
+                .q8_0 => c_kernels.kvDequantQ8_0(32, kvb.ptr, kv.ptr),
+                .q4_0 => c_kernels.kvDequantQ4_0(32, kvb.ptr, kv.ptr),
+                else => unreachable,
+            }
+
+            // Q row, quantized to q8_0 exactly as the kernel does.
+            const q = try randomRow(alloc, rand, 32);
+            defer alloc.free(q);
+            var amax: f32 = 0;
+            for (q) |v| amax = @max(amax, @abs(v));
+            const qd: f32 = if (amax > 0) amax / 127.0 else 1.0;
+            const inv: f32 = if (amax > 0) 1.0 / qd else 0.0;
+            var qi: [32]i8 = undefined;
+            for (q, 0..) |v, j| {
+                const s = v * inv;
+                const r: i32 = @intFromFloat(if (s >= 0) s + 0.5 else s - 0.5);
+                qi[j] = @intCast(@max(-128, @min(127, r)));
+            }
+
+            // Integer path, byte-for-byte the kernel's algebra.
+            var qsum: i32 = 0;
+            for (qi) |v| qsum += v;
+            var isum: i32 = 0;
+            if (t == .q8_0) {
+                for (0..8) |i| {
+                    const w = std.mem.readInt(i32, kvb[2 + 4 * i ..][0..4], .little);
+                    isum += dp4a(w, readI32(qi[4 * i ..][0..4].*));
+                }
+            } else {
+                for (0..4) |i| {
+                    const w = std.mem.readInt(i32, kvb[2 + 4 * i ..][0..4], .little);
+                    const lo: i32 = w & 0x0F0F0F0F;
+                    const hi: i32 = (w >> 4) & 0x0F0F0F0F;
+                    isum += dp4a(lo, readI32(qi[4 * i ..][0..4].*));
+                    isum += dp4a(hi, readI32(qi[16 + 4 * i ..][0..4].*));
+                }
+                isum -= 8 * qsum;
+            }
+
+            // Reference in the INTEGER path's units: sum over j of the integer
+            // KV value times the quantized Q.  `kv[j] = kq[j] * dk` and
+            // `q[j] ~= qi[j] * qd`, so sum(kv*q) == isum * dk * qd.
+            var ref: f32 = 0;
+            for (kv, 0..) |v, j| ref += v * (@as(f32, @floatFromInt(qi[j])) * qd);
+            const dk_h: f16 = @bitCast(std.mem.readInt(u16, kvb[0..2], .little));
+            const dk: f32 = @floatCast(dk_h);
+            const ref_int: f32 = ref / (dk * qd);
+            const got: f32 = @floatFromInt(isum);
+            // Exact up to float rounding of the two sums (integer inputs).
+            const tol = 1e-4 * @max(1.0, @abs(ref_int));
+            try std.testing.expect(@abs(got - ref_int) <= tol);
+
+            // NOTE deliberately NO bound against the float-Q dot: q8_0 rounds
+            // each Q element to int8 with a per-row scale, so a small element
+            // can collapse to 0 and the dot can differ by several percent
+            // (measured: median 0.4%, p99 27% on the real distribution).  That
+            // is the price llama.cpp's fast path pays too; the exact claim this
+            // test pins is the integer algebra above, not float agreement.
+        }
+    }
+}
+
+fn readI32(v: [4]i8) i32 {
+    // Little-endian assembly, like the device's `memcpy` into an int: element
+    // k of the four lands in byte k.
+    var out: u32 = 0;
+    for (v, 0..) |b, k| out |= @as(u32, @as(u8, @bitCast(b))) << @intCast(8 * k);
+    return @bitCast(out);
+}
+
+/// `__dp4a`: four signed int8 products accumulated into `c`.
+fn dp4a(a: i32, b: i32) i32 {
+    var acc: i32 = 0;
+    for (0..4) |k| {
+        const ab: i8 = @bitCast(@as(u8, @truncate(@as(u32, @bitCast(a)) >> @intCast(8 * k))));
+        const bb: i8 = @bitCast(@as(u8, @truncate(@as(u32, @bitCast(b)) >> @intCast(8 * k))));
+        acc += @as(i32, ab) * @as(i32, bb);
+    }
+    return acc;
+}
+
 test "kv f16: C quantize/dequant is the exact f32->f16 cast" {
     const alloc = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(23);

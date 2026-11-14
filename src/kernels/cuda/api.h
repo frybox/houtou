@@ -365,7 +365,7 @@ int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
                           float *d_gout, int slot0, int rows, int heads,
                           int gqa, int hd, int kv_dim, float scale,
                           int kv_kind, void *stream);
-int q35_attn_chunk_max_rows(int slot0);
+int q35_attn_chunk_max_rows(int slot0, int hd, int kv_kind);
 
 // Same kernel, but `slot` is read from DEVICE memory (`d_slot`, one int) and the
 // dynamic shared block is the fixed maximum.  Because neither the argument block

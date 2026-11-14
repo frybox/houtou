@@ -54,6 +54,7 @@
 // cache.  `d_att` is (slot+1) floats of scratch reused by each head.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 // Upper bound for the dynamic shared-memory scratch (`scores`, 1 float per
@@ -105,6 +106,15 @@
 // so this is bounded by the 48 KB dynamic shared budget.
 #define Q35_ATTN_CHUNK_SMEM_MAX (48 * 1024 / (int)sizeof(float))
 
+// Extra bytes the chunk kernel needs in its dynamic block beyond the scores and
+// the two scalars: the q8_0 copy of Q (`hd/4` words) plus two floats.  Only
+// reserved for the block formats; f16/f32 still request the plain size.
+static inline size_t q35_attn_chunk_extra_smem(int hd, int kv_kind)
+{
+    if (kv_kind != 1 && kv_kind != 2) return 0;
+    return (size_t)(hd / 4) * sizeof(int) + 2 * sizeof(float);
+}
+
 // ---------------------------------------------------------------------------
 // Quantized-KV dequant, on read.  When the cache is not f32 the K/V rows are
 // the byte-packed layouts the CPU writes (`q35_kv_quant_*`, kv.c) and every
@@ -138,6 +148,18 @@ __device__ __forceinline__ float q35_kv_f16_to_f32(unsigned short h)
     return __uint_as_float(out);
 }
 
+// Byte stride of one 32-element KV block in `kind`.
+__device__ __forceinline__ int q35_kv_stride(int kind)
+{
+    return (kind == 0) ? 64 : (kind == 1) ? 34 : 18;
+}
+
+// Scalar decode of element `k` (0..31) of one 32-element block.  This is the
+// REFERENCE: expression-for-expression with `q35_kv_dequant_q8_0` /
+// `q35_kv_dequant_q4_0` / `q35_kv_dequant_f16` in src/kernels/x86/kv.c, which
+// `kv_tests.zig` pins against the Zig oracle.  The kernels below keep using it
+// wherever a single element is what they need; the block-level fast paths are
+// separate and must produce the same bits.
 __device__ __forceinline__ float q35_kv_block_elem(const unsigned char *block, int k, int kind)
 {
     if (kind == 0) {
@@ -156,16 +178,176 @@ __device__ __forceinline__ float q35_kv_block_elem(const unsigned char *block, i
     return __fmul_rn(d, (float)((int)q - 8));
 }
 
+// The scalar per-element decode above is the reference (it is what the CPU
+// dequant computes, and `kv_tests.zig` pins the two together).  It is NOT the
+// fast path: one bit-extract + branch + `__uint_as_float` per element cost
+// 4.4x the f32 attention in prefill (measured 2026-11, q8_0, 1309 tokens:
+// 1275 ms vs 289 ms), because the chunk kernel walks j serially in one thread
+// and cannot amortise anything.
+//
+// Two block-level fast paths sit on top of it, both shaped after
+// llama.cpp's CUDA flash attention (ggml/src/ggml-cuda/fattn-common.cuh):
+//
+//   * `q35_kv_dot32_q8` -- one 32-element block against a q8_0-quantized Q,
+//     as an integer dot product: q8_0 K is int8 x int8, q4_0 K is nibble x
+//     int8.  `dp4a` is 4 MACs per instruction, so the arithmetic that used to
+//     be 32 float mul+add plus 32 decodes becomes 8 integer ops plus one
+//     scale.  This is `vec_dot_fattn_vec_KQ_q[48]_0` (fattn-common.cuh:149,
+//     :304).  The q4_0 `-8` offset needs the sum of the 32 Q quants, which is
+//     the `Q_s` side channel the caller accumulates once per Q row.
+//
+//   * `q35_kv_dequant4` -- four CONSECUTIVE elements of one block, decoded
+//     together.  The V side multiplies each block by a single probability, so
+//     the cost there is per-element decode plus one float op, not a dot
+//     product; this is llama.cpp's `dequantize_V_q4_0<T, 4>` (dequantize_V_*
+//     in fattn-common.cuh, `ne == 2 || ne == 4`).  Loading 4 bytes at once and
+//     turning them into four floats with one int->float4 conversion keeps the
+//     value bit-identical to the scalar path.
+//
+// f16 is handled by `q35_kv_ld4` alone: `half2`->float2 IS the decode.
+
+// 4 CONSECUTIVE elements starting at `elem` of the block at `blk` (elem%4==0).
+// Writes to `out[0..4]`.  Exactly the arithmetic of `q35_kv_block_elem` on
+// each of the four, including the f16 scale round-trip.
+__device__ __forceinline__ void q35_kv_dequant4(const unsigned char *blk, int elem,
+                                                int kind, float *out)
+{
+    if (kind == 0) {
+        // 4 halves = 8 B at byte `2*elem` of the block.  Not assumed aligned
+        // (the block stride is 64 B, so the base IS aligned, but `elem` +2
+        // offsets it by 2 B); `memcpy` keeps the same codegen without the UB.
+        unsigned short h4[4];
+        __builtin_memcpy(h4, blk + 2 * elem, sizeof(h4));
+        const float2 a = __half22float2(*(const half2 *)&h4[0]);
+        const float2 b = __half22float2(*(const half2 *)&h4[2]);
+        out[0] = a.x;
+        out[1] = a.y;
+        out[2] = b.x;
+        out[3] = b.y;
+        return;
+    }
+    const half hs = __ushort_as_half((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+    const float d = __half2float(hs);
+    if (kind == 1) {
+        // 4 int8 at a time: one 32-bit load, then four signed byte -> float.
+        int v;
+        __builtin_memcpy(&v, blk + 2 + elem, sizeof(v));
+        const char *c = (const char *)&v;
+        out[0] = __fmul_rn(d, (float)c[0]);
+        out[1] = __fmul_rn(d, (float)c[1]);
+        out[2] = __fmul_rn(d, (float)c[2]);
+        out[3] = __fmul_rn(d, (float)c[3]);
+        return;
+    }
+    // q4_0: elements 0..15 are the low nibbles of bytes 2..17, 16..31 the high
+    // ones.  Four consecutive elements therefore live in 4 bytes of the SAME
+    // half; `elem/2` is the byte and the half selects low or high.
+    const int half_sel = elem / 16;
+    const int base = 2 + (elem % 16);
+    unsigned v;
+    __builtin_memcpy(&v, blk + base, 4);
+    v = (v >> (4 * half_sel)) & 0x0F0F0F0Fu;
+    out[0] = __fmul_rn(d, (float)((int)(v & 0xFFu) - 8));
+    out[1] = __fmul_rn(d, (float)((int)((v >> 8) & 0xFFu) - 8));
+    out[2] = __fmul_rn(d, (float)((int)((v >> 16) & 0xFFu) - 8));
+    out[3] = __fmul_rn(d, (float)((int)((v >> 24) & 0xFFu) - 8));
+}
+
+// `dp4a`: 4 signed int8 MACs in one instruction (`__dp4a` on sm_61+; every
+// target this project builds for has it).
+__device__ __forceinline__ int q35_dp4a(int a, int b, int c)
+{
+    return __dp4a(a, b, c);
+}
+
+// Integer dot product of one 32-element K block against 8 packed Q words
+// (`q8_0`-quantized, 4 int8 each).  `qsum` is the sum of the 32 Q quants,
+// needed only by q4_0's `-8` offset.  Returns the dot of the QUANTIZED values
+// times K's block scale; the caller multiplies by Q's scale (a constant per Q
+// row, so folding it outside the t loop is exact).
+//
+// Corresponds to vec_dot_fattn_vec_KQ_q4_0 / _q8_0 (f2...:149 / :304), with
+// the same algebra:
+//   q8_0: sum_i Kq[i]*Qq[i]
+//   q4_0: sum_i (n[i]) * Qq[i]  where element = (n - 8) * d  ->  sum_i n*Q - 8*sum_i Q
+__device__ __forceinline__ int q35_kv_dot32_q8(const unsigned char *blk, const int *q8, int qsum,
+                                               int kind)
+{
+    int sumi = 0;
+    if (kind == 1) {
+        // The 32 quants start at byte 2 of the block, which is NOT 4-byte
+        // aligned (block stride is 34 B), so the words are loaded with
+        // `__builtin_memcpy` -- a plain `(const int *)` dereference here is what
+        // produced "misaligned address" for every q8_0 run (2026-11).
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int u;
+            __builtin_memcpy(&u, blk + 2 + 4 * i, sizeof(u));
+            sumi = q35_dp4a(u, q8[i], sumi);
+        }
+        return sumi;
+    }
+    // q4_0: the 16 packed bytes are 8 words.  Byte k holds element k in its low
+    // nibble and element 16+k in its high nibble, so word i covers elements
+    // 4i..4i+3 (low) and 16+4i..16+4i+3 (high) -- Q words i and 4+i, because
+    // the q8_0 Q buffer is laid out as consecutive 4-element groups.
+    // Byte 2 is likewise unaligned; same `memcpy` load.
+    int sumi4 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int w;
+        __builtin_memcpy(&w, blk + 2 + 4 * i, sizeof(w));
+        const int lo = w & 0x0F0F0F0F;
+        const int hi = (w >> 4) & 0x0F0F0F0F;
+        sumi4 = q35_dp4a(hi, q8[4 + i], q35_dp4a(lo, q8[i], sumi4));
+    }
+    return sumi4 - 8 * qsum;
+}
+
+// Quantize one head's Q into q8_0 words and accumulate each 32-element block's
+// quant sum.  Inlined: it runs once per (row, head) by thread 0, and the call
+// overhead of `noinline` cost the packed formats 18% (2026-11).
+__device__ __forceinline__ void q35_kv_prep_q(const float *__restrict__ qs, int hd,
+                                              int *__restrict__ s_q8, int *__restrict__ s_qblk,
+                                              float *__restrict__ s_qpar)
+{
+    float amax = 0.0f;
+    for (int j = 0; j < hd; ++j) amax = fmaxf(amax, fabsf(qs[j]));
+    const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv = amax > 0.0f ? 1.0f / d : 0.0f;
+    for (int w = 0; w < hd / 4; ++w) s_q8[w] = 0;
+    for (int j = 0; j < hd; ++j) {
+        const float v = qs[j] * inv;
+        int q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        s_q8[j >> 2] |= (q & 0xFF) << ((j & 3) * 8);
+    }
+    // q4_0's offset correction subtracts 8 * (sum of the 32 Q quants IN THAT
+    // BLOCK), so the sum is kept PER BLOCK.  A whole-row sum is wrong: measured
+    // 2026-11, it put every q4_0 K dot off by 8*(row_sum - block_sum) and the
+    // model diverged on the first token while q8_0 (no correction) stayed exact.
+    for (int b = 0; b < hd / 32; ++b) {
+        int s = 0;
+        for (int w = 0; w < 8; ++w) {
+            const signed char *c = (const signed char *)&s_q8[b * 8 + w];
+            s += c[0] + c[1] + c[2] + c[3];
+        }
+        s_qblk[b] = s;
+    }
+    s_qpar[0] = d;
+}
+
 // One block per (row, head).  `d_q`/`d_gate`/`d_gout` are indexed by
 // (token, head): row r at `r * heads * hd + h * hd`, matching the chunk buffers
 // `qK`/`gateK`/`goutK` that engine.zig fills.
+template <int KIND>
 __global__ void q35_attn_chunk_kernel(
     const float *__restrict__ d_q,
     const float *__restrict__ d_gate,
     const float *__restrict__ d_kcache,
     const float *__restrict__ d_vcache,
     float *__restrict__ d_gout,
-    int slot0, int heads, int gqa, int hd, int kv_dim, float scale, int kv_kind)
+    int slot0, int heads, int gqa, int hd, int kv_dim, float scale)
 {
     const int r = blockIdx.x;               // token within the chunk
     const int h = blockIdx.y;               // head
@@ -179,14 +361,45 @@ __global__ void q35_attn_chunk_kernel(
     const float *__restrict__ qs = d_q + (size_t)r * row_len + (size_t)h * hd;
 
     // Quantized-cache geometry: row `row_b` bytes, 32-elem block `stride` bytes.
+    // `KIND` is a compile-time parameter, so every `if (kv_kind ...)` below is
+    // pruned per instantiation.
+    constexpr int kv_kind = KIND;
     const unsigned char *kcache_b = (const unsigned char *)d_kcache;
     const unsigned char *vcache_b = (const unsigned char *)d_vcache;
-    const size_t stride = (kv_kind == 0) ? 64 : (kv_kind == 1) ? 34 : 18;
+    const size_t stride = q35_kv_stride(kv_kind);
     const size_t row_b = (size_t)(kv_dim / 32) * stride;
 
     extern __shared__ float s_scores[];
     float *const s_max = &s_scores[n];
     float *const s_sum = &s_scores[n + 1];
+
+    // Q in the K cache's integer domain, computed ONCE per (row, head) and
+    // reused by all n scores -- this is llama.cpp's `quantize_q8_1_to_shared`
+    // (fattn-vec.cuh:180) hoisted out of the t loop.
+    //
+    // Only the block formats need it: f16 multiplies `half2` directly and f32
+    // needs nothing.  The words live in the SAME dynamic block as the scores
+    // (static and dynamic `__shared__` share one region -- see the aliasing
+    // note at the top of this file), placed after the two scalars.
+    constexpr bool int_dot = KIND == 1 || KIND == 2;
+    int *const s_q8 = (int *)(s_sum + 1);
+    float *const s_qpar = (float *)(s_q8 + hd / 4);
+    int *const s_qblk = (int *)(s_qpar + 2);
+    // f32 runs none of this and must not pay for it: measured 2026-11, an
+    // unconditional barrier here cost f32 prefill 9% (1.49 -> 1.63 s on
+    // 1309 tokens) for code it never runs.
+    // ALL 128 threads run this, so the quantization itself is confined to
+    // thread 0: `amax` would otherwise be a per-thread partial (every thread
+    // needs the block-wide maximum) and the `s_q8[w] |= ...` read-modify-write
+    // would race.  Measured 2026-11: with the racy version q8_0 matched the
+    // reference but q4_0 diverged -- its `-8 * sum(Q)` correction amplifies the
+    // half-written words.
+    if (int_dot and tid == 0) {
+        q35_kv_prep_q(qs, hd, s_q8, s_qblk, s_qpar);
+    }
+    // Only the formats that read `s_q8` need everyone to see it; f32/f16 skip
+    // the barrier AND the (unreached) shared-memory writes entirely.
+    if (int_dot) __syncthreads();
 
     for (int t = tid; t < n; t += nt) {
         float acc = 0.0f;
@@ -194,11 +407,30 @@ __global__ void q35_attn_chunk_kernel(
             const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
             for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
         } else {
-            const unsigned char *krow = kcache_b + (size_t)t * row_b;
-            const int base = kvh * hd;
-            for (int j = 0; j < hd; ++j) {
-                const unsigned char *blk = krow + ((size_t)((base + j) / 32)) * stride;
-                acc = __fadd_rn(acc, __fmul_rn(qs[j], q35_kv_block_elem(blk, (base + j) % 32, kv_kind)));
+            // `kvh * hd` is a multiple of 32 (hd is), so block `b` of this head
+            // starts at block `bbase + b` of the row.
+            const unsigned char *krow = kcache_b + (size_t)t * row_b +
+                                        (size_t)(kvh * hd / 32) * stride;
+            if (int_dot) {
+                const float qd = s_qpar[0];
+                for (int b = 0; b < hd / 32; ++b) {
+                    const unsigned char *blk = krow + (size_t)b * stride;
+                    // K's block scale, decoded exactly as the scalar path does.
+                    const float d = q35_kv_f16_to_f32((unsigned short)blk[0] |
+                                                      ((unsigned short)blk[1] << 8));
+                    const int isum = q35_kv_dot32_q8(blk, s_q8 + b * 8, s_qblk[b], kv_kind);
+                    acc = __fadd_rn(acc, __fmul_rn(d * qd, (float)isum));
+                }
+            } else {
+                for (int j = 0; j < hd; j += 4) {
+                    const unsigned char *blk = krow + (size_t)(j / 32) * stride;
+                    float v4[4];
+                    q35_kv_dequant4(blk, j % 32, kv_kind, v4);
+                    acc = __fadd_rn(acc, __fmul_rn(qs[j], v4[0]));
+                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 1], v4[1]));
+                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 2], v4[2]));
+                    acc = __fadd_rn(acc, __fmul_rn(qs[j + 3], v4[3]));
+                }
             }
         }
         s_scores[t] = __fmul_rn(acc, scale);
@@ -224,29 +456,45 @@ __global__ void q35_attn_chunk_kernel(
 
     float *__restrict__ gout = d_gout + (size_t)r * row_len + (size_t)h * hd;
     const float *__restrict__ gt = d_gate + (size_t)r * row_len + (size_t)h * hd;
-    for (int j = tid; j < hd; j += nt) {
-        float acc = 0.0f;
-        if (kv_kind < 0) {
+    // f32 keeps its own loop, untouched by the quantized variants.  Sharing one
+    // loop body measurably slowed it (2026-11: 1309-token prefill 1.49 -> 1.63 s
+    // with the packed cases folded in), and it gains nothing from them.
+    if (kv_kind < 0) {
+        for (int j = tid; j < hd; j += nt) {
+            float acc = 0.0f;
             for (int t = 0; t < n; ++t) {
                 const float w = s_scores[t];
                 const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
                 acc = __fadd_rn(acc, __fmul_rn(w, vv));
             }
-        } else {
+            const float g = gt[j];
+            gout[j] = acc * (1.0f / (1.0f + expf(-g)));
+        }
+    } else {
+        for (int j = tid; j < hd; j += nt) {
+            float acc = 0.0f;
+            // One V element per thread, t in increasing order -- the CPU's
+            // accumulation order, which the last bits depend on.  What changes
+            // is the DECODE: the element is fetched through a 4-element group
+            // (`q35_kv_dequant4`) instead of a lone per-element bit extract.
+            // Values are bit-identical to the scalar path; only the load width
+            // differs.
             const int base = kvh * hd + j;
             const int blk = base / 32;
-            const int off = base % 32;
+            const int lane = base & 3;
+            const int goff = (base % 32) & ~3;
             for (int t = 0; t < n; ++t) {
                 const float w = s_scores[t];
                 const unsigned char *vrow = vcache_b + (size_t)t * row_b;
-                const float vv = q35_kv_block_elem(vrow + (size_t)blk * stride, off, kv_kind);
-                acc = __fadd_rn(acc, __fmul_rn(w, vv));
+                float v4[4];
+                q35_kv_dequant4(vrow + (size_t)blk * stride, goff, kv_kind, v4);
+                acc = __fadd_rn(acc, __fmul_rn(w, v4[lane]));
             }
+            // Gate folded in: the per-token launcher ran this as a second kernel
+            // over the whole head set.  Per-element and order-independent, so exact.
+            const float g = gt[j];
+            gout[j] = acc * (1.0f / (1.0f + expf(-g)));
         }
-        // Gate folded in: the per-token launcher ran this as a second kernel over
-        // the whole head set.  Per-element and order-independent, so exact.
-        const float g = gt[j];
-        gout[j] = acc * (1.0f / (1.0f + expf(-g)));
     }
 }
 
@@ -259,17 +507,51 @@ extern "C" int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
     if (rows <= 0 || heads <= 0 || hd <= 0) return (int)cudaSuccess;
     if (slot0 < 0 || slot0 + rows > Q35_ATTN_MAX_ROWS) return cudaErrorInvalidValue;
     if (slot0 + rows > Q35_ATTN_CHUNK_SMEM_MAX) return cudaErrorInvalidValue;
-    const size_t smem = (size_t)(slot0 + rows + 2) * sizeof(float);
+    // Scores + the two scalars + (block formats) the q8_0 copy of Q.  Reserved
+    // unconditionally would overstate the f32/f16 requirement, so it follows
+    // `kv_kind`.
+    const size_t smem = (size_t)(slot0 + rows + 2) * sizeof(float) +
+                        q35_attn_chunk_extra_smem(hd, kv_kind);
+    // One instantiation per KV family.  Templating on the kind is what keeps the
+    // f32 and f16 paths free of the quantized formats' shared-memory prep: with
+    // a run-time `kv_kind` the dead `int_dot` block still changed how the f32
+    // score loop loaded `qs` and cost it 54% of its attention time (measured
+    // 2026-11), while forcing the prep out of line cost the packed formats 18%.
     dim3 grid((unsigned)rows, (unsigned)heads);
-    q35_attn_chunk_kernel<<<grid, 128, smem, (cudaStream_t)stream>>>(
-        d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale, kv_kind);
+    switch (kv_kind) {
+        case 0:
+            q35_attn_chunk_kernel<0><<<grid, 128, smem, (cudaStream_t)stream>>>(
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+            break;
+        case 1:
+            q35_attn_chunk_kernel<1><<<grid, 128, smem, (cudaStream_t)stream>>>(
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+            break;
+        case 2:
+            q35_attn_chunk_kernel<2><<<grid, 128, smem, (cudaStream_t)stream>>>(
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+            break;
+        default:
+            q35_attn_chunk_kernel<-1><<<grid, 128, smem, (cudaStream_t)stream>>>(
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+            break;
+    }
     return (int)cudaGetLastError();
 }
 
-extern "C" int q35_attn_chunk_max_rows(int slot0)
+extern "C" int q35_attn_chunk_max_rows(int slot0, int hd, int kv_kind)
 {
-    if (slot0 < 0 || slot0 >= Q35_ATTN_MAX_ROWS) return 0;
-    return Q35_ATTN_CHUNK_SMEM_MAX - slot0;
+    if (slot0 < 0 || slot0 >= Q35_ATTN_CHUNK_SMEM_MAX) return 0;
+    if (hd <= 0) return 0;
+    // Room left for scores once the fixed part (2 scalars + the q8_0 copy of Q
+    // for the block formats) is paid.  The caller passes the same `hd`/
+    // `kv_kind` it will hand to the launcher, so the two agree.
+    const size_t fixed = 2 * sizeof(float) + q35_attn_chunk_extra_smem(hd, kv_kind);
+    const size_t budget = (size_t)48 * 1024;
+    if (fixed >= budget) return 0;
+    const int room = (int)((budget - fixed) / sizeof(float)) - slot0;
+    const int max_rows = Q35_ATTN_CHUNK_SMEM_MAX - slot0;
+    return room < max_rows ? room : max_rows;
 }
 
 

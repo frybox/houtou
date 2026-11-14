@@ -181,7 +181,7 @@ const Kernels = struct {
     extern fn q35_launch_scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_attn_chunk_max_rows(slot0: c_int) callconv(.c) c_int;
+    extern fn q35_attn_chunk_max_rows(slot0: c_int, hd: c_int, kv_kind: c_int) callconv(.c) c_int;
     /// Warp-tiled / split decode attention (see api.h for the measurements).
     extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -489,8 +489,8 @@ const Launch = if (cuda_linked) struct {
     /// `maxrows` at zero and skip the sliced path entirely.  Returning a
     /// positive number here would be the dangerous answer -- the slice loop
     /// would then call the stubbed `attn_chunk` above.
-    fn attn_chunk_max_rows(slot0: c_int) c_int {
-        _ = slot0;
+    fn attn_chunk_max_rows(slot0: c_int, hd: c_int, kv_kind: c_int) c_int {
+        _ = .{ slot0, hd, kv_kind };
         return 0;
     }
     fn deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -7973,7 +7973,7 @@ const attn_score_arity: usize = 11;
         // rows and the cache prefix it needs.
         var maxrows: usize = 0;
         if (self.cu != null and shapes_ok) {
-            const m = Launch.attn_chunk_max_rows(@intCast(slot0));
+            const m = Launch.attn_chunk_max_rows(@intCast(slot0), @intCast(hd), self.kvKind());
             if (m > 0) maxrows = @intCast(m);
         }
 
@@ -7988,7 +7988,7 @@ const attn_score_arity: usize = 11;
                                     // `maxrows` shrinks as `slot0` grows, so
                                     // recompute it per slice rather than
                                     // trusting the first value.
-                                    const m2 = Launch.attn_chunk_max_rows(@intCast(slot0 + done));
+                                    const m2 = Launch.attn_chunk_max_rows(@intCast(slot0 + done), @intCast(hd), self.kvKind());
                                     if (m2 <= 0) break;
                                     const take = @min(rows - done, @as(usize, @intCast(m2)));
                                     const rc = Launch.attn_chunk(
