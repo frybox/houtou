@@ -365,6 +365,130 @@ fn run(
 
 /// `run <gguf> <prompt> [-n N]`: load the engine, greedy-generate, print the
 /// text and per-token timing.
+/// Which engine a GGUF names in `general.architecture`.
+const Architecture = union(enum) {
+    qwen35,
+    qwen3,
+    /// Anything else, carrying the declared name for the error message.
+    unknown: []const u8,
+};
+
+/// Read only what dispatch needs: the metadata KV region.
+///
+/// The file is memory-mapped and parsed, then unmapped on return; loading the
+/// model proper happens in the chosen engine.
+fn probeArchitecture(arena: std.mem.Allocator, io: Io, path: []const u8) Architecture {
+    var file = Io.Dir.cwd().openFile(io, path, .{}) catch return .{ .unknown = "<unreadable file>" };
+    defer file.close(io);
+    const st = file.stat(io) catch return .{ .unknown = "<unreadable file>" };
+    var mm = file.createMemoryMap(io, .{ .len = @intCast(st.size), .protection = .{ .read = true } }) catch
+        return .{ .unknown = "<unmappable file>" };
+    defer mm.destroy(io);
+    var g = houtou.gguf.parse(arena, mm.memory) catch return .{ .unknown = "<not a GGUF file>" };
+    defer g.deinit();
+    const name = g.getString("general.architecture") orelse return .{ .unknown = "<no general.architecture>" };
+    if (std.mem.eql(u8, name, "qwen35")) return .qwen35;
+    if (std.mem.eql(u8, name, "qwen3")) return .qwen3;
+    return .{ .unknown = name };
+}
+
+/// The Qwen3 path of `runInference`.
+///
+/// Split out rather than interleaved: none of the Qwen3.5-only machinery
+/// (speculative decoding, the tap ring, the nextn drafter) applies, and this
+/// engine has its own `generate`.
+fn runInferenceQwen3(
+    arena: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    prompt_text: []const u8,
+    n_predict: usize,
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    seed: u64,
+    n_threads: usize,
+    backend_kind: houtou.backend.Kind,
+    out: *Io.Writer,
+    err_out: *Io.Writer,
+) !void {
+    if (spec_draft or spec_gen or spec_trace or g_dump_path != null) {
+        try err_out.print(
+            "error: speculative-decoding and draft-dump flags are Qwen3.5-only; this file is a qwen3 model\n",
+            .{},
+        );
+        try err_out.flush();
+        return error.InvalidArgument;
+    }
+
+    // Tokenizer from the same GGUF.
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const st = try file.stat(io);
+    var mm = try file.createMemoryMap(io, .{ .len = @intCast(st.size), .protection = .{ .read = true } });
+    defer mm.destroy(io);
+    var g = try houtou.gguf.parse(arena, mm.memory);
+    defer g.deinit();
+    var tok = try houtou.tokenizer.Tokenizer.initFromGguf(arena, &g);
+    defer tok.deinit();
+
+    const rendered = try houtou.tokenizer.Tokenizer.renderChatTurn(arena, prompt_text, false);
+    const prompt = try tok.encode(arena, rendered);
+    try out.print("[prompt: {d} tokens]\n", .{prompt.len});
+    try out.flush();
+
+    var e = try houtou.engines.qwen3.Engine.load(
+        arena,
+        path,
+        io,
+        n_threads,
+        backend_kind,
+        .f16,
+        houtou.engines.qwen3.Engine.max_seq,
+    );
+    defer e.deinit();
+    e.sampler = houtou.engine.Sampler.init(.{ .temperature = temp, .top_k = top_k, .top_p = top_p, .seed = seed });
+    try out.print(
+        "[qwen3: layers={d} hidden={d} heads={d}/{d} hd={d} rotary={d} ff={d}]\n",
+        .{ e.cfg.n_layers, e.cfg.hidden, e.cfg.n_heads, e.cfg.n_kv_heads, e.cfg.head_dim, e.cfg.rotary_dim, e.cfg.n_ff },
+    );
+    try out.flush();
+
+    var stream_ctx = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
+    const res = try houtou.engines.common.generate(
+        e.driver(),
+        arena,
+        io,
+        prompt,
+        n_predict,
+        StreamCtx.onToken,
+        &stream_ctx,
+    );
+
+    // `common.generate` returns the ids we already streamed; anything it left
+    // (a wrong-id probe) is printed here the same way the Qwen3.5 path does.
+    if (dump_ids) {
+        try out.print("IDS:", .{});
+        for (res.tokens) |id| try out.print(" {d}", .{id});
+        try out.print("\n", .{});
+    }
+
+    try out.print("\n\n-------------------\n", .{});
+    try out.print("Prefill: {d} tokens in {d:.3} s\n", .{ prompt.len, res.prefill_ms / 1000.0 });
+    try out.print("Generate: {d} tokens in {d:.3} s  ({d:.2} tok/s)\n", .{
+        res.tokens.len,
+        res.decode_ms / 1000.0,
+        if (res.decode_ms > 0) @as(f64, @floatFromInt(res.tokens.len)) / (res.decode_ms / 1000.0) else 0.0,
+    });
+    try out.print("{s}\n", .{if (res.hit_eos)
+        "Stop reason: EOS"
+    else if (res.hit_context_limit)
+        "Stop reason: context limit reached"
+    else
+        "Stop reason: max tokens reached"});
+    try out.flush();
+}
+
 fn runInference(
     arena: std.mem.Allocator,
     io: Io,
@@ -470,6 +594,31 @@ fn runInference(
             try err_out.flush();
             return error.InvalidArgument;
         }
+    }
+
+    // ---- architecture dispatch ----
+    //
+    // Which engine runs is a property of the FILE (`general.architecture`), not
+    // of a flag: a Qwen3 GGUF has no `qwen35.*` keys and would fail deep inside
+    // the Qwen3.5 loader with a confusing `BadConfig`.  The probe below reads
+    // only the metadata KV region, so a misdispatch costs nothing.
+    //
+    // The Qwen3 path is a separate function rather than a branch inside this
+    // one: everything after this point is written against the Qwen3.5 engine's
+    // 49 fields (spec decoding, tap ring, nextn), and threading an "or the
+    // other engine" through it would be the flag-per-difference abstraction
+    // `engines/common.zig` deliberately avoided.
+    switch (probeArchitecture(arena, io, path)) {
+        .qwen3 => return runInferenceQwen3(arena, io, path, prompt_text, n_predict, temp, top_k, top_p, seed, n_threads, backend_kind, out, err_out),
+        .qwen35 => {},
+        .unknown => |name| {
+            try err_out.print(
+                "error: '{s}' declares general.architecture = \"{s}\", which no engine in this build handles (qwen35, qwen3)\n",
+                .{ path, name },
+            );
+            try err_out.flush();
+            return error.UnsupportedArchitecture;
+        },
     }
 
     var e = engine.Engine.load(arena, path, io, n_threads, backend_kind, kv_type) catch |e2| {
