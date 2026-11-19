@@ -1308,22 +1308,25 @@ pub const CpuBackend = struct {
                 gamma.span(t * gamma_stride, nv),
                 nv,
             );
-            // 3. l2norm(q), l2norm(k), then q *= qscale -- ONE pass.
+            // 3. l2norm(q), l2norm(k), then q *= qscale -- per HEAD, one pass.
             //
             // This must match `Exec.l2normQkScale`, which is what the serial
-            // `forwardGdn` uses.  It used to loop `nk_reps = nv/nk` times, a
-            // leftover from when the per-head loop visited each k head once per
-            // value head.  `l2norm` is NOT idempotent (a second pass divides by
-            // `sqrt(1 + eps)` again), so repeating it is a different operation:
-            // with nv/nk = 3 the chunk path's q/k came out scaled by ~1e-6^2
-            // relative to the serial one, which is enough to change the first
-            // sampled token of a 17-token prompt while looking plausible.
-            // `forwardGdn`'s own comment records the same conclusion (the
-            // reference normalises `num_k_heads` rows once, then broadcasts).
+            // `forwardGdn` uses: that slot normalises `nk` rows of `kd` floats
+            // each (`vL2normRows`), NOT the whole `nk*kd` run as one row.
+            // `bufL2norm` on the full span divides by `sqrt(sum over 2048)` and
+            // multiplies every element by it, which is `sqrt(nk)` times too
+            // small for each of the `nk` heads -- a pure magnitude error that
+            // leaves the output finite and plausible.
+            //
+            // This used to be one `bufL2norm` over the whole span, repeated
+            // `nk_reps = nv/nk` times; both the span and the repeat were wrong.
             if (nk != 0 and nv % nk == 0) {
-                ew.bufL2norm(qkv_t.span(0, kq_dim));
-                ew.bufL2norm(qkv_t.span(kq_dim, kq_dim));
-                ew.bufScaleVec(qkv_t.span(0, kq_dim), qscale);
+                var h: usize = 0;
+                while (h < nk) : (h += 1) ew.bufL2norm(qkv_t.span(h * kd, kd));
+                h = 0;
+                while (h < nk) : (h += 1) ew.bufL2norm(qkv_t.span(kq_dim + h * kd, kd));
+                var j: usize = 0;
+                while (j < kq_dim) : (j += kd) ew.bufScaleVec(qkv_t.span(j, kd), qscale);
             }
         }
         _ = eps; // the CPU l2norm pins its own eps, exactly as `Exec.l2norm` does
@@ -1753,11 +1756,14 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
             Buf.wrap(gamma_serial[t * ab_stride ..][0..nv]),
             nv,
         );
-        // ONE pass: this is `Exec.l2normQkScale`, the slot the serial
-        // `forwardGdn` uses.
-        ew.bufL2norm(Buf.wrap(qkv_t[0..kq_dim]));
-        ew.bufL2norm(Buf.wrap(qkv_t[kq_dim..][0..kq_dim]));
-        ew.bufScaleVec(Buf.wrap(qkv_t[0..kq_dim]), qscale);
+        // Per HEAD, one pass -- what `Exec.l2normQkScale` does: `nk` rows of
+        // `kd`, not one row of `nk*kd`.
+        var hh: usize = 0;
+        while (hh < nk) : (hh += 1) ew.bufL2norm(Buf.wrap(qkv_t[hh * kd ..][0..kd]));
+        hh = 0;
+        while (hh < nk) : (hh += 1) ew.bufL2norm(Buf.wrap(qkv_t[kq_dim + hh * kd ..][0..kd]));
+        var jj: usize = 0;
+        while (jj < kq_dim) : (jj += kd) ew.bufScaleVec(Buf.wrap(qkv_t[jj..][0..kd]), qscale);
     }
 
     // The batched path must be bit-identical here: every underlying primitive is

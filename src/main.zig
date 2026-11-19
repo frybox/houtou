@@ -718,10 +718,11 @@ fn runInference(
         }
 
         try out.print("SPEC-TAPS last_layer={d} chunk={d}\n", .{ last, toks.len });
-        // NOT a failure: the batched path reorders f32 reductions, so it
-        // differs from the serial path by construction (AGENTS.md SS4).  It is
-        // printed only so the comparison below can be told apart from it.
-        try out.print("SPEC-TAPS batched forwardChunk vs serial forwardLogits: {d}/{d} equal (maxdiff {e:.3}) [expected to differ]\n", .{
+        // MUST be exact.  Every operator the chunk path batches is defined as
+        // the per-token sequence it replaces, so there is no reassociation to
+        // tolerate here.  (This used to be annotated "expected to differ",
+        // which hid a real GDN prelude bug for as long as it was there.)
+        try out.print("SPEC-TAPS batched forwardChunk vs serial forwardLogits: {d}/{d} equal (maxdiff {e:.3})\n", .{
             csame, ref_logits.len, cmax,
         });
         try out.print("SPEC-TAPS tapped-row -> logits equal to SERIAL path: {d}/{d} (maxdiff {e:.3})\n", .{
