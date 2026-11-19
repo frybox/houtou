@@ -1597,11 +1597,6 @@ pub const Engine = struct {
         const conv_dim: usize = 2 * nk * kd + nv * kd;
         const value_dim: usize = nv * kd;
         const n_ff: usize = c.n_ff;
-        // q/k head counts and head width for the chunk-wide `rope64Rows` passes
-        // (`forwardFullCore` no longer rotates; see there).
-        const heads_q_rope: usize = c.n_heads;
-        const kv_heads_rope: usize = c.n_kv_heads;
-        const hd_q: usize = c.head_dim;
 
         var t: usize = 0;
         while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
@@ -1623,18 +1618,22 @@ pub const Engine = struct {
                 self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
                 self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
                 self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
-                // ---- RoPE for the whole chunk in ONE launch ----
-                // The per-token loop below issues this tensor-by-tensor, so the
-                // per-head `rope64` calls inside it were 28 launches per token
-                // per full-attention layer (24 q heads + 4 kv heads) -- 9.8%
-                // of prefill device time on 27B IQ3_XXS.  `rope64Rows` indexes
-                // rows and heads off one flat block id and rotates row r at
-                // `pos0 + r`, so row r is the same arithmetic as the single-row
-                // call it replaces.  Row r needs row r's pos, so this MUST run
-                // after `qkvK`/`kK` are filled for every token (above) and
-                // before any consumer of q/k.
-                self.exec.rope64Rows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads_q_rope, hd_q);
-                self.exec.rope64Rows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads_rope, hd_q);
+                // ---- RoPE ----
+                // MOVED: both q's and k's rotation now happen inside
+                // `forwardFullChunk`, AFTER the q_norm/k_norm pass.  Doing them
+                // here was wrong twice over:
+                //   * `qK` is still empty at this point (it is produced by the
+                //     deinterleave inside `forwardFullChunk`), so q was rotated
+                //     before it existed and the real q was never rotated;
+                //   * `kK` WAS populated, but rotating it before `k_norm` means
+                //     the norm then rescales each head -- and since a head's
+                //     norm depends on the rotated values' sum of squares, the
+                //     rotation is not preserved.  The reference order
+                //     (`forwardFull`) is norm -> rope.
+                // Symptoms this caused: row 0 of a chunk was exact (pos 0 is
+                // the RoPE identity) and every later row drifted -- 5.9e-3 in
+                // the first full-attention layer's output, enough to change the
+                // first sampled token of a 17-token prompt.
                 t = 0;
                 self.forwardFullChunk(lw, li, k);
                 self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
@@ -1983,6 +1982,15 @@ pub const Engine = struct {
         self.exec.deinterleaveQGStrided(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
             self.qkvK.span(0, k * 2 * q_dim), heads, hd, k);
 
+        // q's RoPE, chunk-wide.  It CANNOT move up to `forwardChunk` with k's:
+        // `qK` does not exist until the deinterleave above has run.  It also
+        // has to run AFTER the q_norm/k_norm pair below, because the reference
+        // order (`forwardFull`) is norm -> rope; rotating first and
+        // normalising after renormalises the rotation away.
+        //
+        // `slot0` is the chunk's absolute start, so row r rotates at
+        // `slot0 + r`, which equals the `pos0 + r` the caller used for k.
+        //
         // Pass 1: everything row r needs written, for EVERY row, in ascending
         // order.  This is the old per-token body minus the attention itself.
         //
@@ -2010,6 +2018,8 @@ pub const Engine = struct {
             lw.attn_q_norm, k * heads, c.rms_eps);
         self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
             lw.attn_k_norm, k * kv_heads, c.rms_eps);
+        self.exec.rope64Rows(self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
+        self.exec.rope64Rows(self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
         self.exec.kvAppend(cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
         self.exec.kvAppend(cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
         cache.len += @intCast(k);

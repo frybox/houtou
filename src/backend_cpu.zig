@@ -1293,7 +1293,6 @@ pub const CpuBackend = struct {
         gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
         conv_k: usize, eps: f32) void {
         _ = ctx;
-        const nk_reps = if (nk != 0) nv / nk else 0;
         const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
         var t: usize = 0;
         while (t < tokens) : (t += 1) {
@@ -1309,14 +1308,22 @@ pub const CpuBackend = struct {
                 gamma.span(t * gamma_stride, nv),
                 nv,
             );
-            // 3. l2norm(q) then l2norm(k) then q *= qscale, nk_reps times.
+            // 3. l2norm(q), l2norm(k), then q *= qscale -- ONE pass.
+            //
+            // This must match `Exec.l2normQkScale`, which is what the serial
+            // `forwardGdn` uses.  It used to loop `nk_reps = nv/nk` times, a
+            // leftover from when the per-head loop visited each k head once per
+            // value head.  `l2norm` is NOT idempotent (a second pass divides by
+            // `sqrt(1 + eps)` again), so repeating it is a different operation:
+            // with nv/nk = 3 the chunk path's q/k came out scaled by ~1e-6^2
+            // relative to the serial one, which is enough to change the first
+            // sampled token of a 17-token prompt while looking plausible.
+            // `forwardGdn`'s own comment records the same conclusion (the
+            // reference normalises `num_k_heads` rows once, then broadcasts).
             if (nk != 0 and nv % nk == 0) {
-                var rep: usize = 0;
-                while (rep < nk_reps) : (rep += 1) {
-                    ew.bufL2norm(qkv_t.span(0, kq_dim));
-                    ew.bufL2norm(qkv_t.span(kq_dim, kq_dim));
-                    ew.bufScaleVec(qkv_t.span(0, kq_dim), qscale);
-                }
+                ew.bufL2norm(qkv_t.span(0, kq_dim));
+                ew.bufL2norm(qkv_t.span(kq_dim, kq_dim));
+                ew.bufScaleVec(qkv_t.span(0, kq_dim), qscale);
             }
         }
         _ = eps; // the CPU l2norm pins its own eps, exactly as `Exec.l2norm` does
@@ -1678,8 +1685,9 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
     // for it is literally the per-token loop, and this test pins that equality.
     //
     // Shapes are the 27B GDN geometry shrunk to something a test can hold:
-    // nv = 6 value heads, nk = 2 k heads (so nk_reps = 3 -- the repeat count is
-    // what makes l2norm non-idempotent, so it MUST be > 1 here), kd = 4.
+    // nv = 6 value heads, nk = 2 k heads (deliberately nv != nk: an older
+    // version of the prelude looped `nv/nk` l2norm passes here, and this shape
+    // is what caught it), kd = 4.
     // conv_k is pinned at 4, the only width `ew.convStep` implements.
     const nv: usize = 6;
     const nk: usize = 2;
@@ -1733,7 +1741,6 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
         ab_stride, ab_stride, kq_dim, nv, nk, kd, conv_k, 1e-6);
 
     // ---- reference: exactly what `forwardGdnCore` used to do, per token ----
-    const nk_reps = nv / nk;
     const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
     for (0..tokens) |t| {
         const qkv_t = qkv_serial[t * conv_dim ..][0..conv_dim];
@@ -1746,11 +1753,11 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
             Buf.wrap(gamma_serial[t * ab_stride ..][0..nv]),
             nv,
         );
-        for (0..nk_reps) |_| {
-            ew.bufL2norm(Buf.wrap(qkv_t[0..kq_dim]));
-            ew.bufL2norm(Buf.wrap(qkv_t[kq_dim..][0..kq_dim]));
-            ew.bufScaleVec(Buf.wrap(qkv_t[0..kq_dim]), qscale);
-        }
+        // ONE pass: this is `Exec.l2normQkScale`, the slot the serial
+        // `forwardGdn` uses.
+        ew.bufL2norm(Buf.wrap(qkv_t[0..kq_dim]));
+        ew.bufL2norm(Buf.wrap(qkv_t[kq_dim..][0..kq_dim]));
+        ew.bufScaleVec(Buf.wrap(qkv_t[0..kq_dim]), qscale);
     }
 
     // The batched path must be bit-identical here: every underlying primitive is
@@ -1760,4 +1767,66 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
     try std.testing.expectEqualSlices(f32, &conv_serial, &conv_batch);
     try std.testing.expectEqualSlices(f32, &gamma_serial, &gamma_batch);
     try std.testing.expectEqualSlices(f32, &ab_serial, &ab_batch);
+}
+
+test "matvecBatchK equals k single matvec calls" {
+    // There was no test here at all, which is how the batched prefill broke
+    // silently: `forwardChunk` disagrees with `forwardLogits` by 17.5 in the
+    // max logit on the 0.8B model (see `QWEN35_SPEC_TAPS`), and on a 17-token
+    // prompt that flips the FIRST sampled token.  `QWEN35_NO_BATCH` produces
+    // the correct stream, which points at this operator or its scratch.
+    //
+    // Contract: `matvecBatchK(out, w, xK, k)` must produce, for every token t,
+    // exactly what `matvec(out[t*rows..], w, xK[t*cols..])` produces.  Both
+    // quantize the activation the same way (`actQ8_0` over the same row), so
+    // the comparison is exact, not approximate.
+    const cols = 256;
+    const rows = 2;
+    const k = 3;
+
+    // Q8_0: 34-byte blocks, one block per 32 elements -> 8 blocks per row.
+    var wq: [rows * cols / 32 * 34]u8 = undefined;
+    for (0..rows) |r| {
+        for (0..cols / 32) |b| {
+            const off = (r * (cols / 32) + b) * 34;
+            const bits: u16 = @bitCast(@as(f16, 0.03125) * @as(f16, @floatFromInt(1 + b)));
+            wq[off] = @truncate(bits);
+            wq[off + 1] = @truncate(bits >> 8);
+            for (0..32) |j| {
+                // Vary per (r, b, j) so a wrong row/block/token stride shows up.
+                const q: i8 = @intCast(@as(i32, @intCast((j * 7 + b * 13 + r * 29) % 17)) - 8);
+                wq[off + 2 + j] = @bitCast(q);
+            }
+        }
+    }
+    const w: QuantRow = .{ .data = &wq, .ttype = .q8_0, .rows = rows, .blocks_per_row = cols / 32 };
+    try std.testing.expectEqual(cols, w.cols());
+
+    // Distinct activations per token: a stride bug that reuses token 0's row
+    // would otherwise compare equal.
+    var xK: [k * cols]f32 = undefined;
+    for (0..k) |t| {
+        for (0..cols) |c| {
+            xK[t * cols + c] = @as(f32, @floatFromInt((c * 3 + t * 31) % 23)) * 0.125 - 1.0;
+        }
+    }
+
+    var batch: [k * rows]f32 = undefined;
+    var q8K: [q8ScratchBytes(cols) * k]u8 = undefined;
+    var q8kK: [q8kScratchBytes(cols) * k]u8 = undefined;
+    matvecBatchK(&batch, .{ .quant = w }, &xK, k, &q8K, &q8kK, null);
+
+    var single: [k * rows]f32 = undefined;
+    for (0..k) |t| {
+        var one: [rows]f32 = undefined;
+        matvecQuant(&one, w, xK[t * cols ..][0..cols], &q8kK, &q8K, null);
+        for (0..rows) |r| single[t * rows + r] = one[r];
+    }
+
+    for (0..k * rows) |i| {
+        if (batch[i] != single[i]) {
+            std.debug.print("matvecBatchK[{d}] = {e}, single = {e}\n", .{ i, batch[i], single[i] });
+            return error.BatchDisagreesWithSingle;
+        }
+    }
 }
