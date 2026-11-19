@@ -1,6 +1,6 @@
 //! Dev-only CLI: encode text with our tokenizer from a GGUF and print ids —
 //! used to diff against HF transformers tokenization.
-//! Usage: qwen35-tok <model.gguf> <text>...
+//! Usage: houtou-tok <model.gguf> <text>...
 //!
 //! Output per text argument, always exactly three lines:
 //!   <id> <id> ...        -- encoded token ids
@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const qwen35 = @import("qwen35");
+const houtou = @import("houtou");
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -36,10 +36,10 @@ pub fn main(init: std.process.Init) !void {
     });
     defer mm.destroy(io);
 
-    var g = try qwen35.gguf.parse(arena, mm.memory);
+    var g = try houtou.gguf.parse(arena, mm.memory);
     defer g.deinit();
 
-    var tok = try qwen35.tokenizer.Tokenizer.initFromGguf(arena, &g);
+    var tok = try houtou.tokenizer.Tokenizer.initFromGguf(arena, &g);
 
     for (args[2..]) |text| {
         const ids = try tok.encode(arena, text);

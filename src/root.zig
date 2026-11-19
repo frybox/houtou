@@ -1,6 +1,6 @@
-//! qwen35: a from-scratch Qwen3.5 inference engine in Zig.
+//! houtou: a Zig inference engine for frontier open models.
 //!
-//! Module root. Everything public here is reachable as `@import("qwen35").xxx`.
+//! Module root. Everything public here is reachable as `@import("houtou").xxx`.
 
 const std = @import("std");
 
@@ -10,7 +10,15 @@ pub const backend_cpu = @import("backend_cpu.zig");
 pub const backend_cuda = @import("backend_cuda.zig");
 pub const cudart = @import("cudart.zig");
 pub const tokenizer = @import("tokenizer.zig");
-pub const engine = @import("engine.zig");
+/// Per-architecture inference engines.  Each one owns the layer stack of one
+/// model family and shares the rest (backends, GGUF, sampling) with the others.
+pub const engines = struct {
+    pub const qwen35 = @import("engines/qwen35.zig");
+};
+/// Historical alias: before the `engines/` split there was exactly one engine,
+/// and `main.zig` and the tests still reach it as `qwen35.engine`.  Kept so the
+/// move did not have to touch every call site at once.
+pub const engine = engines.qwen35;
 pub const quant_dequant = @import("quant_dequant.zig");
 pub const pool = @import("pool.zig");
 pub const dspine_bridge = @import("dspine_bridge.zig");

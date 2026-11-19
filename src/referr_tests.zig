@@ -14,7 +14,7 @@
 //! the test lives here and imports both sides.
 
 const std = @import("std");
-const engine = @import("engine.zig");
+const engine = @import("engines/qwen35.zig");
 const backend_cpu = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
 const quant = @import("quant_dequant.zig");

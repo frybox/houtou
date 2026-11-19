@@ -22,10 +22,10 @@
 //!     Qwen3_5RMSNorm-family weights and stores ssm_a = -A_log.exp().
 
 const std = @import("std");
-const gguf = @import("gguf.zig");
-const backend = @import("backend.zig");
-const backend_cpu = @import("backend_cpu.zig");
-const sampler = @import("sampler.zig");
+const gguf = @import("../gguf.zig");
+const backend = @import("../backend.zig");
+const backend_cpu = @import("../backend_cpu.zig");
+const sampler = @import("../sampler.zig");
 const Io = std.Io;
 
 /// The engine hands backend-owned activation regions to every op.  It wraps its

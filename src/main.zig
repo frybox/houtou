@@ -5,8 +5,8 @@ const Io = std.Io;
 /// by `runInference` far below, which never sees `std.process.Init`.
 var g_dump_path: ?[]const u8 = null;
 
-const qwen35 = @import("qwen35");
-const gguf = qwen35.gguf;
+const houtou = @import("houtou");
+const gguf = houtou.gguf;
 
 /// Context threaded through the engine's per-token progress callback: prints
 /// each generated token as soon as it is produced, C-style.
@@ -27,13 +27,13 @@ const gguf = qwen35.gguf;
 /// is exactly what makes a small `ctx_rows` the right default.
 /// `Draft.lm_head_matvec` hook: `out = lm_head @ x` on the TARGET's backend.
 fn lmHeadHook(ctx: *anyopaque, out: []f32, x: []const f32) void {
-    const e: *qwen35.engine.Engine = @ptrCast(@alignCast(ctx));
+    const e: *houtou.engine.Engine = @ptrCast(@alignCast(ctx));
     e.lmHeadFromHostRow(out, x);
 }
 
 const DraftRunner = struct {
-    e: *qwen35.engine.Engine,
-    dr: *qwen35.draft.Draft,
+    e: *houtou.engine.Engine,
+    dr: *houtou.draft.Draft,
     io: Io,
     /// Trailing committed ids fed to the draft's `fc` projection.
     ctx_rows: usize,
@@ -194,14 +194,14 @@ const Dumper = struct {
 
 const StreamCtx = struct {
     out: *Io.Writer,
-    tok: *const qwen35.tokenizer.Tokenizer,
+    tok: *const houtou.tokenizer.Tokenizer,
     arena: std.mem.Allocator,
 
     fn onToken(ctx: ?*anyopaque, token: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ctx orelse return));
-        if (qwen35.pool.stat_on) {
-            const s = qwen35.pool.snapshot();
-            qwen35.pool.reset();
+        if (houtou.pool.stat_on) {
+            const s = houtou.pool.snapshot();
+            houtou.pool.reset();
             std.debug.print("STATS tok={d} k256={d} k32={d} ksc={d} kq8={d} kf32={d} total={d}\n", .{
                 token, s.k256, s.k32, s.ksc, s.kq8, s.kf32, s.k256 + s.k32 + s.ksc + s.kq8 + s.kf32,
             });
@@ -250,7 +250,7 @@ var draft_nobridge = false;
 /// `QWEN35_DRAFT_BACKEND`: which backend runs DSpine stage 3 (the 5-layer
 /// draft forward + the code bridge).  Unset means "follow the target's
 /// backend".  Stage 4 (serial refinement) is host-only either way.
-var draft_backend_override: ?qwen35.dspine_bridge.Kind = null;
+var draft_backend_override: ?houtou.dspine_bridge.Kind = null;
 /// `QWEN35_SPEC_TAPFILE=<path>`: the draft self-check's context tap planes, as
 /// raw f32.  Written when the file is absent, read when it is present, so the
 /// CPU and CUDA backends can be fed the SAME input and their chains compared.
@@ -277,15 +277,15 @@ pub fn main(init: std.process.Init) !void {
     // Hand the environment to the CUDA runtime shim: Zig 0.17 only exposes it
     // through `Init`, and locating libcudart needs $QWEN35_CUDART / $PATH (the
     // CUDA kernels themselves are linked in, so they need nothing from here).
-    qwen35.cudart.environ_map = init.environ_map;
-    if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
-    if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
+    houtou.cudart.environ_map = init.environ_map;
+    if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| houtou.engine.Engine.setSimdTier(t);
+    if (init.environ_map.get("QWEN35_NO_BATCH") != null) houtou.engine.no_batch = true;
     if (init.environ_map.get("QWEN35_PROF") != null) {
-        qwen35.engine.prof = true;
-        qwen35.backend_cpu.prof = true;
+        houtou.engine.prof = true;
+        houtou.backend_cpu.prof = true;
     }
-    if (init.environ_map.get("QWEN35_PROF_POST") != null) qwen35.pool.prof_post_only = true;
-    if (init.environ_map.get("QWEN35_STAT") != null) qwen35.pool.stat_on = true;
+    if (init.environ_map.get("QWEN35_PROF_POST") != null) houtou.pool.prof_post_only = true;
+    if (init.environ_map.get("QWEN35_STAT") != null) houtou.pool.stat_on = true;
     dump_ids = init.environ_map.get("QWEN35_DUMP_IDS") != null;
     spec_taps = init.environ_map.get("QWEN35_SPEC_TAPS") != null;
     spec_nextn = init.environ_map.get("QWEN35_SPEC_NEXTN") != null;
@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) !void {
         tapl_shift_override = std.fmt.parseInt(i32, v, 10) catch null;
     }
     if (init.environ_map.get("QWEN35_DRAFT_BACKEND")) |v| {
-        draft_backend_override = std.meta.stringToEnum(qwen35.dspine_bridge.Kind, v);
+        draft_backend_override = std.meta.stringToEnum(houtou.dspine_bridge.Kind, v);
     }
     if (init.environ_map.get("QWEN35_DRAFT")) |p| {
         if (p.len < draft_path_buf.len) {
@@ -392,21 +392,21 @@ fn runInference(
     }
     const path = args[2];
     const prompt_text = args[3];
-    const engine = qwen35.engine;
+    const engine = houtou.engine;
     var n_predict: usize = engine.Engine.max_seq; // default: until the context fills
     var temp: f32 = 0;
     var top_k: usize = 0;
     var top_p: f32 = 0;
     var seed: u64 = 12345;
     var n_threads: usize = 0; // 0 = default (min(16, cpus))
-    var backend_kind: qwen35.backend.Kind = .cpu;
-    var kv_type: qwen35.backend.KvType = .f16;
+    var backend_kind: houtou.backend.Kind = .cpu;
+    var kv_type: houtou.backend.KvType = .f16;
     var i: usize = 4;
     while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
             // Keep the accepted set in sync with `backend.Kind`; naming the
             // valid values in the error is what makes a typo recoverable.
-            backend_kind = std.meta.stringToEnum(qwen35.backend.Kind, args[i + 1]) orelse {
+            backend_kind = std.meta.stringToEnum(houtou.backend.Kind, args[i + 1]) orelse {
                 try err_out.print("error: --backend expects 'cpu' or 'cuda', got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
                 return error.InvalidArgument;
@@ -417,7 +417,7 @@ fn runInference(
             // the default (halves the f32 footprint, near-lossless); q8_0 /
             // q4_0 trade more precision for 2x / ~3.5x less KV memory; f32 is
             // kept for A/B against the historical path.
-            kv_type = std.meta.stringToEnum(qwen35.backend.KvType, args[i + 1]) orelse {
+            kv_type = std.meta.stringToEnum(houtou.backend.KvType, args[i + 1]) orelse {
                 try err_out.print("error: --kv-type expects 'f32', 'f16', 'q8_0' or 'q4_0', got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
                 return error.InvalidArgument;
@@ -481,9 +481,9 @@ fn runInference(
 
     e.sampler = engine.Sampler.init(.{ .temperature = temp, .top_k = top_k, .top_p = top_p, .seed = seed });
 
-    var tok = try qwen35.tokenizer.Tokenizer.initFromGguf(arena, &e.g);
+    var tok = try houtou.tokenizer.Tokenizer.initFromGguf(arena, &e.g);
 
-    const rendered = try qwen35.tokenizer.Tokenizer.renderChatTurn(arena, prompt_text, false);
+    const rendered = try houtou.tokenizer.Tokenizer.renderChatTurn(arena, prompt_text, false);
     const prompt = try tok.encode(arena, rendered);
     try out.print("[prompt: {d} tokens]\n", .{prompt.len});
 
@@ -853,7 +853,7 @@ fn runInference(
                 .protection = .{ .read = true },
             });
             defer dmm.destroy(io);
-            var dg = try qwen35.gguf.parse(arena, dmm.memory);
+            var dg = try houtou.gguf.parse(arena, dmm.memory);
             defer dg.deinit();
 
             const er = e.embedRows() catch {
@@ -872,10 +872,10 @@ fn runInference(
             // it does not while stage 4 is still a host loop.  The two backends
             // now agree to <0.5% on the residual stream and are bit-exact on
             // the four bridge kernels -- see docs/dspine-stage3-cuda.md.
-            const draft_kind: qwen35.dspine_bridge.Kind =
+            const draft_kind: houtou.dspine_bridge.Kind =
                 draft_backend_override orelse (if (backend_kind == .cuda) .cuda else .cpu);
             try out.print("SPEC-DRAFT backend={s}\n", .{@tagName(draft_kind)});
-            var dr = qwen35.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), draft_kind, io, tapl_shift_override) catch |de| {
+            var dr = houtou.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), draft_kind, io, tapl_shift_override) catch |de| {
                 std.debug.print("SPEC-DRAFT load failed: {s}\n", .{@errorName(de)});
                 return;
             };
@@ -990,7 +990,7 @@ fn runInference(
                 dr.disable_bridge = draft_nobridge;
 
                 const runBlk = struct {
-                    fn go(d: *qwen35.draft.Draft, ids: []const u32, tp: []const f32, rows: usize, nb: usize) void {
+                    fn go(d: *houtou.draft.Draft, ids: []const u32, tp: []const f32, rows: usize, nb: usize) void {
                         d.reset();
                         d.projectContext(tp, rows);
                         // The context window ends right before the block: its rows
@@ -1106,7 +1106,7 @@ fn runInference(
             }
 
             const runBlock = struct {
-                fn go(d: *qwen35.draft.Draft, ids: []const u32, tp: []const f32, rows: usize, nblock: usize) void {
+                fn go(d: *houtou.draft.Draft, ids: []const u32, tp: []const f32, rows: usize, nblock: usize) void {
                     d.reset();
                     d.projectContext(tp, rows);
                     // The context sits BEFORE the block in absolute positions;
@@ -1162,7 +1162,7 @@ fn runInference(
                 "SPEC-DRAFT magnitudes: rms={d:.3} embed={d:.4} resid={d:.1} xin={d:.2} gout={d:.2} " ++
                     "attn={d:.1} mlp={d:.1} delta={d:.2} msg={d:.2} codes={d:.2}\n",
                 .{
-                    qwen35.draft.maxAbsForSelfCheck(dr.bridge_rms.slice()),
+                    houtou.draft.maxAbsForSelfCheck(dr.bridge_rms.slice()),
                     dr.debug_embed, dr.debug_resid, dr.debug_xin,   dr.debug_gout,
                     dr.debug_attn,  dr.debug_mlp,    dr.debug_delta, dr.debug_msg,
                     dr.debug_codes,
@@ -1330,12 +1330,12 @@ fn runInference(
             .protection = .{ .read = true },
         });
         defer dmm.destroy(io);
-        var dg = try qwen35.gguf.parse(arena, dmm.memory);
+        var dg = try houtou.gguf.parse(arena, dmm.memory);
         defer dg.deinit();
         const er = e.embedRows() catch break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
-        const kind: qwen35.dspine_bridge.Kind =
+        const kind: houtou.dspine_bridge.Kind =
             draft_backend_override orelse (if (e.backendKind() == .cuda) .cuda else .cpu);
-        var dr = qwen35.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), kind, io, tapl_shift_override) catch |de| {
+        var dr = houtou.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), kind, io, tapl_shift_override) catch |de| {
             try out.print("\n[spec: draft load failed ({s}); falling back to plain decode]\n", .{@errorName(de)});
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
@@ -1492,10 +1492,10 @@ fn runInference(
     // calls `reportStats`), printed a header with no tables.  Goes through
     // `Engine`, not the device module, so `engine.zig` keeps importing no
     // hardware backend (AGENTS.md §1.1).
-    if (qwen35.engine.prof) {
+    if (houtou.engine.prof) {
         e.profBackendReport();
-        qwen35.engine.profReport();
-        qwen35.backend_cpu.profReportMatvec();
+        houtou.engine.profReport();
+        houtou.backend_cpu.profReportMatvec();
     }
     try out.flush();
 }
