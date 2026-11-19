@@ -226,6 +226,19 @@ int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base,
 int q35_launch_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn,
                            void *stream);
 void *q35_func_rope64_dpos(void);
+
+// Rotary embedding with a RUNTIME rotary width: `rows` rows x `heads` heads of
+// `hd` floats, rotating each head's leading `rotary_dim` (row r at `pos0 + r`).
+// `rotary_dim` must be even and <= hd.
+//
+// Qwen3.5/3.8 need only the 64-wide `q35_launch_rope64_rows`; Qwen3 rotates the
+// whole head (rotary_dim == hd == 128), which that kernel cannot express.  The
+// CPU twin is `backend_cpu.zig` `vRopeRows` -> `elementwise.applyRope`.
+// `rotary_dim == 64` is bit-identical to `q35_launch_rope64_rows`; the same
+// accuracy contract applies (not bit-exact with the host, see rope.cu).
+int q35_launch_rope_rows_dim(float *d_x, int rows, int heads, int hd, int pos0,
+                             float base, int rotary_dim, void *stream);
+
 // Row-batched twin of the above: `rows` rows x `heads` heads, rotating row r
 // at {pos+r, base} read from the same device channel.  Exists so decode can
 // issue ONE rope node per tensor instead of one per head -- `k_rope64_dpos`

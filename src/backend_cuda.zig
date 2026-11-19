@@ -201,6 +201,9 @@ const Kernels = struct {
     /// Row-batched rope64: `rows` tokens `pos0..pos0+rows-1`, each `heads * hd`
     /// floats wide.  PREFILL ONLY (see the note on `VTable.rope64Rows`).
     extern fn q35_launch_rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Rotary embedding with a runtime rotary width (Qwen3 rotates the whole
+    /// head; Qwen3.5/3.8 rotate 64 of 256).  See `api.h`.
+    extern fn q35_launch_rope_rows_dim(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_rope64_rows_dpos() callconv(.c) ?*anyopaque;
     /// Host-stub address of the device kernel `q35_launch_rope64` launches.  A
@@ -345,6 +348,7 @@ const Launch = if (cuda_linked) struct {
     const rope64_dpos = Kernels.q35_launch_rope64_dpos;
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
     const rope64_rows = Kernels.q35_launch_rope64_rows;
+    const rope_rows_dim = Kernels.q35_launch_rope_rows_dim;
     const rope64_rows_dpos = Kernels.q35_launch_rope64_rows_dpos;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -574,6 +578,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, rows, heads, hd, pos0, base, stream };
+        return stubNoCudaKernels();
+    }
+    fn rope_rows_dim(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, rows, heads, hd, pos0, base, rotary_dim, stream };
         return stubNoCudaKernels();
     }
     fn rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
@@ -8093,14 +8101,67 @@ const attn_score_arity: usize = 11;
     /// To implement: a `k_rope_rows` kernel taking `(x, rows, heads, hd,
     /// rotary_dim, pos, base)`; `rotary_dim` is uniform across the vector so it
     /// can be a template/register argument rather than a runtime branch.
+    /// Rotary embedding with a runtime rotary width: `rows` rows x `heads`
+    /// heads of `hd` floats, rotating each head's leading `rotary_dim`.
+    ///
+    /// Qwen3.5/3.8 reach `rope64Rows` (rotary width 64); Qwen3 rotates the whole
+    /// head, so it reaches this slot with `rotary_dim == hd == 128`.  The two
+    /// kernels are the same arithmetic with the width as a parameter, and
+    /// `rotary_dim == 64` reproduces `rope64Rows` bit for bit (see rope.cu).
+    ///
+    /// PREFILL ONLY in intent, but Qwen3 has no batched prefill yet, so this is
+    /// also reached from decode.  There is no device-position twin of the kernel
+    /// (unlike `rope64Rows`, which has `_dpos` variants the decode graph
+    /// retargets), so if a capture ever IS open the node would replay the first
+    /// token's arguments forever.  Refuse to record it: abandon the capture and
+    /// run this op on the host instead of silently rotating with a stale
+    /// `pos`/`base`.
+    ///
+    /// NOTE: on the Qwen3 engine this branch is currently unreachable -- its
+    /// decode step never manages to open a capture (measured: no "decode graph
+    /// live" line and no abandon message with or without this kernel).  It is
+    /// kept because that is a property of `graphBegin` for that engine, not of
+    /// this op, and it must not become a silent corruption if it changes.
     fn dRopeRows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
-        _ = .{ ctx, x, pos, base, rows, heads, hd };
-        std.debug.print(
-            "error: ropeRows (rotary_dim={d}) has no CUDA kernel yet; run with --backend cpu\n",
-            .{rotary_dim},
-        );
-        @panic("ropeRows is not implemented on the CUDA backend");
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.rope64_rows, t0);
+        if (self.ablated(.rope64_rows)) return;
+        dRopeRows_body(ctx, x, pos, base, rows, heads, hd, rotary_dim);
     }
+
+    fn dRopeRows_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        const self = self_(ctx);
+        const row_len = heads * hd;
+        if (rotary_dim == 64) {
+            // Same width as `rope64Rows`: delegate so the 3.5/3.8 path keeps
+            // exactly one implementation (and one set of graph-identity rules).
+            return dRope64Rows_body(ctx, x, pos, base, rows, heads, hd);
+        }
+        if (!ropeOnDevice() or rows == 0 or heads == 0 or
+            rotary_dim < 2 or rotary_dim > hd or
+            row_len == 0 or x.len != rows * row_len or self.cu == null)
+        {
+            cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+            return;
+        }
+        // A capture would replay this node with the FIRST token's arguments and
+        // there is no `_dpos` variant to retarget, so refuse to record it: let
+        // the capture be abandoned (decoding still works, just unbatched) rather
+        // than produce silently stale rotations.
+        if (self.capturing()) {
+            self.graphAbandon("ropeRows (variable rotary_dim) is not capture-safe");
+            cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+            return;
+        }
+        if (dBufPtr(x)) |px| {
+            const rc = Launch.rope_rows_dim(px, @intCast(rows), @intCast(heads), @intCast(hd), @bitCast(pos), base, @intCast(rotary_dim), self.launchStream());
+            if (rc == cudart.cudaSuccess) return;
+            self.ewLaunchFail("rope_rows_dim", rc);
+        }
+        cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+    }
+
 
     fn dRope64Rows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);

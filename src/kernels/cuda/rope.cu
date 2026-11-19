@@ -109,6 +109,65 @@ __global__ void k_rope64_rows(float *__restrict__ x, int rows, int heads, int hd
     hp[j + kHalf] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
 }
 
+// Variable rotary width: the `k_rope64_rows` body with `rotary_dim` as a
+// parameter instead of the hard-wired 64.
+//
+// WHY THIS EXISTS: Qwen3.5/3.8 rotate the leading 64 of a `head_dim = 256`
+// head (`partial_rotary_factor = 0.25`), which `k_rope64_rows` covers.  Qwen3
+// rotates the WHOLE head (`head_dim = 128`, `partial_rotary_factor = 1.0`), so
+// the engine needs a rotation whose width is a runtime value.  The CPU twin is
+// `backend_cpu.zig` `vRopeRows` -> `elementwise.applyRope`.
+//
+// ARITHMETIC: expression for expression the CPU body, i.e.
+//
+//     half = rotary_dim / 2
+//     theta = (f32)pos * powf(base, -2j/rotary_dim)
+//     c = cosf(theta); s = sinf(theta)
+//     a = x[j]; b = x[j+half]
+//     x[j]      = a*c - b*s
+//     x[j+half] = a*s + b*c
+//
+// with `j < half` and every op the rounded intrinsic, exactly like
+// `k_rope64_rows`.  The SAME accuracy contract applies: this is not bit-exact
+// with the host (device `powf` vs glibc `powf` differ by ~1 ULP, an absolute
+// phase error of order `pos * 1.2e-7` rad).  See the header comment.
+//
+// `rotary_dim == 64` reproduces `k_rope64_rows` bit for bit, because the
+// exponent and both constants then have the same values -- so routing the
+// 3.5/3.8 path through this kernel would not change its output.  The engine
+// still keeps the dedicated 64 kernel on that path (its host stub is what the
+// decode graph identifies), and this one is used only where the width differs.
+//
+// Threads: one warp per (row, head) pair, `half` of its lanes active.  Warps
+// exist for `half <= 32`; a wider rotation (not produced by any model this
+// engine targets) loops over `j` in `half`-sized strides so the code stays
+// correct rather than asserting.
+constexpr int kHeadsPerBlockDim = 8;
+
+__global__ void k_rope_rows_dim(float *__restrict__ x, int rows, int heads, int hd,
+                                int pos0, float base, int rotary_dim) {
+    const int lane = threadIdx.x & (kHalf - 1);
+    const int local_head = threadIdx.x / kHalf;
+    const int rh = blockIdx.x * kHeadsPerBlockDim + local_head;
+    if (rh >= rows * heads) return;
+    const int r = rh / heads;
+    float *hp = x + ((size_t)rh) * (size_t)hd;
+    const int pos = pos0 + r;
+    const int half = rotary_dim >> 1;
+    // `half <= 32` in practice (64 and 128 rotary widths), so this is one
+    // iteration; the stride keeps wider shapes correct.
+    for (int j = lane; j < half; j += kHalf) {
+        const float exponent = -2.0f * (float)j / (float)rotary_dim;
+        const float theta = __fmul_rn((float)pos, powf(base, exponent));
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float a = hp[j];
+        const float b = hp[j + half];
+        hp[j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+        hp[j + half] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
+    }
+}
+
 // Device-position variant of `k_rope64`.
 //
 // WHY THIS EXISTS (this is the whole point of the kernel):
@@ -250,6 +309,17 @@ extern "C" int q35_launch_rope64_rows(float *d_x, int rows, int heads, int hd, i
     k_rope64_rows<<<blocks, threads, 0, stream>>>(d_x, rows, heads, hd, pos0, base);
     return (int)cudaGetLastError();
 }
+extern "C" int q35_launch_rope_rows_dim(float *d_x, int rows, int heads, int hd, int pos0,
+                                       float base, int rotary_dim, void *stream_v) {
+    if (rows <= 0 || heads <= 0 || rotary_dim < 2 || rotary_dim > hd) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    const int threads = kHalf * kHeadsPerBlockDim;
+    const int total = rows * heads;
+    const int blocks = (total + kHeadsPerBlockDim - 1) / kHeadsPerBlockDim;
+    k_rope_rows_dim<<<blocks, threads, 0, stream>>>(d_x, rows, heads, hd, pos0, base, rotary_dim);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_rope64_rows_dpos(float *d_x, int rows, int heads, int hd,
                                            const void *d_dyn, void *stream_v) {
     if (rows <= 0 || heads <= 0 || hd < 64) return (int)cudaSuccess;
