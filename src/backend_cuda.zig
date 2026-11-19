@@ -1907,6 +1907,54 @@ pub const CudaBackend = struct {
     /// forget, and the `g_capturing`/`g_state` pair makes forgetting a loud
     /// capture error (`cudaErrorStreamCaptureUnsupported`) instead of a graph
     /// that is missing nodes.
+    /// The stream kernel launches should use right now (`null` = the default
+    /// stream).  Public so a caller that owns its own launches -- the DSpine
+    /// draft's code bridge (`src/draft.zig`) -- can put them on the same stream
+    /// as the backend's matvecs and get the ordering for free.
+    pub fn currentStream(self: *CudaBackend) ?*anyopaque {
+        return self.launchStream();
+    }
+
+    /// Copy `n` f32 from device region `src` into HOST slice `dst`.
+    ///
+    /// `Exec.copyRange` is a device-to-device move on this backend (and a
+    /// memcpy of host memory for a host->device or host-only pair, which does
+    /// not help a caller that owns a raw `[]f32`).  A caller holding host memory
+    /// -- the DSpine draft's serial stash -- needs this instead; passing a host
+    /// pointer to `copyRange` would make `copy_range` write THROUGH a host
+    /// address and abort the context with an illegal access (measured).
+    pub fn copyToHost(self: *CudaBackend, dst: []f32, src: backend.Buf) void {
+        if (dst.len < src.len or self.cu == null) return;
+        const cu = &self.cu.?;
+        _ = cu.lib.Memcpy(dst.ptr, @ptrCast(src.ptr), src.len * @sizeOf(f32), cudart.MemcpyDeviceToHost);
+    }
+
+    /// Copy arbitrary host bytes into a device buffer.  Needed for the small
+    /// non-f32 control cells a caller owns (the DSpine bridge's anchor-id
+    /// table); `copyFromHost` is the typed form of the same thing.
+    pub fn copyBytesToDevice(self: *CudaBackend, dst: *anyopaque, src: []const u8) void {
+        if (self.cu == null) return;
+        const cu = &self.cu.?;
+        _ = cu.lib.Memcpy(dst, src.ptr, src.len, cudart.MemcpyHostToDevice);
+    }
+
+    /// Copy HOST slice `src` into device region `dst`.  The mirror of
+    /// `copyToHost`; see its comment.
+    pub fn copyFromHost(self: *CudaBackend, dst: backend.Buf, src: []const f32) void {
+        if (src.len < dst.len or self.cu == null) return;
+        const cu = &self.cu.?;
+        _ = cu.lib.Memcpy(@ptrCast(dst.ptr), src.ptr, dst.len * @sizeOf(f32), cudart.MemcpyHostToDevice);
+    }
+
+    /// Block until every launch on `currentStream()` has completed.  Public for
+    /// the same reason as `currentStream`: the DSpine draft issues its own
+    /// launches and then needs the results on the host.
+    pub fn syncCurrentStream(self: *CudaBackend) void {
+        if (self.cu) |*cu| {
+            _ = cu.lib.StreamSynchronize(self.launchStream());
+        }
+    }
+
     fn launchStream(self: *CudaBackend) ?*anyopaque {
         return switch (self.g_state) {
             .rec => self.g_stream,
@@ -5083,7 +5131,7 @@ const attn_score_arity: usize = 11;
                 self.ewLaunchFail("copyToHost", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.copyToHost(@ptrCast(&self.cpu), dst, src);
+        cpu_mod.CpuBackend.vtable.copyOut(@ptrCast(&self.cpu), dst, src);
     }
 
     // ==== slots: norms / activations (P2b, second batch) ====================
@@ -8113,7 +8161,6 @@ pub const vtable = backend.Exec.VTable{
     .gdnGamma = CudaBackend.dGdnGamma,
     .gdnPrefillCore = CudaBackend.dGdnPrefillCore,
     .copyFromHost = CudaBackend.dCopyFromHost,
-    .copyToHost = CudaBackend.dCopyToHost,
     .argmax = CudaBackend.dArgmax,
     .sample = CudaBackend.dSample,
     .sampledToken = CudaBackend.dSampledToken,
@@ -8125,6 +8172,7 @@ pub const vtable = backend.Exec.VTable{
     .l2normQkScale = CudaBackend.dL2normQkScale,
     .addResid = CudaBackend.dAddResid,
     .copyRange = CudaBackend.dCopyRange,
+    .copyOut = CudaBackend.dCopyToHost,
     .copyRangeSlot = CudaBackend.dCopyRangeSlot,
     .deinterleaveQG = CudaBackend.dDeinterleaveQG,
     .deinterleaveQGStrided = CudaBackend.dDeinterleaveQGStrided,

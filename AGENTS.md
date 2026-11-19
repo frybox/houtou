@@ -610,10 +610,13 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 
 ## 7. 代码风格与提交
 
-- 注释写**为什么**与**来源锚点**（如 `ggml-quants.c:2575`），移植代码标注"逐表达式对应 C 的哪一段"。
+- **注释一律用中文写**（含 Zig / C / CUDA / shell / 构建脚本等所有源文件）。
+  写**为什么**与**来源锚点**（如 `ggml-quants.c:2575`），移植代码标注"逐表达式对应 C 的哪一段"。
+  代码标识符、API 名、环境变量名、命令、路径保持原样不译。
 - Zig 侧保持现有命名与分区习惯（`// ==== Phase N ====` 分节）；不要重排无关代码。
-- commit message 用 conventional commits + scope，例：
-  `fix(iq3_xxs): use keven_signs_q2xs in Zig dequant to match C kernel`。
+- **commit message 一律用中文写**，但仍用 conventional commits 的 `type(scope):` 前缀，例：
+  `fix(iq3_xxs): Zig 反量化改用 keven_signs_q2xs 以对齐 C kernel`。
+  说明正文写清动机、踩过的坑与实测数字（参照本文件其它条目的写法）。
 - 一次提交只做一件事：kernel 改动与调用方改动分开，便于二分定位回归。
 
 ## 8. 文档一致性提醒

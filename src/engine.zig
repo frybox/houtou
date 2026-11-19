@@ -569,6 +569,19 @@ pub const Engine = struct {
     layers: []LayerWeights,
     kv: []KvCache,
     gdn: []GdnState,
+    /// Pre-verify snapshot for speculative decoding; empty until
+    /// `specSnapshotAlloc` runs.
+    spec_snap: []SnapLayer = &.{},
+    /// Trailing MTP / nextn prediction block (`blk.<n_layers>.*`), or null when
+    /// the model has none (0.8B/2B/4B) or `spec` was never initialised.
+    ///
+    /// SPECULATIVE DECODING (stage 1): the nextn block is a full decoder layer
+    /// plus a `eh_proj` that folds (embedding, hidden) back to `hidden`, and it
+    /// shares the main model's `output_norm` / lm_head.  It is the cheapest
+    /// possible drafter -- the weights ship with the target, so there is nothing
+    /// to download, and one forward gives one speculative token instead of the
+    /// 15 a DSpine-style block drafter proposes.
+    nextn: ?Nextn = null,
     /// worker count (1 = serial); set by load from `n_threads`
     n_threads: usize = 1,
 
@@ -638,6 +651,55 @@ pub const Engine = struct {
     sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
 
+    // ---- speculative-decoding taps (DSpine port, stage 0) ----
+    //
+    // The DSpine draft consumes the target's hidden state at a FIXED set of
+    // layer indices (`dflash_config.target_layers`, `[2,17,32,47,62]` for the
+    // 27B) and never looks at any other layer.  `forwardChunk` can therefore
+    // copy those layers' OUTPUT hidden state into `tap_hidden`, which the
+    // draft's `fc` projection then turns into its 5H -> H context.
+    //
+    // LAYOUT: `tap_hidden` is `taps.len * nbatch * hidden`, i.e. one
+    // `nbatch * hidden` plane per tap, tap-major.  Tap `i` covers layer
+    // `tap_layers[i]`, and inside that plane row `t` is token `t` of the
+    // chunk -- matching `dspine_mlx`'s `_LayerHook`, which stores the layer's
+    // WHOLE output tensor (`mx.concatenate(storage, axis=-1)` keeps every
+    // position; the draft needs features for all block rows, not just the
+    // last).  The `nbatch` stride (not `k`) is so a short final chunk still
+    // lands at a fixed offset and the reader does not have to know `k`.
+    //
+    // Disabled by default: `tap_hidden` is `Buf.empty`, so the normal
+    // prefill/decode path pays ONE usize compare per layer and nothing else.
+    //
+    // ORDER: `tap_layers` must be ASCENDING (it is the draft's
+    // `target_layers`); tap i is written from layer `tap_layers[i]`.
+    tap_layers: []const u32 = &.{},
+    tap_hidden: backend.Buf = backend.Buf.empty,
+    /// Rolling tap ring for the spec context window (`specRingEnable`).
+    ring: []f32 = &.{},
+    ring_ctx: usize = 0,
+    ring_next: usize = 0,
+    ring_filled: usize = 0,
+    /// `$QWEN35_SPEC_TRACE`: print each round's first proposal next to the
+    /// target's own pick.  Set by `main.zig`; purely diagnostic.
+    spec_trace_dbg: bool = false,
+    /// `$QWEN35_SPEC_POSSTAT`: buckets each round by how many draft ids the
+    /// verifier accepted (`0..max_draft`).
+    spec_posstat: bool = false,
+    spec_pos_reached: [64]usize = @splat(0),
+    /// `$QWEN35_SPEC_RECALL`: the draft's `selector_top_k`.  Sized by the caller
+    /// (`main.zig`) before `generateSpec`, because the engine must not import
+    /// the draft module.
+    spec_recall_k: usize = 0,
+    /// `$QWEN35_SPEC_RECALL`: failures split by cause.  `miss_select` = the
+    /// target's token WAS in the candidate set but stage 4 picked another lane;
+    /// `miss_forward` = it was not in the set at all.
+    recall_miss_select: usize = 0,
+    recall_miss_forward: usize = 0,
+    /// Which backend `exec` drives.  Only consulted by the CPU-only debug
+    /// helpers (`allocHiddenRow`), which must refuse a device buffer.
+    backend_kind: backend.Kind = .cpu,
+
 
     /// Packed weight types are defined by the GGUF module (`gguf.QuantRow` is
     /// pure layout); the backend owns `LinearW` because whether a weight lives
@@ -700,10 +762,49 @@ pub const Engine = struct {
     /// Same story as `KvCache` (P2c): backend-owned regions, addressed only
     /// through `span()`.  `state` is [nv, kd, vd] row-major, one `kd*vd`
     /// sub-window per value head.
+    /// Trailing MTP / nextn prediction block (SPECULATIVE DECODING, stage 1).
+    ///
+    /// The block is a normal decoder layer at index `cfg.n_layers` (27B:
+    /// blk.64) PLUS four MTP-only tensors.  Its input is not the residual
+    /// stream: it is
+    ///
+    ///     h = eh_proj( [ enorm(embedding(next_token)) ; hnorm(hidden) ] )
+    ///
+    /// (embedding FIRST -- `qwen.py`'s remapper names them
+    /// `pre_fc_norm_embedding` / `pre_fc_norm_hidden`, and deepseek.py builds
+    /// the fused matrix with `torch.cat((e_proj, h_proj), dim=1)`).  The layer
+    /// then runs attention + MLP as usual and its output is normed by
+    /// `shared_head_norm` before the SHARED lm_head / `output_norm`, i.e. the
+    /// drafter does not own a head.
+    ///
+    /// `eh_proj` is `[2*hidden, hidden]` in GGUF (= torch `[hidden, 2*hidden]`),
+    /// so one matvec over a `2*hidden` input produces the layer input directly.
+    const Nextn = struct {
+        /// `[2*hidden]` staging for `[enorm(embed); hnorm(hidden)]`.
+        input: backend.Buf,
+        eh_proj: LinearW,
+        enorm: backend.Buf, // [hidden]
+        hnorm: backend.Buf, // [hidden]
+        shared_head_norm: backend.Buf, // [hidden]
+        /// Layer index of the block inside `layers`/`kv` (== `cfg.n_layers`).
+        li: usize,
+    };
+
     const GdnState = struct {
         conv: backend.Buf,
         conv_len: u32,
         state: backend.Buf,
+    };
+
+    /// One layer's pre-verify state, for the speculative rollback
+    /// (`specSnapshotTake` / `specRollbackAndReplay`).  Host memory on both
+    /// backends: `copyRange` moves device<->host, and the bytes are touched
+    /// once per round, not per token.
+    const SnapLayer = struct {
+        conv: []f32,
+        state: []f32,
+        conv_len: u32,
+        kv_len: u32,
     };
 
     pub const max_seq: u32 = 4096;
@@ -797,11 +898,11 @@ pub const Engine = struct {
         // (27B: block_count=65, nextn=1 -> main decoder = layers 0..63).
         // The 0.8B/2B/4B files have no nextn key -> 0 -> unchanged.
         //
-        // This is NOT the dead speculative-decoding scaffolding that used to
-        // live next to it: the count has to shrink because blk.64 is a
-        // prediction head, not a decoder layer, and `LayerWeights` below is
-        // loaded per main layer.  Leave it even though nothing consumes
-        // blk.64's weights anymore.
+        // The count shrinks because blk.64 is a prediction head, not a decoder
+        // layer.  It is no longer unused: `Nextn` (below) loads it as a
+        // speculative drafter, stored in the SAME `layers`/`kv` arrays at
+        // index `cfg.n_layers`.  `cfg.n_layers` stays 64 so every existing
+        // loop, cache sizing and `isFullAttention` call keeps its meaning.
         var n_nextn: u32 = 0;
         if (g.getUint("qwen35.block_count")) |v| {
             cfg.n_layers = @intCast(v);
@@ -844,6 +945,7 @@ pub const Engine = struct {
         var e = Engine{
             .alloc = alloc,
             .cfg = cfg,
+            .backend_kind = backend_kind,
             .g = g,
             .mm = mm,
             .file = file,
@@ -893,7 +995,31 @@ pub const Engine = struct {
         e.output_norm = try exec.loadVecF32("output_norm.weight");
 
         const n_layers = cfg.n_layers;
-        e.layers = try alloc.alloc(LayerWeights, n_layers);
+        // One EXTRA slot for the trailing nextn block when it exists: it lives
+        // at index `n_layers` (blk.<n_layers>.*), so keeping it in the same
+        // array lets every per-layer routine index it exactly like a decoder
+        // layer.  `e.layers.len` is therefore NOT `cfg.n_layers` on 27B --
+        // use `n_layers` (or `cfg.n_layers`) for loops over decoder layers.
+        const n_slots = n_layers + @intFromBool(n_nextn > 0);
+        e.layers = try alloc.alloc(LayerWeights, n_slots);
+        // Every slot MUST start from the struct's declared defaults.  `alloc`
+        // hands back uninitialised memory, and while the decoder loop fills all
+        // of 0..n_layers, the nextn slot at index `n_layers` is only given the
+        // fields its own block uses -- `ssm_conv1d` / `ssm_dt_bias` / `ssm_a` /
+        // `ssm_norm` / `ssm_out` stay whatever the allocator left there.  They
+        // are never read (the block is full-attention), but `deinit`'s
+        // `freeLayerTyped` frees them unconditionally, and `vFreeVec` only
+        // skips `len == 0` -- a garbage length walks off into the heap.
+        // MEASURED: general protection fault inside `free` on EVERY shutdown of
+        // a 27B run, i.e. the process always core-dumped after printing its
+        // results, which is easy to miss when the harness only greps stdout.
+        for (e.layers) |*slot| slot.* = .{
+            .attn_norm = backend.Buf.empty,
+            .post_attention_norm = backend.Buf.empty,
+            .ffn_gate = undefined,
+            .ffn_up = undefined,
+            .ffn_down = undefined,
+        };
         var loaded: usize = 0;
         errdefer for (e.layers[0..loaded]) |lw| e.freeLayerWeights(lw);
         for (0..n_layers) |li| {
@@ -912,8 +1038,8 @@ pub const Engine = struct {
         }
 
         // caches (alloc + init)
-        e.kv = try alloc.alloc(KvCache, n_layers);
-        e.gdn = try alloc.alloc(GdnState, n_layers);
+        e.kv = try alloc.alloc(KvCache, n_slots);
+        e.gdn = try alloc.alloc(GdnState, n_slots);
         var inited: usize = 0;
         errdefer e.freeCachesUpTo(inited);
         const kv_dim: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
@@ -946,6 +1072,22 @@ pub const Engine = struct {
             inited += 1;
         }
 
+        // Nextn block slot (`blk.<n_layers>.*`): a FULL-ATTENTION layer with
+        // its own KV cache.  It must NOT share the main cache -- the drafter
+        // runs over speculative tokens at positions the target has not
+        // committed, so those rows would corrupt the target's attention.
+        //
+        // `cfg.isFullAttention(n_layers)` is WRONG here (64 % 4 == 0 -> it says
+        // GDN), which is why the block's type is decided by the tensors it
+        // actually ships, not by the periodic formula.
+        if (n_nextn > 0) {
+            const li = n_layers;
+            const region = try exec.allocKv(kv_dim, max_seq);
+            e.kv[li] = .{ .k = region.k, .v = region.v, .len = 0 };
+            e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
+            inited += 1;
+        }
+
         // load the per-type weights now that layer type is known
         var loaded2: usize = 0;
         errdefer for (e.layers[0..loaded2]) |*lw| e.freeLayerTyped(lw);
@@ -972,6 +1114,46 @@ pub const Engine = struct {
                 e.layers[li].ssm_out = try exec.loadLinear(tname(&b1, "blk.{d}.ssm_out.weight", idx));
             }
             loaded2 += 1;
+        }
+
+        // ---- nextn / MTP drafter block (speculative decoding, stage 1) ----
+        // Same full-attention weight set as the decoder layers (the block ships
+        // attn_q/k/v/q_norm/k_norm/output, no ssm_*), loaded at index
+        // `n_layers`, plus the four MTP-only tensors.  Loaded even though
+        // nothing consumes it yet: `spec` needs it present to arm the drafter,
+        // and a model without one stays null (`n_nextn == 0`).
+        if (n_nextn > 0) {
+            const li = n_layers;
+            const idx: u32 = @intCast(n_layers);
+            var b1: [64]u8 = undefined;
+            var b2: [64]u8 = undefined;
+            // The two layer norms are loaded by the FIRST loop above, which only
+            // walks the decoder layers -- the nextn slot gets them here, or
+            // `forwardFull`/`forwardMlp` would scale by an empty weight vector.
+            e.layers[li].attn_norm = try exec.loadVecF32(tname(&b1, "blk.{d}.attn_norm.weight", idx));
+            e.layers[li].post_attention_norm = try exec.loadVecF32(tname(&b2, "blk.{d}.post_attention_norm.weight", idx));
+            e.layers[li].ffn_gate = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_gate.weight", idx));
+            e.layers[li].ffn_up = try exec.loadLinear(tname(&b2, "blk.{d}.ffn_up.weight", idx));
+            e.layers[li].ffn_down = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_down.weight", idx));
+            e.layers[li].attn_q = try exec.loadLinear(tname(&b1, "blk.{d}.attn_q.weight", idx));
+            e.layers[li].attn_k = try exec.loadLinear(tname(&b2, "blk.{d}.attn_k.weight", idx));
+            e.layers[li].attn_v = try exec.loadLinear(tname(&b1, "blk.{d}.attn_v.weight", idx));
+            e.layers[li].attn_q_norm = try exec.loadVecF32(tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
+            e.layers[li].attn_k_norm = try exec.loadVecF32(tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
+            e.layers[li].attn_output = try exec.loadLinear(tname(&b2, "blk.{d}.attn_output.weight", idx));
+            loaded2 += 1;
+            // `eh_proj` is [2*hidden, hidden]; `Nextn` owns it because it is
+            // not part of a decoder layer's weight set.
+            const eh_proj = try exec.loadLinear(tname(&b1, "blk.{d}.nextn.eh_proj.weight", idx));
+            errdefer exec.freeLinear(eh_proj);
+            e.nextn = Nextn{
+                .input = try exec.allocBuf(2 * cfg.hidden),
+                .eh_proj = eh_proj,
+                .enorm = try exec.loadVecF32(tname(&b2, "blk.{d}.nextn.enorm.weight", idx)),
+                .hnorm = try exec.loadVecF32(tname(&b1, "blk.{d}.nextn.hnorm.weight", idx)),
+                .shared_head_norm = try exec.loadVecF32(tname(&b2, "blk.{d}.nextn.shared_head_norm.weight", idx)),
+                .li = li,
+            };
         }
 
         // scratch
@@ -1166,6 +1348,14 @@ pub const Engine = struct {
         for (self.gdn[0..ng]) |*s| s.* = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
     }
 
+    /// Number of layer slots actually allocated: decoder layers plus the nextn
+    /// block when present.  `cfg.n_layers` counts ONLY decoder layers (it is
+    /// what every per-layer loop and `isFullAttention` mean by "layer"), so
+    /// anything that walks the whole `layers`/`kv`/`gdn` arrays must use this.
+    fn nSlots(self: *const Engine) usize {
+        return self.cfg.n_layers + @intFromBool(self.nextn != null);
+    }
+
     fn freeAll(self: *Engine) void {
         const a = self.alloc;
         // `token_embd` / `output_weight` are zero-copy views into the mapping;
@@ -1177,9 +1367,13 @@ pub const Engine = struct {
             for (self.layers) |*lw| self.freeLayerTyped(lw);
             a.free(self.layers);
         }
-        self.freeCachesUpTo(self.cfg.n_layers);
+        self.freeCachesUpTo(self.nSlots());
         if (self.kv.len > 0) a.free(self.kv);
         if (self.gdn.len > 0) a.free(self.gdn);
+        // `tap_layers` is a host allocation made by `specTapEnable` (the
+        // `tap_hidden` region itself is backend scratch and goes with
+        // `freeScratch()` above).
+        if (self.tap_layers.len > 0) a.free(self.tap_layers);
         // Transient activations are backend-owned (`Exec.allocBuf`), so
         // `exec.freeScratch()` above already released every one of them: the
         // engine must NOT free them individually (double free).
@@ -1259,7 +1453,10 @@ pub const Engine = struct {
         // exist, so the download itself happens at `stepEnd`; see
         // `VTable.sampledToken` for the split.
         self.exec.stepBegin(pos);
-        for (self.layers, 0..) |*lw, li| {
+        // `self.layers` has one extra slot when the model ships a nextn block
+        // (see `nSlots`); a normal forward must stop at the decoder layers, or
+        // it would run the drafter as layer 64 of every token.
+        for (self.layers[0..self.cfg.n_layers], 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
                 const a = Io.Clock.Timestamp.now(io, .awake);
                 self.forwardFull(lw, li, pos);
@@ -1272,6 +1469,27 @@ pub const Engine = struct {
             const a = Io.Clock.Timestamp.now(io, .awake);
             self.forwardMlp(lw);
             if (prof) prof_mlp += profNs(io, a);
+
+            // Speculative tap, single-token form: row 0 of the plane.  Written
+            // after the MLP's residual add, which is the layer's output -- the
+            // value `forwardChunk` copies too (`Engine.tap_hidden` layout).
+            //
+            // This is what lets a spec round reuse the hidden states the TARGET
+            // already computed during ordinary decode / verification instead of
+            // re-forwarding its context window every round.  At 16 rows that
+            // re-forward cost 16 x the target's per-token work per round, which
+            // measured 651 s for 32 tokens before this existed.
+            if (self.tap_hidden.len != 0) {
+                for (self.tap_layers, 0..) |tl, ti| {
+                    if (tl == li) {
+                        self.exec.copyRange(
+                            self.tap_hidden.span(ti * self.nbatch * self.cfg.hidden, self.cfg.hidden),
+                            self.x.span(0, self.cfg.hidden),
+                        );
+                        break;
+                    }
+                }
+            }
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
@@ -1388,7 +1606,10 @@ pub const Engine = struct {
         var t: usize = 0;
         while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
 
-        for (self.layers, 0..) |*lw, li| {
+        // `self.layers` has one extra slot when the model ships a nextn block
+        // (see `nSlots`); a normal forward must stop at the decoder layers, or
+        // it would run the drafter as layer 64 of every token.
+        for (self.layers[0..self.cfg.n_layers], 0..) |*lw, li| {
             // ---- RMSNorm of the whole chunk in ONE launch, then the batched
             // projections (weight bytes read once for the whole chunk) ----
             // `rmsnormRows` is `k` consecutive single-row blocks of `k_rmsnorm`:
@@ -1457,6 +1678,27 @@ pub const Engine = struct {
             self.exec.swiglu(self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
             self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
             self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+
+            // ---- speculative-decoding tap: copy this layer's OUTPUT hidden
+            // state into row `ti` of `tap_hidden`.  Placed after the second
+            // `addResid` so it sees the same value the next layer's
+            // `rmsnormRows` will consume -- i.e. the layer's output, which is
+            // what DSpine's `fc` projection was trained on.
+            //
+            // Guarded by `tap_hidden.len != 0` (disabled by default).  `ti` is
+            // found by a linear scan over `tap_layers`, which is at most 5
+            // entries, once per layer: ~320 compares per chunk, not per token.
+            if (self.tap_hidden.len != 0) {
+                for (self.tap_layers, 0..) |tl, ti| {
+                    if (tl == li) {
+                        self.exec.copyRange(
+                            self.tap_hidden.span(ti * self.nbatch * hidden, k * hidden),
+                            self.xK.span(0, k * hidden),
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
@@ -2006,6 +2248,106 @@ pub const Engine = struct {
         self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
+    // ------------- nextn / MTP drafter (SPECULATIVE DECODING, stage 1) ------
+
+    /// Run the nextn block once and leave ONE token's logits in `self.logits`.
+    ///
+    /// Inputs:
+    ///   * `hidden_buf` -- the target's `output_norm`-ed hidden state for the
+    ///     token at position p.  NOT the raw last-layer residual stream:
+    ///     `qwen35.cpp:210` builds `t_h_nextn` as
+    ///     `build_norm(inpL, output_norm, ...)`, and that normed value is what
+    ///     the drafter's `hnorm` receives.  Passing the raw residual instead
+    ///     keeps every intermediate finite but drops the hit rate to a few
+    ///     percent (MEASURED: 12.2 / 6.1 / 14.3 / 0.0 % over four prompts);
+    ///     with the norm applied it is ~25 %.
+    ///   * `next_token` -- the token at position p+1, i.e. the one the target
+    ///     has ALREADY committed after the hidden state above.  The drafter
+    ///     therefore predicts the token after it (position p+2), which is what
+    ///     `common/speculative.cpp`'s draft driver does: it pairs each batch
+    ///     token `t.id` with `h_tgt + (k-1)*n_embd`, the target embedding
+    ///     shifted right by one position.
+    ///   * `draft_pos` -- KV position for the drafter's OWN cache.
+    ///
+    /// The block is a full-attention layer, so this reuses `forwardFull` /
+    /// `forwardMlp` unchanged: they read `self.x1` (normed input) and write
+    /// `self.x` (residual stream), which is exactly the contract the decoder
+    /// loop uses.
+    ///
+    /// ORDER (from `qwen.py`'s remapper + `deepseek.py`'s torch.cat): the
+    /// embedding half comes FIRST, then the hidden half.  Getting this backwards
+    /// produces a plausible-looking but wrong draft, so it is asserted by
+    /// construction here (`input[0..hidden]` = enorm(e)).
+    ///
+    /// Returns error.NoNextn when the model has no drafter.
+    ///
+    /// CHAINING (the reason `out_hidden` exists): a single MTP head drafts
+    /// several tokens by feeding its OWN output back in, one step at a time --
+    /// `common/speculative.cpp`'s non-`chain_heads` path re-runs this graph per
+    /// draft token with `h_row` taken from the drafter's previous step.  Pass
+    /// the same buffer as `hidden_buf` and `out_hidden` to chain in place
+    /// (`null` skips the copy).  `self.x1` holds exactly the value to carry:
+    /// `shared_head_norm` of this step's output, which is the drafter's
+    /// counterpart of the trunk's `t_h_nextn`.
+    pub fn nextnPredict(
+        self: *Engine,
+        hidden_buf: backend.Buf,
+        next_token: u32,
+        draft_pos: u32,
+        out_hidden: ?backend.Buf,
+    ) !void {
+        const nn = self.nextn orelse return error.NoNextn;
+        const c = self.cfg;
+        const hidden: usize = c.hidden;
+        const li = nn.li;
+        const lw = &self.layers[li];
+
+        // h = eh_proj([enorm(e); hnorm(h)])  -- one matvec over a 2*hidden input.
+        //
+        // `enorm`/`hnorm` are RMSNorms, and they are applied to the two halves
+        // INDEPENDENTLY (each over its own `hidden` values), not jointly over
+        // the concatenation: GGUF ships them as two separate [hidden] weights,
+        // and `pre_fc_norm_embedding` / `pre_fc_norm_hidden` are two distinct
+        // modules in the reference.
+        self.embedTo(next_token, self.x1.span(0, hidden));
+        self.exec.rmsnorm(self.x1.span(0, hidden), self.x1.span(0, hidden), nn.enorm, c.rms_eps);
+        self.exec.copyRange(nn.input.span(0, hidden), self.x1.span(0, hidden));
+        self.exec.rmsnorm(self.x1.span(0, hidden), hidden_buf.span(0, hidden), nn.hnorm, c.rms_eps);
+        self.exec.copyRange(nn.input.span(hidden, hidden), self.x1.span(0, hidden));
+
+        // The projected value becomes the residual stream for the block.
+        self.exec.matvec(self.x.span(0, hidden), nn.eh_proj, nn.input.span(0, 2 * hidden));
+
+        // Full-attention layer + MLP, over the drafter's OWN KV cache.
+        //
+        // `forwardFull` derives the cache index from `li`, which is
+        // `cfg.n_layers` -- a slot the decoder loop never touches, so the
+        // target's KV is untouched by construction.
+        self.forwardFull(lw, li, draft_pos);
+        self.forwardMlp(lw);
+
+        // Shared head: `shared_head_norm` then the TARGET's `output_norm`?  No --
+        // the reference applies the MTP block's own norm and then reuses the
+        // model's lm_head on that normed value.  `output_norm` belongs to the
+        // main stack and is already applied once for the target logits, so the
+        // drafter's equivalent is `shared_head_norm` alone.
+        self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), nn.shared_head_norm, c.rms_eps);
+        // Hand the normed output back for the next chained step BEFORE it gets
+        // overwritten by anything else in this function (nothing does, but the
+        // copy makes the contract explicit and costs one `hidden` memcpy).
+        if (out_hidden) |oh| self.exec.copyRange(oh.span(0, hidden), self.x1.span(0, hidden));
+        if (self.output_weight) |ow| {
+            switch (ow) {
+                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1.span(0, hidden)),
+            }
+        } else {
+            switch (self.token_embd) {
+                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1.span(0, hidden)),
+                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1.span(0, hidden)),
+            }
+        }
+    }
+
     // ------------- MLP (SPEC C16) -------------
 
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
@@ -2032,6 +2374,379 @@ pub const Engine = struct {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Speculative-decoding rollback (stage 2)
+    // -----------------------------------------------------------------
+
+    /// Allocate the snapshot a spec round needs to undo a partially accepted
+    /// verify block.  One call per process; the buffers are the same size every
+    /// round.
+    ///
+    /// WHAT IS SAVED (the complete list -- nothing else carries per-token
+    /// state, see `spec_rollback.zig`'s header):
+    ///   * full-attention layers: only `KvCache.len`.  The ROWS are not copied:
+    ///     the next verify overwrites them and nothing reads past `len`, so
+    ///     rewinding the count is the whole undo.
+    ///   * GDN layers: `conv` (the last K-1 raw samples per channel) and
+    ///     `state` (the [nv, kd, vd] delta-rule matrix) are copied whole.  Both
+    ///     are consumed non-linearly (the conv shifts, the delta rule divides by
+    ///     a running norm), so there is no cheap inverse -- copy and restore.
+    ///
+    /// 31.4 MB for the 27B (48 GDN layers), taken once per round.
+    pub fn specSnapshotAlloc(self: *Engine, alloc: std.mem.Allocator) !void {
+        if (self.spec_snap.len > 0) return;
+        const n = self.nSlots();
+        const snaps = try alloc.alloc(SnapLayer, n);
+        errdefer alloc.free(snaps);
+        var made: usize = 0;
+        errdefer for (snaps[0..made]) |s| {
+            if (s.conv.len > 0) alloc.free(s.conv);
+            if (s.state.len > 0) alloc.free(s.state);
+        };
+        for (snaps, 0..) |*s, i| {
+            s.* = .{ .conv = &.{}, .state = &.{}, .conv_len = 0, .kv_len = 0 };
+            if (i < self.gdn.len) {
+                const g = self.gdn[i];
+                s.conv = try alloc.alloc(f32, g.conv.len);
+                s.state = try alloc.alloc(f32, g.state.len);
+            }
+            made += 1;
+        }
+        self.spec_snap = snaps;
+    }
+
+    /// Copy the live per-token state into the snapshot.
+    pub fn specSnapshotTake(self: *Engine) void {
+        for (self.spec_snap, 0..) |*s, i| {
+            if (i < self.kv.len) s.kv_len = self.kv[i].len;
+            if (i < self.gdn.len) {
+                const g = self.gdn[i];
+                // D2H: `copyRange` infers direction from the SOURCE, so a host
+                // destination wrapped as a `Buf` would be written as if it were
+                // device memory.  `copyOut` is the declared device->host slot.
+                if (g.conv.len > 0) self.exec.copyOut(s.conv, g.conv);
+                if (g.state.len > 0) self.exec.copyOut(s.state, g.state);
+                s.conv_len = g.conv_len;
+            }
+        }
+    }
+
+    /// Wind the state back to the snapshot, then advance it by `rows` tokens of
+    /// `tokens` so it reflects a verify block that was `rows` long instead of
+    /// the full block.
+    ///
+    /// The replay exists because the conv history and the delta-rule matrix are
+    /// non-linear in the number of steps: restoring the snapshot and re-running
+    /// the accepted prefix reproduces exactly the state the model would have had
+    /// (`spec_rollback.zig` explains why an incremental undo is not available).
+    /// `tokens` holds the ACCEPTED ids; their logits are discarded.
+    pub fn specRollbackAndReplay(self: *Engine, tokens: []const u32, pos: u32) void {
+        for (self.spec_snap, 0..) |*s, i| {
+            if (i < self.kv.len) self.kv[i].len = s.kv_len;
+            if (i < self.gdn.len) {
+                const g = &self.gdn[i];
+                if (g.conv.len > 0) self.exec.copyRange(g.conv, backend.Buf.wrap(s.conv));
+                if (g.state.len > 0) self.exec.copyRange(g.state, backend.Buf.wrap(s.state));
+                g.conv_len = s.conv_len;
+            }
+        }
+        for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+    }
+
+    /// Enable speculative-decoding hidden-state taps (DSpine port, stage 0).
+    ///
+    /// Allocates `layers.len * nbatch * hidden` floats and makes `forwardChunk`
+    /// copy layer `layers[i]`'s output hidden state into plane `i`.  Must be
+    /// called AFTER `load` (it needs the backend and `cfg`) and before the
+    /// first `forwardChunk` that should be observed.  `layers` must be
+    /// ascending and every index must be a real layer.
+    ///
+    /// Idempotent in the sense that calling it twice re-allocates into the
+    /// backend scratch arena; that memory is released wholesale by
+    /// `exec.freeScratch()` in `freeAll` (like every other `allocBuf` region),
+    /// so this must NOT free it individually -- doing so would double-free.
+    ///
+    /// COST: the copy is `k * hidden` floats per tapped layer per chunk.  For
+    /// the 27B (hidden=5120, 5 taps, k=16 verify) that is 5 * 16 * 5120 * 4 B
+    /// = 1.6 MB per verify round, i.e. ~0.15 ms at 10 GB/s -- against an
+    /// ~11 ms verify, so it is noise.  It only runs in `forwardChunk`, never in
+    /// the single-token decode path.
+    /// The output projection as a `[vocab, hidden]` linear: the untied
+    /// `output.weight` when the checkpoint has one, else the tied embedding
+    /// table.  Same selection `forwardLogits` makes; exposed because the
+    /// speculative drafter scores candidates with it (stage 4's
+    /// `build_serial_tables` and `topk_ids`).
+    /// `lm_head @ x` for a HOST row `x` (`hidden` floats), logits into `out`
+    /// (`vocab`).
+    ///
+    /// This is the DSpine draft's `topk_ids` scoring: the head lives in the
+    /// target's backend, so the draft has to borrow it.  The row is uploaded
+    /// into engine scratch, projected, and the logits come back -- one H2D, one
+    /// launch, one D2H per candidate row (`block_size - 1` = 15 of them per spec
+    /// round), against 248320 host-side dequant+dot calls if the draft did it
+    /// itself (measured 28 s per round).
+    pub fn lmHeadFromHostRow(self: *Engine, out: []f32, x: []const f32) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(x.len == hidden);
+        std.debug.assert(out.len >= self.cfg.vocab);
+        // `x1` is engine scratch exactly `hidden` wide and is rewritten by every
+        // forward anyway, so borrowing it here needs no new allocation.
+        const row = self.x1;
+        self.exec.copyFromHost(row, x[0..hidden]);
+        switch (self.output_weight orelse self.token_embd) {
+            .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, row),
+        }
+        self.exec.copyOut(out[0..self.cfg.vocab], self.logits);
+    }
+
+    pub fn lmHead(self: *const Engine) LinearW {
+        if (self.output_weight) |ow| return ow;
+        return switch (self.token_embd) {
+            .quant => |qrow| .{ .quant = qrow },
+            .f32 => |m| .{ .f32 = m },
+        };
+    }
+
+    pub fn specTapEnable(self: *Engine, layers: []const u32) !void {
+        self.tap_layers = &.{};
+        self.tap_hidden = backend.Buf.empty;
+        if (layers.len == 0) return;
+        // `nbatch` is 0 when batching is disabled (`QWEN35_NO_BATCH`), and a
+        // zero-sized tap buffer would silently disable the taps.  Refuse rather
+        // than allocate nothing: the caller asked for observation.
+        if (self.nbatch == 0) return error.BatchingDisabled;
+        var prev: u32 = 0;
+        for (layers, 0..) |l, i| {
+            if (l >= self.layers.len) return error.TapLayerOutOfRange;
+            if (i > 0 and l <= prev) return error.TapLayersNotAscending;
+            prev = l;
+        }
+        self.tap_hidden = try self.exec.allocBuf(layers.len * self.nbatch * self.cfg.hidden);
+        // Copy the indices: the caller's slice may be a temporary.
+        const owned = try self.alloc.dupe(u32, layers);
+        self.tap_layers = owned;
+    }
+
+    /// Which backend this engine drives (debug/verification helpers use it).
+    pub fn backendKind(self: *const Engine) backend.Kind {
+        return self.backend_kind;
+    }
+
+    /// Allocate a one-row hidden-state buffer (debug/verification helper).
+    ///
+    /// CPU BACKEND ONLY: it hands back a host-readable `Buf` and
+    /// `copyHiddenRowIn` memcpys into it, which is invalid on a device buffer
+    /// (`Buf.slice()` there is a device pointer; a host `@memcpy` segfaults --
+    /// observed as a core dump with `QWEN35_SPEC_TAPS=1 --backend cuda`).
+    pub fn allocHiddenRow(self: *Engine) !backend.Buf {
+        if (self.backend_kind != .cpu) return error.HostOnly;
+        return self.exec.allocBuf(self.cfg.hidden);
+    }
+
+    /// Copy a host f32 row into `dst` (debug/verification helper).  See
+    /// `allocHiddenRow` for the CPU-only restriction.
+    pub fn copyHiddenRowIn(self: *Engine, dst: backend.Buf, row: []const f32) void {
+        _ = self;
+        std.debug.assert(dst.len == row.len);
+        @memcpy(dst.slice(), row);
+    }
+
+    /// Debug/verification helper: run `output_norm` + lm_head over an arbitrary
+    /// hidden row that the caller supplies, leaving the result in `self.logits`.
+    /// Used by the `QWEN35_SPEC_TAPS` self-check to prove a tapped last-layer
+    /// hidden reproduces `forwardLogits`' logits -- i.e. that the tap really is
+    /// the final layer's output and not some other layer's.
+    pub fn logitsFromHidden(self: *Engine, h: backend.Buf) void {
+        const c = self.cfg;
+        self.exec.rmsnorm(self.x1, h, self.output_norm, c.rms_eps);
+        if (self.output_weight) |ow| {
+            switch (ow) {
+                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+            }
+        } else {
+            switch (self.token_embd) {
+                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
+            }
+        }
+    }
+
+    /// Read-back accessor for tests: the tap plane of `layers[i]`.
+    /// `rows * hidden` floats starting at plane `i`, where `rows <= nbatch`.
+    /// The target's embedding table as a row view.  The DSpine draft has no
+    /// embedding of its own (the reference calls the target's
+    /// `embed_tokens`), so `draft.load` needs this rather than a copy.
+    /// `max_seq` the engine sized its KV caches for; a draft attached to this
+    /// target must not outrun it.
+    /// Prefill chunk width (`0` when K-token batching is disabled).  A spec
+    /// round's context window is bounded by it: the draft's taps come out of one
+    /// `forwardChunk`, and that call refuses more than this many rows.
+    pub fn batchLimit(self: *const Engine) usize {
+        return if (self.nbatch == 0) 1 else self.nbatch;
+    }
+
+    pub fn maxSeqForSpec(self: *const Engine) usize {
+        _ = self;
+        return max_seq;
+    }
+
+    pub fn embedRows(self: *const Engine) !gguf.QuantRow {
+        return switch (self.token_embd) {
+            .quant => |qrow| qrow,
+            .f32 => error.EmbeddingNotQuantized,
+        };
+    }
+
+    /// Enable the ROLLING tap ring: every `forwardLogits` / `forwardChunk`
+    /// appends its rows' tap values, and `specContextRing` hands back the last
+    /// `ctx_rows` of them.
+    ///
+    /// Why a ring at all.  The draft needs the target's hidden states for the
+    /// tokens that ALREADY precede the block.  The obvious implementation is to
+    /// re-forward that window through the target every round, which costs one
+    /// target prefill of `ctx_rows` tokens per round -- measured at 651 s for 32
+    /// generated tokens (0.05 tok/s against a 47 tok/s baseline).  A ring makes
+    /// it free: those hidden states were computed anyway, during the previous
+    /// round's verification, and are simply kept.
+    ///
+    /// Host memory, `taps * ctx_rows * hidden` f32 = 5 x 16 x 5120 x 4 = 1.6 MB.
+    pub fn specRingEnable(self: *Engine, alloc: std.mem.Allocator, ctx_rows: usize) !void {
+        if (self.ring.len > 0) return;
+        if (self.tap_layers.len == 0) return error.TapsNotEnabled;
+        self.ring_ctx = ctx_rows;
+        self.ring = try alloc.alloc(f32, self.tap_layers.len * ctx_rows * self.cfg.hidden);
+        self.ring_filled = 0;
+    }
+
+    /// Push the current tap planes (row 0 of each) into the ring.  Called right
+    /// after every single-token forward.
+    pub fn specRingPush(self: *Engine) void {
+        if (self.ring.len == 0) return;
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const at = self.ring_next;
+        for (0..self.tap_layers.len) |ti| {
+            const src = self.tap_hidden.span(ti * self.nbatch * hidden, hidden);
+            const dst = self.ring[ti * ctx * hidden + at * hidden ..][0..hidden];
+            self.exec.copyOut(dst, src);
+        }
+        self.ring_next = (at + 1) % ctx;
+        if (self.ring_filled < ctx) self.ring_filled += 1;
+    }
+
+    /// The ring's contents in CHRONOLOGICAL order, flattened tap-major to match
+    /// `Draft.projectContext`'s `tap` argument.  `out` must be
+    /// `taps * ctx_rows * hidden`.
+    ///
+    /// Only the rows actually pushed are meaningful; the caller passes
+    /// `specRingFilled()` as the row count.
+    pub fn specRingRead(self: *Engine, out: []f32) void {
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const nt = self.tap_layers.len;
+        const n = self.ring_filled;
+        const start = (self.ring_next + ctx - n) % ctx;
+        for (0..nt) |ti| {
+            for (0..n) |r| {
+                const src_at = (start + r) % ctx;
+                @memcpy(
+                    out[ti * ctx * hidden + r * hidden ..][0..hidden],
+                    self.ring[ti * ctx * hidden + src_at * hidden ..][0..hidden],
+                );
+            }
+        }
+    }
+
+    /// Seed the ring from the tap planes a PREFILL chunk just wrote: those hold
+    /// `rows` consecutive tokens' hidden states for every tapped layer, which is
+    /// exactly the draft's left context after the prompt.
+    pub fn specRingFillFromChunk(self: *Engine, rows: usize, pos0: u32) void {
+        _ = pos0;
+        if (self.ring.len == 0 or rows == 0) return;
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const take = @min(rows, ctx);
+        const skip = rows - take;
+        for (0..take) |r| {
+            const at = (self.ring_next + r) % ctx;
+            for (0..self.tap_layers.len) |ti| {
+                const src = self.tap_hidden.span(ti * self.nbatch * hidden + (skip + r) * hidden, hidden);
+                self.exec.copyOut(self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
+            }
+        }
+        self.ring_next = (self.ring_next + take) % ctx;
+        self.ring_filled = @min(self.ring_filled + take, ctx);
+    }
+
+    pub fn specRingFilled(self: *const Engine) usize {
+        return self.ring_filled;
+    }
+
+    pub fn specTapPlane(self: *const Engine, i: usize, rows: usize) backend.Buf {
+        std.debug.assert(i < self.tap_layers.len);
+        std.debug.assert(rows <= self.nbatch);
+        return self.tap_hidden.span(i * self.nbatch * self.cfg.hidden, rows * self.cfg.hidden);
+    }
+
+    /// Copy tap plane `i`'s first `rows` rows into HOST slice `dst`
+    /// (`rows * hidden` floats).
+    ///
+    /// The draft lives on its own backend -- it may be the CPU one while the
+    /// target is on the GPU, or vice versa -- and `Draft.projectContext` takes a
+    /// host slice, so the planes have to come back over PCIe either way.  That
+    /// is `rows * hidden * 4` bytes per tap plane per spec round (33 x 5120 x 4
+    /// x 5 = 3.4 MB), which is the price of the two models not sharing a
+    /// device; the kernel-level A/B that would avoid it is not worth it while
+    /// stage 4 is still a host loop.
+    pub fn specTapPlaneToHost(self: *Engine, dst: []f32, i: usize, rows: usize) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(dst.len >= rows * hidden);
+        // `copyOut`, not `copyRange`: the destination is HOST memory, and
+        // `copyRange` decides the direction from the source alone (a device
+        // source + a host destination is a device-to-device move as far as it
+        // can tell, which writes through a host address).
+        self.exec.copyOut(dst[0 .. rows * hidden], self.specTapPlane(i, rows));
+    }
+
+    /// Tap plane `i`, first `rows` rows, each passed through `output_norm` --
+    /// the exact value llama.cpp exports as `t_h_nextn` and feeds to the
+    /// drafter (`qwen35.cpp:210` norms the trunk's last residual stream with
+    /// `output_norm` before the MTP block sees it).
+    /// Returns host memory (`rows * hidden`), so it is CPU-BACKEND ONLY: on CUDA
+    /// the plane lives in device memory.  Debug/self-check use only.
+    /// `out = lm_head @ h` for one already-normed `[hidden]` row.
+    ///
+    /// Exposed for the drafter's self-check, which has to tell two failures
+    /// apart that give the same acceptance rate: a broken draft forward pass
+    /// and a broken candidate scoring path.  Uses the same `matvec` as
+    /// `logitsFromHidden`, MINUS its terminal rmsnorm -- callers hand in a row
+    /// that has already been normed (see `specTapNormedPlane`), so norming
+    /// twice here would be a silent difference from the engine's own path.
+    pub fn selfCheckLogits(self: *Engine, out: []f32, h: []const f32) void {
+        const c = self.cfg;
+        const dst = self.exec.allocBuf(c.vocab) catch unreachable;
+        defer self.exec.freeScratch();
+        _ = dst;
+        const src = self.exec.allocBuf(c.hidden) catch unreachable;
+        @memcpy(src.slice()[0..c.hidden], h[0..c.hidden]);
+        const lw = self.lmHead();
+        const tmp = self.exec.allocBuf(c.vocab) catch unreachable;
+        self.exec.matvec(tmp, lw, src);
+        @memcpy(out[0..c.vocab], tmp.slice()[0..c.vocab]);
+    }
+
+    pub fn specTapNormedPlane(self: *const Engine, i: usize, rows: usize) ![]f32 {
+        const hidden: usize = self.cfg.hidden;
+        const plane = self.specTapPlane(i, rows).slice();
+        const w = self.output_norm.slice();
+        const out = try self.alloc.alloc(f32, rows * hidden);
+        for (0..rows) |r| {
+            rmsNorm(out[r * hidden ..][0..hidden], plane[r * hidden ..][0..hidden], w, self.cfg.rms_eps);
+        }
+        return out;
+    }
+
     pub const GenResult = struct {
         tokens: []u32,
         prefill_ms: f64,
@@ -2044,6 +2759,26 @@ pub const Engine = struct {
         /// true when generation stopped because the KV cache (`Engine.max_seq`)
         /// ran out before `n_predict` tokens were produced
         hit_context_limit: bool = false,
+        /// Speculative decoding counters (all zero when `generate` ran the
+        /// plain loop).  `proposed` counts draft tokens offered to the verifier,
+        /// `accepted` how many of them the target agreed with, and `rounds` how
+        /// many verify passes were spent -- `accepted / proposed` is the
+        /// acceptance rate, and `accepted / rounds` is the mean accepted length.
+        spec_proposed: usize = 0,
+        spec_accepted: usize = 0,
+        spec_rounds: usize = 0,
+        /// `QWEN35_SPEC_POSSTAT`: rounds bucketed by accepted count, so
+        /// "chain[0] always right, chain[1] never" is distinguishable from
+        /// "uniformly weak".
+        spec_pos_reached: [64]usize = @splat(0),
+        /// Per-row candidate recall (`$QWEN35_SPEC_RECALL`): entry `r` is
+        /// `recall_hit[r] / recall_tries[r]`, the share of rounds that reached
+        /// block row `r+1` whose candidate set contained the target's own pick.
+        spec_recall_hit: [64]usize = @splat(0),
+        spec_recall_tries: [64]usize = @splat(0),
+        /// `$QWEN35_SPEC_RECALL`: how each rejected row failed.
+        spec_miss_select: usize = 0,
+        spec_miss_forward: usize = 0,
     };
 
     /// Prefill prompt (forward-only, no PRNG draws), then generate up to
@@ -2157,6 +2892,295 @@ pub const Engine = struct {
             .decode_ms = @as(f64, @floatFromInt(gen_ns)) / 1e6,
             .hit_eos = hit_eos,
             .hit_context_limit = hit_context_limit,
+        };
+    }
+
+    /// The draft callback a speculative round calls to get proposals.
+    ///
+    /// `context` is the trailing window of ALREADY-COMMITTED token ids (`ctx_rows`
+    /// of them, the block's left context); `anchor` is the id the block starts
+    /// from.  The callee fills `out` with up to `out.len` candidate ids and
+    /// returns how many it wrote.  Returns 0 to skip drafting this round (the
+    /// caller then runs one plain step, so a drafter that cannot answer costs
+    /// nothing but the call).
+    pub const DraftFn = *const fn (
+        ctx: *anyopaque,
+        context: []const u32,
+        anchor: u32,
+        /// Absolute position the block's FIRST row sits at (`anchor`'s position
+        /// + 1).  The draft's RoPE is absolute, so this cannot be inferred from
+        /// the row index.
+        block_pos: u32,
+        out: []u32,
+    ) usize;
+
+    /// `QWEN35_SPEC_RECALL`: the draft's candidate sets for the round it just
+    /// proposed, `[row][k]` with row 0 = block row 1 (the anchor row is never
+    /// predicted).  Called right after `draft_fn` returns, before verification,
+    /// so the caller can test each row's candidates against the token the target
+    /// actually picks.  Separate from `DraftFn` because the candidate table is a
+    /// diagnostic, not part of the proposal contract.
+    pub const CandFn = *const fn (
+        ctx: *anyopaque,
+        /// Filled with `rows * cfg.spec_recall_k` ids, row-major.
+        cand: []u32,
+        rows: usize,
+    ) void;
+
+    /// Speculative decoding: draft proposes, this loop verifies.
+    ///
+    /// SHAPE OF A ROUND (DSpine / dspine_mlx `generate.py`):
+    ///   1. the draft proposes up to `draft.len` ids for positions
+    ///      `pos+1 .. pos+draft.len`, conditioned on the committed context;
+    ///   2. the target runs them through ONE verify pass -- here literally
+    ///      `draft.len` `forwardLogits` calls, so every state kernel sees the
+    ///      same per-token order the plain loop would give it and the resulting
+    ///      logits are identical to a serial run (which is why acceptance is
+    ///      meaningful: the target is not approximating itself);
+    ///   3. the accepted prefix is the longest one where the target's own
+    ///      greedy pick matches the proposal.  One extra token (the target's own
+    ///      choice at the first mismatch, or at the end of an all-accepted
+    ///      block) is committed too -- that is the `accepted + 1` of the
+    ///      reference;
+    ///   4. the state is wound back to `accepted` rows (`specRollbackAndReplay`)
+    ///      because the verify already pushed all `draft.len` of them.
+    ///
+    /// WHY THE VERIFY IS PER-TOKEN AND NOT BATCHED: `forwardChunk` would compute
+    /// the same logits from the same weights, but its GDN/attention state update
+    /// is the thing the rollback has to undo, and a batched verify makes that
+    /// state a function of the CHUNK LENGTH rather than of the accepted prefix.
+    /// The replay in `specRollbackAndReplay` already handles the per-token case
+    /// exactly, so batching would trade a measurable risk for a launch count.
+    /// It is also not the current bottleneck: the draft forward is.
+    pub fn generateSpec(
+        self: *Engine,
+        alloc: std.mem.Allocator,
+        prompt: []const u32,
+        n_predict: usize,
+        draft_fn: DraftFn,
+        draft_ctx: *anyopaque,
+        max_draft: usize,
+        ctx_rows: usize,
+        progress: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
+        progress_ctx: ?*anyopaque,
+        /// `QWEN35_SPEC_RECALL` only: reports the round's candidate table so
+        /// the caller can score recall.  Null (the default) costs nothing.
+        cand_fn: ?CandFn,
+        cand_ctx: ?*anyopaque,
+    ) !GenResult {
+        self.sampler.reseed();
+        self.reset();
+
+        if (prompt.len >= max_seq) {
+            std.debug.print(
+                "generateSpec: prompt is {d} tokens, but the context holds {d}\n",
+                .{ prompt.len, max_seq },
+            );
+            return error.ContextLengthExceeded;
+        }
+        const io = self.io;
+        self.exec.profReset();
+        self.exec.profPhase(true);
+        const t_start = Io.Clock.Timestamp.now(io, .awake);
+        var last_logits: Buf = Buf.empty;
+        if (self.nbatch == 0) {
+            for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
+        } else {
+            var i: usize = 0;
+            while (i < prompt.len) {
+                const n = @min(self.nbatch, prompt.len - i);
+                last_logits = self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                i += n;
+            }
+        }
+        const t_after = Io.Clock.Timestamp.now(io, .awake);
+        self.prefill_ms = @as(f64, @floatFromInt(t_start.durationTo(t_after).raw.nanoseconds)) / 1e6;
+        self.exec.profPrefillEnd();
+
+        // The prompt's own hidden states are the draft's first context window;
+        // without this the first round drafts from a single row (`nctx=1`) and
+        // nothing it proposes can be right.
+        if (self.nbatch != 0) self.specRingFillFromChunk(prompt.len, 0);
+
+        try self.specSnapshotAlloc(alloc);
+
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(alloc);
+        // The committed id stream INCLUDING the prompt: the draft needs real
+        // left context, and after a few rounds most of it is generated text.
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(alloc);
+        try history.appendSlice(alloc, prompt);
+
+        var pos: u32 = @intCast(prompt.len);
+        var generated: usize = 0;
+        var gen_ns: i96 = 0;
+        var hit_eos = false;
+        var hit_context_limit = false;
+        var next: u32 = self.exec.sample(last_logits, self.sample_scratch, &self.sampler);
+        var proposed_total: usize = 0;
+        var accepted_total: usize = 0;
+        var rounds: usize = 0;
+        // `QWEN35_SPEC_RECALL` bookkeeping: per block-row position (0 = block
+        // row 1), how often the target's own pick was among that row's
+        // candidates.  Row position `r` is reached in a round only when rows
+        // 0..r-1 were accepted, so a low count at `r` also reflects the
+        // rounds that never got there -- `recall_tries` records that.
+        var recall_hit: [64]usize = @splat(0);
+        var recall_tries: [64]usize = @splat(0);
+        const recall_k = self.spec_recall_k;
+
+        const draft_buf = try alloc.alloc(u32, max_draft);
+        defer alloc.free(draft_buf);
+        // `QWEN35_SPEC_RECALL` scratch: `max_draft * k` candidate ids, `k` being
+        // the draft's `selector_top_k`.  Allocated lazily on the first round
+        // (the callback reports `k`, which the engine does not otherwise know).
+        var cand_buf: []u32 = &.{};
+        if (cand_fn != null and self.spec_recall_k > 0) {
+            cand_buf = try alloc.alloc(u32, max_draft * self.spec_recall_k);
+        }
+
+        while (generated < n_predict) {
+            if (pos >= max_seq) {
+                hit_context_limit = true;
+                break;
+            }
+            if (next == self.cfg.eos_token_id) {
+                hit_eos = true;
+                break;
+            }
+            try out.append(alloc, next);
+            try history.append(alloc, next);
+            if (progress) |f| f(progress_ctx, next);
+
+            const t0 = Io.Clock.Timestamp.now(io, .awake);
+            // `next` sits at `pos` and is already committed.  The block the
+            // draft may fill occupies positions `pos+1 ..`.
+            const block_pos = pos + 1;
+            const room = @min(max_draft, @min(n_predict - generated - 1, max_seq - block_pos));
+
+            var advanced: usize = 1;
+            // Set when the verify block already advanced the target over this
+            // position; the plain `step` below must then be skipped, or the
+            // target moves TWO rows while `pos` only advances one.
+            var verified = false;
+            if (room > 0) {
+                const from = if (history.items.len > ctx_rows) history.items.len - ctx_rows else 0;
+                const n_draft = draft_fn(draft_ctx, history.items[from..], next, block_pos, draft_buf[0..room]);
+                if (n_draft > 0) {
+                    rounds += 1;
+                    proposed_total += n_draft;
+                    verified = true;
+                    // ---- verification uses the ORDINARY step ----
+                    // The first draft id is scored by target's own `step` for
+                    // position `pos`; every further one by the step for the
+                    // position before it.  Reusing `step` (rather than a bespoke
+                    // argmax walk) keeps the accepted path bit-identical to plain
+                    // decode, which is the whole point: an accepted block must
+                    // produce exactly the tokens greedy decode would have.
+                    self.specSnapshotTake();
+                    var logits = self.forwardLogits(next, pos);
+                    self.specRingPush();
+                    var committed: usize = 0;
+                    var pending: u32 = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    if (self.spec_trace_dbg) {
+                        std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
+                            pos, next, draft_buf[0], pending, n_draft,
+                        });
+                    }
+                    // `QWEN35_SPEC_RECALL`: fetch this round's candidate table.
+                    // It is scored inside the verify loop below, where the
+                    // target's own pick for each row is actually available.
+                    const have_cand = cand_fn != null;
+                    if (cand_fn) |cf| cf(cand_ctx.?, cand_buf[0 .. n_draft * recall_k], n_draft);
+                    while (committed < n_draft) : (committed += 1) {
+                        const cand = draft_buf[committed];
+                        // `QWEN35_SPEC_RECALL`: `pending` is now the target's
+                        // own pick for row `committed`, and the draft's candidate
+                        // set for that row is `cand_buf[committed]`.  Recall =
+                        // "was the target's token even OFFERED", which is the
+                        // gate that separates a scoring defect from a forward
+                        // defect: high recall + wrong pick means stage 4 picked
+                        // badly; low recall means the block forward never
+                        // produced the right hidden state.
+                        if (have_cand and committed < recall_hit.len) {
+                            recall_tries[committed] += 1;
+                            var offered = false;
+                            for (cand_buf[committed * recall_k ..][0..recall_k]) |c| {
+                                if (c == pending) {
+                                    recall_hit[committed] += 1;
+                                    offered = true;
+                                    break;
+                                }
+                            }
+                            // `QWEN35_SPEC_RECALL` split: an offered-but-rejected
+                            // token is a *selection* loss (stage 4 scored it below
+                            // another candidate); a token that was never offered
+                            // is a *forward* loss (the block never produced it).
+                            if (pending != cand) {
+                                if (offered) self.recall_miss_select += 1 else self.recall_miss_forward += 1;
+                            }
+                        }
+                        if (pending != cand) break;
+                        if (generated + 1 + committed >= n_predict) break;
+                        try out.append(alloc, cand);
+                        try history.append(alloc, cand);
+                        if (progress) |f| f(progress_ctx, cand);
+                        // Advance the target by the token we just accepted.
+                        const row_pos = block_pos + @as(u32, @intCast(committed));
+                        logits = self.forwardLogits(cand, row_pos);
+                        self.specRingPush();
+                        pending = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    }
+                    accepted_total += committed;
+                    // `QWEN35_SPEC_POSSTAT`: how far down the chain each round
+                    // gets.  A chain whose first element is right and whose
+                    // second never is has a different shape from one that is
+                    // uniformly weak, and `accepted/rounds` cannot tell them
+                    // apart.
+                    if (self.spec_posstat) {
+                        self.spec_pos_reached[committed] += 1;
+                    }
+                    // Both branches leave the state reflecting the committed
+                    // rows: never-advanced (committed == 0) needs no rollback,
+                    // and a partial block is wound back and replayed.
+                    if (committed > 0) {
+                        self.specRollbackAndReplay(draft_buf[0..committed], block_pos);
+                    }
+                    advanced = committed + 1;
+                    next = pending;
+                }
+            }
+            if (advanced == 1 and !verified) {
+                // Nothing was drafted this round: one ordinary step, exactly as
+                // plain decode would do.
+                next = self.step(next, pos);
+                self.specRingPush();
+            }
+            pos += @as(u32, @intCast(advanced));
+            generated += advanced;
+            gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        }
+        self.exec.profPhase(false);
+        const per: f64 = if (out.items.len > 0)
+            @as(f64, @floatFromInt(gen_ns)) / 1e6 / @as(f64, @floatFromInt(out.items.len))
+        else
+            0;
+        return .{
+            .tokens = try out.toOwnedSlice(alloc),
+            .prefill_ms = self.prefill_ms,
+            .ms_per_token = per,
+            .decode_ms = @as(f64, @floatFromInt(gen_ns)) / 1e6,
+            .hit_eos = hit_eos,
+            .hit_context_limit = hit_context_limit,
+            .spec_proposed = proposed_total,
+            .spec_accepted = accepted_total,
+            .spec_rounds = rounds,
+            .spec_pos_reached = self.spec_pos_reached,
+            .spec_recall_hit = recall_hit,
+            .spec_recall_tries = recall_tries,
+            .spec_miss_select = self.recall_miss_select,
+            .spec_miss_forward = self.recall_miss_forward,
         };
     }
 

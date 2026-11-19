@@ -13,6 +13,10 @@ pub const tokenizer = @import("tokenizer.zig");
 pub const engine = @import("engine.zig");
 pub const quant_dequant = @import("quant_dequant.zig");
 pub const pool = @import("pool.zig");
+pub const dspine_bridge = @import("dspine_bridge.zig");
+pub const draft = @import("draft.zig");
+pub const spec_rollback = @import("spec_rollback.zig");
+pub const serial = @import("serial.zig");
 
 // The IQ lookup tables are defined here once and consumed by the C kernels via
 // `extern const` (src/kernels/x86/iq_tables.h).  Importing them from the root
@@ -45,6 +49,18 @@ test {
 // mode worth a test.
 test {
     _ = @import("chunk_slot_tests.zig");
+}
+
+// Speculative-decoding rollback (DSpine port, stage 2): the GDN/conv snapshot +
+// replay primitive, pinned to "restore + replay(committed) is bit-identical to a
+// fresh run of only those rows".  That equivalence is the entire contract the
+// engine relies on, and an off-by-one in `committed` is its failure mode.
+test {
+    _ = @import("spec_rollback.zig");
+    _ = @import("draft.zig");
+    _ = @import("spec_ref.zig");
+    _ = @import("dspine_tests.zig");
+    _ = @import("serial_tests.zig");
 }
 
 test {

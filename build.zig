@@ -135,6 +135,13 @@ const cuda_sources = [_][]const u8{
     // the host sampler's 1 MB D2H; see the file header for the graph constraint
     // that dictates the design.
     "sample.cu",
+    // DSpine code bridge (prepare_read / normalize_codes / feature_message /
+    // feature_finish).  The GPU twin of src/kernels/x86/dspine.c: both carry the
+    // reference's eleven bf16 cast points and its expression order, and both
+    // reduce in OUR tree order rather than Triton's, so the two backends agree
+    // bit-for-bit (scripts/dspine_ab.cu is the A/B that proves it).  See the
+    // file header for why Triton's own order is not the contract.
+    "dspine.cu",
 };
 
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of
@@ -293,6 +300,10 @@ pub fn build(b: *std.Build) void {
         // per token (decode) or once per chunk (prefill), so the element-wise
         // f16 cast is the whole kernel — there is no reduction to SIMD.
         .{ .name = "qwen35_kv_kernels", .file = "src/kernels/x86/kv.c", .isa = .baseline },
+        // DSPINE code bridge.  Baseline ISA on purpose: the kernels are defined
+        // by their bf16 rounding points (see the file header), so the whole
+        // point is to keep the compiler from re-associating anything.
+        .{ .name = "qwen35_dspine", .file = "src/kernels/x86/dspine.c", .isa = .baseline },
         // Table cross-check: reads the tables through the extern declarations
         // and counts mismatches against upstream anchors. Baseline ISA on
         // purpose -- it must link even when no SIMD tier is available.

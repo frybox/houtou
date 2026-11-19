@@ -675,7 +675,11 @@ pub fn dequantRowInto(dst: []f32, w: QuantRow, row: usize) void {
     const src = w.row(row);
     var b: usize = 0;
     while (b < w.blocks_per_row) : (b += 1) {
-        deq(src[b * per_rb * blk ..], dst[b * rbe ..]);
+        // `dst` must be narrowed to EXACTLY one row-block: `deq` asserts
+        // `out.len == rbe`, and a slice running to the end of a wide row would
+        // trip that assert on every type whose row-block is 256 (i.e. every
+        // type except q8_0, which returns above).
+        deq(src[b * per_rb * blk ..], dst[b * rbe ..][0..rbe]);
     }
 }
 
@@ -1052,15 +1056,30 @@ pub const CpuBackend = struct {
     }
 
     /// Row-batched rope64: `rows` tokens `pos..pos+rows-1`, each `heads * hd`
-    /// floats wide.  The CPU oracle is literally the loop of per-row calls, so
-    /// row r is bit-identical to `vRope64` on that row with `pos + r` (same
-    /// convention as `vRmsnormRows`).
+    /// floats wide.
+    ///
+    /// RoPE applies to the FIRST 64 dimensions of EACH head, not to the first
+    /// 64 dimensions of the row: `bufRope64` rotates one head's leading 64
+    /// floats (`applyRope64`, `half = 32`).  So a row of `heads * hd` floats
+    /// needs `heads` calls, one per head -- calling it once per ROW would
+    /// rotate head 0 and leave every other head untouched, which is silent
+    /// (the values stay finite and plausible) and was this function's bug until
+    /// the DSpine draft's stage-3 A/B surfaced it: with `heads = 32` only 64 of
+    /// 4096 q values came out rotated, and the CPU and CUDA paths disagreed on
+    /// exactly the heads after the first.
+    ///
+    /// Kept as the per-head loop (rather than one vectorised pass) because it is
+    /// the reference the device kernel is checked against.
     fn vRope64Rows(ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
         _ = ctx;
         const row_len = heads * hd;
         std.debug.assert(row_len != 0 and x.len % row_len == 0 and x.len / row_len == rows_in);
-        for (0..rows_in) |r|
-            ew.bufRope64(x.span(r * row_len, row_len), pos + @as(u32, @intCast(r)), base);
+        std.debug.assert(hd >= 64);
+        for (0..rows_in) |r| {
+            const tpos = pos + @as(u32, @intCast(r));
+            for (0..heads) |h|
+                ew.bufRope64(x.span(r * row_len + h * hd, hd), tpos, base);
+        }
     }
 
     fn vL2norm(ctx: *anyopaque, x: Buf) void {
@@ -1331,7 +1350,7 @@ pub const CpuBackend = struct {
 
     /// Host slices on this backend, so the "copy" is a plain memcpy (and for
     /// the `beta`/`gamma` scalars, the very same region the caller reads).
-    fn vCopyToHost(ctx: *anyopaque, dst: []f32, src: Buf) void {
+    fn vCopyOut(ctx: *anyopaque, dst: []f32, src: Buf) void {
         _ = ctx;
         std.debug.assert(dst.len <= src.len);
         @memcpy(dst, src.slice()[0..dst.len]);
@@ -1439,7 +1458,7 @@ pub const CpuBackend = struct {
         .deinterleaveQG = vDeinterleaveQG,
         .deinterleaveQGStrided = vDeinterleaveQGStrided,
         .copyFromHost = vCopyFromHost,
-        .copyToHost = vCopyToHost,
+        .copyOut = vCopyOut,
         .zeroBuf = vZeroBuf,
         .argmax = vArgmax,
         .sample = vSample,

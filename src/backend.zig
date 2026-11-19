@@ -495,7 +495,7 @@ pub const Exec = struct {
         /// style tooling, debug paths).  Never use it to bring activations
         /// back -- that is what P2c removed, and a device->host copy also
         /// serialises the stream.
-        copyToHost: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
+        copyOut: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
         /// Zero a region (reset of the conv history / GDN state).
         zeroBuf: *const fn (ctx: *anyopaque, buf: Buf) void,
         /// Greedy argmax over logits.  On a device backend this runs on the
@@ -740,6 +740,18 @@ pub const Exec = struct {
     pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
         self.vtable.copyRange(self.ptr, dst, src);
     }
+
+    /// Device -> host copy into a plain host slice.
+    ///
+    /// `copyRange` cannot serve this: it decides the direction from whether the
+    /// SOURCE is a backend region, so a host destination (wrapped as a `Buf`)
+    /// is written through as if it were device memory, which aborts the context
+    /// on CUDA.  Any caller holding a host buffer uses this instead.
+    pub fn copyOut(self: Exec, dst: []f32, src: Buf) void {
+        std.debug.assert(dst.len >= src.len);
+        self.vtable.copyOut(self.ptr, dst[0..src.len], src);
+    }
+
 
     /// KV-cache append: `copyRange` whose destination is `base + slot * stride`.
     /// See `VTable.copyRangeSlot` for why a replaying backend needs the slot
