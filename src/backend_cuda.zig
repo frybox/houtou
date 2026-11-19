@@ -8081,14 +8081,25 @@ const attn_score_arity: usize = 11;
     }
 
     /// The prefill row-batched `rope64` slot, timed (`$QWEN35_PROF`).
-    /// `ropeRows` (variable rotary width).  Not yet on the device: Qwen3's
-    /// full-head rotation is a different span than the Qwen3.5 kernels handle,
-    /// and the decoder that needs it (qwen3.zig) is new.  Delegating to the CPU
-    /// twin keeps the arithmetic correct; it costs a D2H/H2D round trip per
-    /// call, which is acceptable until the op is measured.
+    /// `ropeRows` (variable rotary width).  NOT implemented on the device yet.
+    ///
+    /// It cannot delegate to the CPU twin: `vRopeRows` takes a host slice, and
+    /// on this backend `x` is a DEVICE address, so the CPU path dereferences
+    /// device memory and dies without a stack trace.  Refusing loudly is the
+    /// only honest option until a device kernel exists -- and the engine that
+    /// needs it (`engines/qwen3.zig`, full-head rotation) is CPU-verified, so
+    /// a clear error is strictly better than a segfault.
+    ///
+    /// To implement: a `k_rope_rows` kernel taking `(x, rows, heads, hd,
+    /// rotary_dim, pos, base)`; `rotary_dim` is uniform across the vector so it
+    /// can be a template/register argument rather than a runtime branch.
     fn dRopeRows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
-        const self = self_(ctx);
-        cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+        _ = .{ ctx, x, pos, base, rows, heads, hd };
+        std.debug.print(
+            "error: ropeRows (rotary_dim={d}) has no CUDA kernel yet; run with --backend cpu\n",
+            .{rotary_dim},
+        );
+        @panic("ropeRows is not implemented on the CUDA backend");
     }
 
     fn dRope64Rows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {

@@ -388,6 +388,23 @@ pub fn build(b: *std.Build) void {
     // Link all C kernel units (each built for its own ISA).
     linkKernels(exe, &kernel_libs);
 
+    // Dev-only CLI: drive an engine other than Qwen3.5 directly.  `main.zig`'s
+    // `run` path is still written against the Qwen3.5 engine (spec decoding,
+    // tap ring, nextn); generalising that is the `engines/common.zig` work, so
+    // until then a second engine needs its own entry point.
+    const qwen3_cli = b.addExecutable(.{
+        .name = "houtou-qwen3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/qwen3_cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "houtou", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(qwen3_cli);
+
     // -------------------------------------------------------------------------
     // CUDA kernels for the `--backend cuda` path (src/kernels/cuda/)
     // -------------------------------------------------------------------------
@@ -551,13 +568,22 @@ pub fn build(b: *std.Build) void {
             // `q35_host_tables` need not be device-linked, so it goes to the
             // executable directly (nvlink would ignore a host-only object).
             exe.root_module.addObjectFile(host_obj);
+            qwen3_cli.root_module.addObjectFile(host_obj);
         }
 
         // Hand the objects to the executable.  `addObjectFile` appends to the
         // module's link objects, so each object is linked exactly once, in the
         // order the graph lists them.
-        for (objs) |o| exe.root_module.addObjectFile(o);
+        for (objs) |o| {
+            exe.root_module.addObjectFile(o);
+            // The second engine's CLI links the same module (`mod`), so it
+            // references the same `q35_launch_*` symbols.  Attaching the
+            // objects to both is what keeps that binary linkable under
+            // `-Dcuda=true`.
+            qwen3_cli.root_module.addObjectFile(o);
+        }
         exe.root_module.addObjectFile(dlink_obj);
+        qwen3_cli.root_module.addObjectFile(dlink_obj);
 
         // The CUDA runtime, for the host stubs (`__cudaRegisterFatBinary`,
         // `__cudaPushCallConfiguration`, ...) that the stage-2 object calls.
@@ -574,13 +600,18 @@ pub fn build(b: *std.Build) void {
         // __cxa_guard_abort" without it.
         exe.root_module.linkSystemLibrary("cudart", .{});
         exe.root_module.linkSystemLibrary("c++", .{});
+        qwen3_cli.root_module.linkSystemLibrary("cudart", .{});
+        qwen3_cli.root_module.linkSystemLibrary("c++", .{});
         const nvcc_bin_dir = std.fs.path.dirname(nvcc) orelse ".";
         const toolkit_dir = std.fs.path.dirname(nvcc_bin_dir) orelse nvcc_bin_dir;
         const lib64_dir = b.pathJoin(&.{ toolkit_dir, "lib64" });
         if (std.Io.Dir.cwd().access(b.graph.io, lib64_dir, .{})) |_| {
             exe.root_module.addLibraryPath(.{ .cwd_relative = lib64_dir });
+            qwen3_cli.root_module.addLibraryPath(.{ .cwd_relative = lib64_dir });
         } else |_| {
-            exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ toolkit_dir, "lib" }) });
+            const libdir = b.pathJoin(&.{ toolkit_dir, "lib" });
+            exe.root_module.addLibraryPath(.{ .cwd_relative = libdir });
+            qwen3_cli.root_module.addLibraryPath(.{ .cwd_relative = libdir });
         }
         // A DT_NEEDED on libcudart.so is deliberate: the executable is the only
         // artifact now, so "contains CUDA kernels" and "needs cudart" are the
@@ -607,22 +638,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(tok_cli);
 
-    // Dev-only CLI: drive an engine other than Qwen3.5 directly.  `main.zig`'s
-    // `run` path is still written against the Qwen3.5 engine (spec decoding,
-    // tap ring, nextn); generalising that is the `engines/common.zig` work, so
-    // until then a second engine needs its own entry point.
-    const qwen3_cli = b.addExecutable(.{
-        .name = "houtou-qwen3",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/qwen3_cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "houtou", .module = mod },
-            },
-        }),
-    });
-    b.installArtifact(qwen3_cli);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).

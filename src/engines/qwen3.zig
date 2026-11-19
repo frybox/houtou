@@ -27,6 +27,7 @@ const gguf = @import("../gguf.zig");
 const backend = @import("../backend.zig");
 const backend_cpu = @import("../backend_cpu.zig");
 const sampler = @import("../sampler.zig");
+const common = @import("common.zig");
 const Io = std.Io;
 
 const Buf = backend.Buf;
@@ -100,6 +101,8 @@ pub const Engine = struct {
     kv_type: backend.KvType = .f16,
     /// Sampler scratch (`vocab` f32); `Exec.sample` writes into it.
     sample_scratch: Buf = Buf.empty,
+    /// Sampling policy; `generate` installs a greedy one.
+    sampler: sampler.Sampler,
     /// Maximum sequence the KV caches were allocated for.
     max_ctx: u32 = 0,
     n_batch: u32 = 0,
@@ -241,13 +244,23 @@ pub const Engine = struct {
             .ones = try exec.allocBuf(q_dim),
             .kv_type = kv_type,
             .sample_scratch = Buf.empty,
+            .sampler = sampler.Sampler.init(.{ .temperature = 0 }),
             .max_ctx = ctx_len,
             .n_batch = 0,
         };
         errdefer e.deinit();
 
         // `+inf` gate -> sigmoid == 1.0 exactly (see the `ones` field comment).
-        for (e.ones.span(0, q_dim).slice()) |*p| p.* = std.math.inf(f32);
+        // Written through `copyFromHost`, NOT `ones.slice()`: on the CUDA
+        // backend `Buf.slice()` is a DEVICE address, so a host loop over it
+        // dereferences device memory and segfaults inside `load` (observed
+        // before this was fixed).
+        {
+            const host = try alloc.alloc(f32, q_dim);
+            defer alloc.free(host);
+            @memset(host, std.math.inf(f32));
+            exec.copyFromHost(e.ones.span(0, q_dim), host);
+        }
 
         e.sample_scratch = try exec.allocBuf(cfg.vocab);
         const widest = @max(n_ff, @max(q_dim, hidden));
@@ -404,7 +417,9 @@ pub const Engine = struct {
         return out;
     }
 
-    /// Greedy generation, the smoke-test entry point.
+    /// Greedy generation through the shared driver loop
+    /// (`engines/common.zig`), so the prompt/step/EOS bookkeeping is the same
+    /// code the other engine runs.
     pub fn generate(
         self: *Engine,
         alloc: std.mem.Allocator,
@@ -413,28 +428,71 @@ pub const Engine = struct {
         on_token: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
         ctx: ?*anyopaque,
     ) ![]u32 {
-        _ = alloc;
         var s = sampler.Sampler.init(.{ .temperature = 0 });
-        self.reset();
-        var last: Buf = Buf.empty;
+        self.sampler = s;
+        const res = try common.generate(
+            self.driver(),
+            alloc,
+            self.io,
+            prompt,
+            n_predict,
+            on_token,
+            ctx,
+        );
+        s = self.sampler;
+        return res.tokens;
+    }
+
+    /// The narrow contract `engines/common.zig` runs the loop against.
+    pub fn driver(self: *Engine) common.Driver {
+        driver_ops.eos_id = self.cfg.eos_token_id;
+        return .{ .ctx = self, .ops = &driver_ops };
+    }
+
+    /// One shared instance: `Ops` is immutable apart from `eos_id`, which
+    /// `driver()` sets from the loaded config just before the loop starts.
+    /// Generators do not run concurrently within one process here (a CLI run
+    /// owns its engine), which is what makes a single mutable slot safe.
+    var driver_ops: common.Driver.Ops = .{
+        .reset = dReset,
+        .prefill = dPrefill,
+        .step = dStep,
+        .sample = dSample,
+        .max_seq = dMaxSeq,
+        .eos_id = 0,
+    };
+
+    fn dReset(ctx: *anyopaque) void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        e.reset();
+    }
+    fn dPrefill(ctx: *anyopaque, prompt: []const u32) Buf {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        // Prefill in chunks of 8: the layer body is single-token today, so a
+        // "chunk" here is just the loop bound, not a batched kernel.
+        var last: Buf = e.logits;
         var i: usize = 0;
-        while (i < prompt.len) : (i += 1) {
+        while (i < prompt.len) {
             const n = @min(@as(usize, 8), prompt.len - i);
-            last = self.forwardChunk(prompt[i .. i + n], @intCast(i));
-            i += n - 1;
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                last = e.forwardLogits(prompt[i + j], @intCast(i + j));
+            }
+            i += n;
         }
-        var out_l: std.ArrayList(u32) = .empty;
-        var pos: u32 = @intCast(prompt.len);
-        var next: u32 = self.exec.sample(last, self.sample_scratch, &s);
-        while (out_l.items.len < n_predict) {
-            if (next == self.cfg.eos_token_id) break;
-            try out_l.append(self.alloc, next);
-            if (on_token) |f| f(ctx, next);
-            last = self.forwardLogits(next, pos);
-            pos += 1;
-            next = self.exec.sample(last, self.sample_scratch, &s);
-        }
-        return out_l.toOwnedSlice(self.alloc);
+        return last;
+    }
+    fn dStep(ctx: *anyopaque, token: u32, pos: u32) void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        _ = e.forwardLogits(token, pos);
+    }
+    fn dSample(ctx: *anyopaque) u32 {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        return e.exec.sample(e.logits, e.sample_scratch, &e.sampler);
+    }
+    fn dMaxSeq(ctx: *anyopaque) u32 {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        return e.max_ctx;
     }
 };
 

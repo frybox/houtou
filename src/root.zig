@@ -13,6 +13,9 @@ pub const tokenizer = @import("tokenizer.zig");
 /// Per-architecture inference engines.  Each one owns the layer stack of one
 /// model family and shares the rest (backends, GGUF, sampling) with the others.
 pub const engines = struct {
+    /// Architecture-neutral driver code (the generation loop and the narrow
+    /// contract each engine exposes to it).
+    pub const common = @import("engines/common.zig");
     pub const qwen35 = @import("engines/qwen35.zig");
     pub const qwen3 = @import("engines/qwen3.zig");
 };
@@ -73,6 +76,7 @@ test {
     // The Qwen3 engine's own checks: the architecture gate, the full-head
     // rotary span, and that `applyRope` really rotates past 64 dims (the one
     // difference from Qwen3.5 that `rope64Rows` cannot express).
+    _ = @import("engines/common.zig");
     _ = @import("engines/qwen3.zig");
 }
 
