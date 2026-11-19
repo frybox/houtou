@@ -290,6 +290,15 @@ pub const Exec = struct {
         /// those nodes by host-stub address (see `q35_func_rope64`).  Prefill
         /// never captures a graph, so the batch reading is free there.
         rope64Rows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
+        /// RoPE over `rotary_dim` of each head, for architectures that are not
+        /// Qwen3.5/3.8.  Qwen3 rotates the WHOLE head (`rotary_dim == hd`),
+        /// so `rope64Rows` cannot express it.
+        ///
+        /// Separate slot on purpose: `rope64Rows` is what the decode CUDA graph
+        /// identifies and retargets by host-stub address for Qwen3.5, and adding
+        /// a parameter there would invalidate every captured node.  Backends
+        /// that do not implement this may fall back to their CPU twin.
+        ropeRows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
         l2norm: *const fn (ctx: *anyopaque, x: Buf) void,
         /// x *= s
@@ -651,6 +660,11 @@ pub const Exec = struct {
     /// token `pos + r`) is `heads * hd` floats.
     pub fn rope64Rows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
         self.vtable.rope64Rows(self.ptr, x, pos, base, rows, heads, hd);
+    }
+    /// RoPE over `rotary_dim` of each head (`rotary_dim == 64` reproduces
+    /// `rope64Rows` exactly).
+    pub fn ropeRows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        self.vtable.ropeRows(self.ptr, x, pos, base, rows, heads, hd, rotary_dim);
     }
     pub fn l2norm(self: Exec, x: Buf) void {
         self.vtable.l2norm(self.ptr, x);

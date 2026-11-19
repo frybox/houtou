@@ -17,6 +17,36 @@ const Buf = backend.Buf;
 // Thin Buf adapters: the numeric kernels below take plain slices; these
 // wrappers are what backend_cpu registers as the elementwise Exec slots.
 pub fn bufRmsnorm(out: Buf, x: Buf, w: Buf, eps: f32) void { rmsNorm(out.slice(), x.slice(), w.slice(), eps); }
+/// `applyRope64` with the rotary width as a parameter.
+///
+/// Qwen3.5/3.8 rotate the leading 64 of each head's floats
+/// (`partial_rotary_factor = 0.25` of `head_dim = 256`); Qwen3 uses the full
+/// head (`head_dim = 128`, `partial_rotary_factor = 1.0`).  Same cross-half
+/// pairing and same frequency formula, only the span differs:
+/// `inv_freq[j] = base^(-2j/rotary_dim)`, pairing `j` with `j + rotary_dim/2`.
+///
+/// `rotary_dim == 64` must stay byte-identical to `applyRope64` -- the 27B
+/// engine's output depends on it.
+pub fn applyRope(x: []f32, pos: u32, base: f32, rotary_dim: usize) void {
+    if (rotary_dim == 64) return applyRope64(x, pos, base);
+    std.debug.assert(rotary_dim % 2 == 0 and rotary_dim <= x.len);
+    const half = rotary_dim / 2;
+    for (0..half) |j| {
+        const theta = @as(f32, @floatFromInt(pos)) *
+            std.math.pow(f32, base, -@as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rotary_dim)));
+        const c = @cos(theta);
+        const s = @sin(theta);
+        const a = x[j];
+        const b = x[j + half];
+        x[j] = a * c - b * s;
+        x[j + half] = a * s + b * c;
+    }
+}
+
+pub fn bufRope(x: Buf, pos: u32, base: f32, rotary_dim: usize) void {
+    applyRope(x.slice(), pos, base, rotary_dim);
+}
+
 pub fn bufRope64(x: Buf, pos: u32, base: f32) void { applyRope64(x.slice(), pos, base); }
 pub fn bufL2norm(x: Buf) void { l2norm(x.slice()); }
 pub fn bufScaleVec(x: Buf, s: f32) void { scaleVec(x.slice(), s); }

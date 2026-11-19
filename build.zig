@@ -607,6 +607,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(tok_cli);
 
+    // Dev-only CLI: drive an engine other than Qwen3.5 directly.  `main.zig`'s
+    // `run` path is still written against the Qwen3.5 engine (spec decoding,
+    // tap ring, nextn); generalising that is the `engines/common.zig` work, so
+    // until then a second engine needs its own entry point.
+    const qwen3_cli = b.addExecutable(.{
+        .name = "houtou-qwen3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/qwen3_cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "houtou", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(qwen3_cli);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

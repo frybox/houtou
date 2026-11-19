@@ -62,6 +62,16 @@ const special_tokens = [_]struct { tok: []const u8, id: u32 }{
 var gpt2_table: [256]u21 = undefined;
 var gpt2_table_built = false;
 
+/// Linear lookup of a token string in a vocab array, for the special-token
+/// resolution above.  Runs a few dozen times at load, so the O(n) scan costs
+/// nothing next to building the 150k-entry `token_to_id` map.
+fn findInVocab(vocab: []const []const u8, needle: []const u8) ?u32 {
+    for (vocab, 0..) |tok, i| {
+        if (std.mem.eql(u8, tok, needle)) return @intCast(i);
+    }
+    return null;
+}
+
 fn isGpt2Printable(b: usize) bool {
     // GPT-2 bytes_to_unicode: 0x21..0x7E, 0xA1..0xAC, 0xAE..0xFF (0xAD excluded).
     return (b >= 0x21 and b <= 0x7E) or (b >= 0xA1 and b <= 0xAC) or (b >= 0xAE and b <= 0xFF);
@@ -408,10 +418,22 @@ pub const Tokenizer = struct {
         // Decode side needs the string in the vocab at the right slot, so a
         // GGUF whose vocab is too small for our ids is rejected up front
         // rather than silently producing holes.
+        //
+        // The ids are NOT universal across Qwen generations: `<|im_end|>` is
+        // 248046 on Qwen3.5/3.8 (248320-token vocab) and 151645 on Qwen3
+        // (151936-token vocab), and Qwen3.5-only tokens such as
+        // `<|object_ref_start|>` do not exist there at all.
+        //
+        // So: prefer the FILE's own id (`findInVocab`), fall back to the
+        // pinned Qwen3.5 id when the vocab does not carry the string (a mini
+        // GGUF in a unit test, say), and skip only when that id would be
+        // outside the vocab -- which is what happens for Qwen3's
+        // `<|object_ref_start|>` and friends, tokens that do not exist there.
         for (special_tokens) |st| {
-            if (st.id >= self.vocab_size) return error.InvalidVocab;
-            self.special_map.put(allocator, st.tok, st.id) catch return error.OutOfMemory;
-            vocab[st.id] = st.tok;
+            const id: u32 = findInVocab(vocab, st.tok) orelse st.id;
+            if (id >= self.vocab_size) continue;
+            self.special_map.put(allocator, st.tok, id) catch return error.OutOfMemory;
+            vocab[id] = st.tok;
         }
 
         return self;

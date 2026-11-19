@@ -8081,6 +8081,16 @@ const attn_score_arity: usize = 11;
     }
 
     /// The prefill row-batched `rope64` slot, timed (`$QWEN35_PROF`).
+    /// `ropeRows` (variable rotary width).  Not yet on the device: Qwen3's
+    /// full-head rotation is a different span than the Qwen3.5 kernels handle,
+    /// and the decoder that needs it (qwen3.zig) is new.  Delegating to the CPU
+    /// twin keeps the arithmetic correct; it costs a D2H/H2D round trip per
+    /// call, which is acceptable until the op is measured.
+    fn dRopeRows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        const self = self_(ctx);
+        cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+    }
+
     fn dRope64Rows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
@@ -8143,6 +8153,7 @@ pub const vtable = backend.Exec.VTable{
     .rmsnormRows = CudaBackend.dRmsnormRows,
     .rope64 = CudaBackend.dRope64,
     .rope64Rows = CudaBackend.dRope64Rows,
+    .ropeRows = CudaBackend.dRopeRows,
     .l2norm = CudaBackend.dL2norm,
     .l2normRows = CudaBackend.dL2normRows,
     .siluInPlace = CudaBackend.dSiluInPlace,

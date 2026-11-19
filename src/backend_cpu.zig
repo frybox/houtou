@@ -1082,6 +1082,20 @@ pub const CpuBackend = struct {
         }
     }
 
+    /// RoPE over `rotary_dim` of each head.  `rotary_dim == 64` takes the same
+    /// per-head call as `vRope64Rows`, so the two are bit-identical there.
+    fn vRopeRows(ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        _ = ctx;
+        const row_len = heads * hd;
+        std.debug.assert(row_len != 0 and x.len % row_len == 0 and x.len / row_len == rows_in);
+        std.debug.assert(hd >= rotary_dim and rotary_dim >= 2);
+        for (0..rows_in) |r| {
+            const tpos = pos + @as(u32, @intCast(r));
+            for (0..heads) |h|
+                ew.bufRope(x.span(r * row_len + h * hd, hd), tpos, base, rotary_dim);
+        }
+    }
+
     fn vL2norm(ctx: *anyopaque, x: Buf) void {
         _ = ctx;
         ew.bufL2norm(x);
@@ -1429,6 +1443,7 @@ pub const CpuBackend = struct {
         .rmsnormRows = vRmsnormRows,
         .rope64 = vRope64,
         .rope64Rows = vRope64Rows,
+        .ropeRows = vRopeRows,
         .l2norm = vL2norm,
         .l2normRows = vL2normRows,
         .scaleVec = vScaleVec,

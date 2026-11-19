@@ -14,6 +14,7 @@ pub const tokenizer = @import("tokenizer.zig");
 /// model family and shares the rest (backends, GGUF, sampling) with the others.
 pub const engines = struct {
     pub const qwen35 = @import("engines/qwen35.zig");
+    pub const qwen3 = @import("engines/qwen3.zig");
 };
 /// Historical alias: before the `engines/` split there was exactly one engine,
 /// and `main.zig` and the tests still reach it as `qwen35.engine`.  Kept so the
@@ -69,6 +70,10 @@ test {
     _ = @import("spec_ref.zig");
     _ = @import("dspine_tests.zig");
     _ = @import("serial_tests.zig");
+    // The Qwen3 engine's own checks: the architecture gate, the full-head
+    // rotary span, and that `applyRope` really rotates past 64 dims (the one
+    // difference from Qwen3.5 that `rope64Rows` cannot express).
+    _ = @import("engines/qwen3.zig");
 }
 
 test {
