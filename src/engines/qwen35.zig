@@ -801,8 +801,14 @@ pub const Engine = struct {
     /// backends: `copyRange` moves device<->host, and the bytes are touched
     /// once per round, not per token.
     const SnapLayer = struct {
-        conv: []f32,
-        state: []f32,
+        /// Backend regions, NOT host slices: the snapshot is taken and restored
+        /// inside the per-round speculative loop, and on CUDA a host copy means
+        /// 230 MB of PCIe per round (48 GDN layers x [conv + 128x128 state]).
+        /// Keeping both sides as `Buf` makes the whole thing `copyRange`
+        /// (device-to-device), which is what the ablation measured: dropping
+        /// the transfer entirely took 27B MTP decode from 19.1 to 32.1 tok/s.
+        conv: backend.Buf,
+        state: backend.Buf,
         conv_len: u32,
         kv_len: u32,
     };
@@ -2408,19 +2414,15 @@ pub const Engine = struct {
         const n = self.nSlots();
         const snaps = try alloc.alloc(SnapLayer, n);
         errdefer alloc.free(snaps);
-        var made: usize = 0;
-        errdefer for (snaps[0..made]) |s| {
-            if (s.conv.len > 0) alloc.free(s.conv);
-            if (s.state.len > 0) alloc.free(s.state);
-        };
         for (snaps, 0..) |*s, i| {
-            s.* = .{ .conv = &.{}, .state = &.{}, .conv_len = 0, .kv_len = 0 };
+            s.* = .{ .conv = backend.Buf.empty, .state = backend.Buf.empty, .conv_len = 0, .kv_len = 0 };
             if (i < self.gdn.len) {
                 const g = self.gdn[i];
-                s.conv = try alloc.alloc(f32, g.conv.len);
-                s.state = try alloc.alloc(f32, g.state.len);
+                // Backend regions, mirroring the live buffers' own residency:
+                // on CUDA this is VRAM, so the round's copy is D2D.
+                if (g.conv.len > 0) s.conv = try self.exec.allocBuf(g.conv.len);
+                if (g.state.len > 0) s.state = try self.exec.allocBuf(g.state.len);
             }
-            made += 1;
         }
         self.spec_snap = snaps;
     }
@@ -2431,11 +2433,12 @@ pub const Engine = struct {
             if (i < self.kv.len) s.kv_len = self.kv[i].len;
             if (i < self.gdn.len) {
                 const g = self.gdn[i];
-                // D2H: `copyRange` infers direction from the SOURCE, so a host
-                // destination wrapped as a `Buf` would be written as if it were
-                // device memory.  `copyOut` is the declared device->host slot.
-                if (g.conv.len > 0) self.exec.copyOut(s.conv, g.conv);
-                if (g.state.len > 0) self.exec.copyOut(s.state, g.state);
+                // Both sides are backend regions, so this is a plain copy in the
+                // backend's own address space (D2D on CUDA).  It used to be
+                // `copyOut` into a HOST slice, which is what made every
+                // speculative round push ~230 MB over PCIe.
+                if (g.conv.len > 0) self.exec.copyRange(s.conv, g.conv);
+                if (g.state.len > 0) self.exec.copyRange(s.state, g.state);
                 s.conv_len = g.conv_len;
             }
         }
@@ -2455,17 +2458,10 @@ pub const Engine = struct {
             if (i < self.kv.len) self.kv[i].len = s.kv_len;
             if (i < self.gdn.len) {
                 const g = &self.gdn[i];
-                // `copyFromHost`, NOT `copyRange(Buf.wrap(...))`: the snapshot
-                // is HOST memory, and `copyRange` infers the direction from the
-                // SOURCE alone -- a device source with a host destination is
-                // issued as a device-to-device move, i.e. it reads a host
-                // address as if it were VRAM.  That went unnoticed because the
-                // CPU backend treats both sides as host; on CUDA it silently
-                // restored garbage into the GDN state, which then made the
-                // TARGET predict wrong tokens (observed: the verify forward
-                // returned token 0 at the first round).
-                if (g.conv.len > 0) self.exec.copyFromHost(g.conv, s.conv);
-                if (g.state.len > 0) self.exec.copyFromHost(g.state, s.state);
+                // Device-to-device, mirroring `specSnapshotTake`.  The snapshot
+                // lives in backend memory precisely so this never crosses PCIe.
+                if (g.conv.len > 0) self.exec.copyRange(g.conv, s.conv);
+                if (g.state.len > 0) self.exec.copyRange(g.state, s.state);
                 g.conv_len = s.conv_len;
             }
         }
