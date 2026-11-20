@@ -266,6 +266,33 @@ pub const Engine = struct {
         const widest = @max(n_ff, @max(q_dim, hidden));
         try exec.allocScratch(widest);
 
+        // ---- chunk (batched prefill) scratch ----
+        // `K` is the chunk size: one weight read per projection serves this many
+        // tokens.  1024 matches the Qwen3.5 engine; the buffers are sized from
+        // it, so raising it costs activation memory only.
+        const K: usize = 1024;
+        e.n_batch = K;
+        e.xK = try exec.allocBuf(K * hidden);
+        e.x1K = try exec.allocBuf(K * hidden);
+        e.x2K = try exec.allocBuf(K * hidden);
+        e.qK = try exec.allocBuf(K * q_dim);
+        e.kK = try exec.allocBuf(K * kv_dim);
+        e.vK = try exec.allocBuf(K * kv_dim);
+        e.mlpK = try exec.allocBuf(K * n_ff);
+        e.mlpK1 = try exec.allocBuf(K * n_ff);
+        e.goutK = try exec.allocBuf(K * q_dim);
+        // `attnChunk` takes a gate buffer the same shape as q; this engine has no
+        // output gate, so the whole chunk sees `+inf` (sigmoid == 1) exactly like
+        // the single-token path.
+        e.gateK = try exec.allocBuf(K * q_dim);
+        {
+            const host = try alloc.alloc(f32, K * q_dim);
+            defer alloc.free(host);
+            @memset(host, std.math.inf(f32));
+            exec.copyFromHost(e.gateK.span(0, K * q_dim), host);
+        }
+        try exec.allocScratchK(widest, K);
+
         for (0..cfg.n_layers) |i| {
             var b: [96]u8 = undefined;
             const nm = struct {
@@ -408,13 +435,116 @@ pub const Engine = struct {
     }
 
     /// Chunked prefill: `tokens.len` tokens starting at `pos0`, returning the
-    /// logits of the LAST one.  Reuses the single-token layer body -- correct
-    /// but one token at a time; a batched `attnChunk` path is the next speedup
-    /// (see `qwen35.zig`'s `forwardFullChunk` for the shape it takes).
+    /// logits of the LAST one.
+    ///
+    /// K-token batched path (the twin of `qwen35.zig`'s `forwardChunk`): every
+    /// weight-reading projection runs ONCE per chunk as a `matvecBatchK`, and
+    /// the per-token work (per-head q/k norm, RoPE, KV append, attention) runs
+    /// chunk-wide through the row-batched slots.  Each of those is defined as
+    /// the per-token sequence it replaces, so the result is bit-identical to
+    /// `k` calls of `forwardLogits` -- the same contract the Qwen3.5 engine
+    /// holds, and what its `QWEN35_SPEC_TAPS` self-check verifies.
+    ///
+    /// Falls back to the per-token loop when no chunk scratch was allocated
+    /// (`n_batch == 0`, which is what `--backend cpu` used to imply before the
+    /// buffers existed) or when the chunk is a single token.
     pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) Buf {
-        var out: Buf = self.logits;
-        for (tokens, 0..) |t, i| out = self.forwardLogits(t, pos0 + @as(u32, @intCast(i)));
-        return out;
+        const k = tokens.len;
+        // A single token is the serial path, and `forwardLogits` opens and
+        // closes its own `stepBegin`/`stepEnd` span; delegating keeps the
+        // decode-graph boundary from leaking into the next step (same reason
+        // `qwen35.forwardChunk` special-cases k == 1).
+        if (k == 0) return self.logits;
+        // `$QWEN35_NO_BATCH`: force the per-token loop, for A/B against the
+        // batched path (same switch the Qwen3.5 engine honours).
+        const forced_serial = @import("../cudart.zig").environ_map != null and
+            @import("../cudart.zig").environ_map.?.get("QWEN35_NO_BATCH") != null;
+        if (k == 1 or forced_serial or self.n_batch == 0 or k > self.n_batch) {
+            var out: Buf = self.logits;
+            for (tokens, 0..) |t, i| {
+                out = self.forwardLogits(t, pos0 + @as(u32, @intCast(i)));
+            }
+            return out;
+        }
+
+        const c = &self.cfg;
+        const hidden: usize = c.hidden;
+        const heads: usize = c.n_heads;
+        const kv_heads: usize = c.n_kv_heads;
+        const hd: usize = c.head_dim;
+        const q_dim: usize = heads * hd;
+        const kv_dim: usize = kv_heads * hd;
+        const gqa: usize = heads / kv_heads;
+        const n_ff: usize = c.n_ff;
+
+        var t: usize = 0;
+        while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
+
+        for (self.layers, 0..) |*lw, li| {
+            // ---- attention ----
+            // One norm for the whole chunk; `rmsnormRows` is `k` consecutive
+            // single-row blocks and reduces each row in the same order, so it
+            // is bit-identical to the per-token call.
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
+
+            // Plain [q_dim, hidden] projection: no `[q|gate]` interleave, so
+            // `qK` is filled directly (Qwen3.5 has to deinterleave first, which
+            // is why its RoPE lives inside `forwardFullChunk`).
+            self.exec.matvecBatchK(self.qK.span(0, k * q_dim), lw.attn_q, self.x1K, k);
+            self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k, self.x1K, k);
+            self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v, self.x1K, k);
+
+            // Per-head norm over `head_dim`, then RoPE over the FULL head.
+            // Order matters: norm -> rope, as in `layerForward`; rotating first
+            // and normalising after would renormalise the rotation away.
+            self.exec.rmsnormRows(self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
+            self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
+            self.exec.ropeRows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
+            self.exec.ropeRows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
+
+            // KV cache: the chunk's `k` rows land contiguously at `slot0`, so
+            // this is ONE strided append per tensor instead of `k` of them.
+            const cache = &self.kv[li];
+            std.debug.assert(cache.len + k <= self.max_ctx);
+            const slot0: usize = cache.len;
+            self.exec.kvAppend(cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
+            self.exec.kvAppend(cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
+            cache.len += @intCast(k);
+
+            // scores -> softmax -> PV -> gate for all k rows in one launch.
+            // `gateK` stays the all-`+inf` buffer (this architecture has no
+            // attention output gate; `sigmoid(+inf) == 1`).
+            const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+            self.exec.attnChunk(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+                cache.k, cache.v,
+                self.att.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
+                slot0, k, heads, gqa, hd, kv_dim, scale);
+
+            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
+            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+
+            // ---- MLP ----
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
+            self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
+            self.exec.swiglu(self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
+            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
+            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+        }
+
+        // Last token's logits on the serial tail, so the first sampled logits
+        // go through exactly the same arithmetic as the decode path.
+        // `x1` is `max(n_ff, q_dim)` wide, so it cannot be the norm output here
+        // (`rmsNorm` asserts all three lengths match); use a prefix view of it,
+        // which is exactly `hidden` floats.
+        const normed = self.x1.span(0, hidden);
+        self.exec.rmsnorm(normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
+        if (self.output_weight) |ow| {
+            self.exec.matvec(self.logits, ow, normed);
+        } else {
+            self.exec.matvec(self.logits, self.token_embd, normed);
+        }
+        return self.logits;
     }
 
     /// Greedy generation through the shared driver loop
@@ -468,16 +598,16 @@ pub const Engine = struct {
     }
     fn dPrefill(ctx: *anyopaque, prompt: []const u32) Buf {
         const e: *Engine = @ptrCast(@alignCast(ctx));
-        // Prefill in chunks of 8: the layer body is single-token today, so a
-        // "chunk" here is just the loop bound, not a batched kernel.
+        // Batched prefill: each chunk is one `forwardChunk`, which runs every
+        // projection once per chunk instead of once per token.  The chunk size
+        // is `n_batch` (0 -> the buffer was not allocated, so `forwardChunk`
+        // falls back to the per-token loop on its own).
         var last: Buf = e.logits;
         var i: usize = 0;
+        const cap: usize = if (e.n_batch == 0) 1 else @intCast(e.n_batch);
         while (i < prompt.len) {
-            const n = @min(@as(usize, 8), prompt.len - i);
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                last = e.forwardLogits(prompt[i + j], @intCast(i + j));
-            }
+            const n = @min(cap, prompt.len - i);
+            last = e.forwardChunk(prompt[i..][0..n], @intCast(i));
             i += n;
         }
         return last;

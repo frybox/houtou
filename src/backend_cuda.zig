@@ -8146,13 +8146,12 @@ const attn_score_arity: usize = 11;
             return;
         }
         // A capture would replay this node with the FIRST token's arguments and
-        // there is no `_dpos` variant to retarget, so refuse to record it: let
-        // the capture be abandoned (decoding still works, just unbatched) rather
-        // than produce silently stale rotations.
+        // there is no `_dpos` variant to retarget, so refuse to record it: tear
+        // the capture down and run the op with a DIRECT launch (never the CPU
+        // fallback -- `x` is a device pointer here, and the CPU twin would
+        // dereference it as host memory).
         if (self.capturing()) {
             self.graphAbandon("ropeRows (variable rotary_dim) is not capture-safe");
-            cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
-            return;
         }
         if (dBufPtr(x)) |px| {
             const rc = Launch.rope_rows_dim(px, @intCast(rows), @intCast(heads), @intCast(hd), @bitCast(pos), base, @intCast(rotary_dim), self.launchStream());
