@@ -47,6 +47,29 @@
 // dotq.cuh so that mmq.cu (the prefill tile kernel) can use the exact same
 // definitions instead of a second copy (AGENTS.md: one source for one fact).
 #include "dotq.cuh"
+// Largest `tokens` the cooperative warp-per-row kernels accept.
+//
+// 8 matches llama.cpp's `MMVQ_MAX_BATCH_SIZE`, which is the batch at which its
+// `mul_mat_vec_q` hands over to the tiled GEMM: below it the per-row kernels
+// win because the tile cannot be filled.  Read once (this is on the per-matvec
+// path); `$QWEN35_COOP_MAX_TOKENS` overrides for A/B, and 1 reproduces the old
+// single-token-only dispatch.
+static int q35_coop_max_tokens() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 8;
+    const char *v = getenv("QWEN35_COOP_MAX_TOKENS");
+    if (v != nullptr) {
+        const int n = atoi(v);
+        if (n >= 1) cached = n;
+    }
+    if (getenv("QWEN35_COOPDBG")) {
+        fprintf(stderr, "[coop] max_tokens=%d\n", cached);
+    }
+    return cached;
+}
+
+
 // ---------------------------------------------------------------------------
 // matvec kernel: out[t*rows + r] = W[r] . x[t]
 // ---------------------------------------------------------------------------
@@ -786,7 +809,14 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
 
     // Prefill only: a single token has nothing to reuse, and the warp-per-row
     // kernel already coalesces it (below).
-    if (tokens > 1 && q35_mmq_enabled() && q35_launch_mul_mat_vec_tile != 0) {
+    //
+    // SMALL BATCHES SKIP THE TILE TOO.  The tile kernel stages a 16-row slab and
+    // runs tensor-core mma over it, which is right for a prefill chunk and wrong
+    // for the 2..8 rows a speculative verify sends: five rows leave 69% of the
+    // tile empty AND the mma still pays its fixed staging + barrier cost.  Those
+    // sizes go to the cooperative warp-per-row kernels below instead, which is
+    // what `Q35_COOP_MAX_TOKENS` gates.
+    if (tokens > q35_coop_max_tokens() && q35_mmq_enabled() && q35_launch_mul_mat_vec_tile != 0) {
         const int rc = q35_launch_mul_mat_vec_tile(d_w, d_xq, d_out, rows, cols,
                                                    tokens, ttype, stream_v);
         if (rc == (int)cudaSuccess) return rc;   // the tile kernel owns the output
@@ -808,7 +838,7 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     // `__syncwarp()` plus lane-0 fold cost more than the coalescing saves
     // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s).  Keep the thread-per-row
     // kernel for tokens > 1, where each token already fills the SMs.
-    if (tokens == 1) {
+    if (tokens <= q35_coop_max_tokens()) {
         // K-split kernel first: it needs a type with a `_part` body and a block
         // whose sub-block count divides `SPLIT` evenly.  `q35_split()` returns
         // the wanted lane count; clamp to the largest divisor of the type's unit
