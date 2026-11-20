@@ -109,6 +109,20 @@ pub fn generate(
 
     const t_prefill = Io.Clock.Timestamp.now(io, .awake);
     _ = drv.prefill(prompt);
+    // `$QWEN35_PREFILL_SYNC`: a device backend submits the chunk's kernels
+    // asynchronously, so the wall clock above stops as soon as the LAST launch
+    // is queued -- on CUDA that reported "892 tokens in 0.007 s".  `sample` is
+    // the first call that must read a result back (it downloads the token id),
+    // so it is also the first point where the device is known to be idle.
+    // Doing it here makes the timer measure the prefill instead of the
+    // submission, and the sampled token is kept so the loop below does not
+    // re-draw it.
+    var pre_sampled: ?u32 = null;
+    if (@import("../cudart.zig").environ_map != null and
+        @import("../cudart.zig").environ_map.?.get("QWEN35_PREFILL_SYNC") != null)
+    {
+        pre_sampled = drv.sample();
+    }
     const prefill_ms = @as(f64, @floatFromInt(
         t_prefill.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds,
     )) / 1e6;
@@ -121,7 +135,7 @@ pub fn generate(
     var hit_eos = false;
     var hit_context_limit = false;
 
-    var next: u32 = drv.sample();
+    var next: u32 = pre_sampled orelse drv.sample();
     while (generated < n_predict) {
         if (pos >= ctx_max) {
             hit_context_limit = true;

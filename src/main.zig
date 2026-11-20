@@ -412,9 +412,16 @@ fn runInferenceQwen3(
     out: *Io.Writer,
     err_out: *Io.Writer,
 ) !void {
-    if (spec_draft or spec_gen or spec_trace or g_dump_path != null) {
+    // `spec_draft` (the stage-3 self-check: load the draft and run its forward
+    // against a real target chunk) is supported here now: `engines/qwen3.zig`
+    // grew `specTapEnable`/`specTapPlane`/`maxSeqForSpec`/`lmHead` and the tap
+    // hook in both forward paths.  `spec_gen` (the full speculative decode
+    // loop) is NOT ported yet, so that flag is still refused rather than
+    // silently ignored.
+    if (spec_gen or spec_trace or g_dump_path != null) {
         try err_out.print(
-            "error: speculative-decoding and draft-dump flags are Qwen3.5-only; this file is a qwen3 model\n",
+            "error: the speculative decode loop and draft-dump flags are Qwen3.5-only; " ++
+                "this file is a qwen3 model (QWEN35_SPEC_DRAFT is supported)\n",
             .{},
         );
         try err_out.flush();
@@ -464,6 +471,149 @@ fn runInferenceQwen3(
         StreamCtx.onToken,
         &stream_ctx,
     );
+
+    // ---- `QWEN35_SPEC_DRAFT`: is the DSpine draft numerically alive on THIS
+    // target? -------------------------------------------------------------
+    //
+    // The narrow question this answers, and why it is worth a separate mode:
+    // the draft consumes the target's hidden state at five fixed layers, so a
+    // target/draft mismatch (hidden width, tap layer indices, vocabulary) is
+    // the most likely failure of a fresh pairing and it is SILENT -- the
+    // forward still runs, it just produces a meaningless block.  So: run a real
+    // target chunk, copy its tap planes out, and push them through the draft's
+    // 5-layer forward.  Finite, non-degenerate output from a REAL target
+    // context is the evidence that the pairing is wired correctly.
+    //
+    // It does NOT measure acceptance -- that needs the decode loop, which this
+    // engine does not have yet.
+    if (spec_draft) {
+        if (draft_path == null) {
+            try out.print("SPEC-DRAFT: set QWEN35_DRAFT to the dspine GGUF path\n", .{});
+            try out.flush();
+            return;
+        }
+        try out.print("SPEC-DRAFT loading {s}\n", .{draft_path.?});
+        const dfile = std.Io.Dir.cwd().openFile(io, draft_path.?, .{}) catch {
+            try out.print("SPEC-DRAFT: cannot open {s}\n", .{draft_path.?});
+            try out.flush();
+            return;
+        };
+        defer dfile.close(io);
+        const dstat = try dfile.stat(io);
+        var dmm = try std.Io.File.MemoryMap.create(io, dfile, .{
+            .len = @intCast(dstat.size),
+            .protection = .{ .read = true },
+        });
+        defer dmm.destroy(io);
+        var dg = try houtou.gguf.parse(arena, dmm.memory);
+        defer dg.deinit();
+
+        const er = e.embedRows() catch {
+            try out.print("SPEC-DRAFT: target embedding is not quantized\n", .{});
+            try out.flush();
+            return;
+        };
+        const draft_kind: houtou.dspine_bridge.Kind =
+            draft_backend_override orelse (if (e.backendKind() == .cuda) .cuda else .cpu);
+        try out.print("SPEC-DRAFT backend={s}\n", .{@tagName(draft_kind)});
+        var dr = houtou.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), draft_kind, io, tapl_shift_override) catch |de| {
+            try out.print("SPEC-DRAFT load failed: {s}\n", .{@errorName(de)});
+            try out.flush();
+            return;
+        };
+        defer dr.deinit();
+        const dc = &dr.cfg;
+        try out.print(
+            "SPEC-DRAFT cfg layers={d} hidden={d} ffn={d} heads={d} kv={d} hd={d} " ++
+                "R={d} C={d} V={d} block={d} top_k={d}\n",
+            .{ dc.n_layers, dc.hidden, dc.ffn, dc.heads, dc.kv_heads, dc.hd, dc.rank, dc.code_len, dc.vocab, dc.block_size, dc.top_k },
+        );
+        try out.print("SPEC-DRAFT target_layers:", .{});
+        for (dc.target_layers) |tl| try out.print(" {d}", .{tl});
+        try out.print("\n", .{});
+
+        // Cross-check the pairing BEFORE running anything: the draft's tap
+        // indices must be real layers of THIS model, and its hidden width must
+        // match.  A mismatch here is the failure mode this mode exists for.
+        if (dc.hidden != e.cfg.hidden) {
+            try out.print("SPEC-DRAFT MISMATCH: draft hidden={d}, target hidden={d}\n", .{ dc.hidden, e.cfg.hidden });
+            try out.flush();
+            return;
+        }
+        if (dc.vocab != e.cfg.vocab) {
+            try out.print("SPEC-DRAFT MISMATCH: draft vocab={d}, target vocab={d}\n", .{ dc.vocab, e.cfg.vocab });
+            try out.flush();
+            return;
+        }
+        for (dc.target_layers) |tl| {
+            if (tl >= e.cfg.n_layers) {
+                try out.print("SPEC-DRAFT MISMATCH: tap layer {d} >= target layers {d}\n", .{ tl, e.cfg.n_layers });
+                try out.flush();
+                return;
+            }
+        }
+        try out.print("SPEC-DRAFT pairing OK (hidden {d}, vocab {d}, taps within {d} layers)\n", .{ dc.hidden, dc.vocab, e.cfg.n_layers });
+
+        // A real target chunk: the tap planes the draft will actually see.
+        e.reset();
+        e.specTapEnable(dc.target_layers) catch |te| {
+            try out.print("SPEC-DRAFT specTapEnable failed: {s}\n", .{@errorName(te)});
+            try out.flush();
+            return;
+        };
+        const toks = [_]u32{ 9707, 11, 220, 16, 2360, 13, 24, 271 };
+        const rows: usize = toks.len;
+        _ = e.forwardChunk(&toks, 0);
+        const ntap = dc.target_layers.len;
+        const tap = try arena.alloc(f32, ntap * toks.len * dc.hidden);
+        for (0..ntap) |ti| e.specTapPlaneToHost(tap[ti * toks.len * dc.hidden ..][0 .. toks.len * dc.hidden], ti, toks.len);
+
+        // Tap magnitudes: the draft was trained on a residual stream of a
+        // particular scale, so a wildly different rms here is the other silent
+        // mismatch (e.g. tapping the pre-norm value, or the wrong layer).
+        for (0..ntap) |ti| {
+            var ss: f64 = 0;
+            for (tap[ti * toks.len * dc.hidden ..][0 .. toks.len * dc.hidden]) |v| ss += @as(f64, v) * @as(f64, v);
+            try out.print("SPEC-DRAFT tap[{d}] (layer {d}) rms={d:.6}\n", .{
+                ti, dc.target_layers[ti],
+                @sqrt(ss / @as(f64, @floatFromInt(toks.len * dc.hidden))),
+            });
+        }
+
+        // The draft forward itself, on those planes.  Call order is the one the
+        // real loop uses (`main.zig`'s draft callback): project the context,
+        // feed `block_size` rows, then ask for the chain.
+        dr.disable_bridge = draft_nobridge;
+        dr.projectContext(tap, rows);
+        var rb: usize = 0;
+        while (rb < dc.block_size) : (rb += 1) {
+            // Row 0 is the anchor (the target's last committed id); every other
+            // row is the mask token, exactly like the decoder's block input.
+            const row_tok: u32 = if (rb == 0) toks[toks.len - 1] else dc.mask_token_id;
+            dr.forwardToken(row_tok, rb, @intCast(rows + rb));
+        }
+        const chain = dr.serialRound(dc.block_size) catch |de| {
+            try out.print("SPEC-DRAFT forward failed: {s}\n", .{@errorName(de)});
+            try out.flush();
+            return;
+        };
+        try out.print("SPEC-DRAFT block ids:", .{});
+        for (chain) |id| try out.print(" {d}", .{id});
+        try out.print("\n", .{});
+        var distinct: usize = 0;
+        for (chain, 0..) |id, i| {
+            var seen = false;
+            for (chain[0..i]) |prev| if (prev == id) {
+                seen = true;
+            };
+            if (!seen) distinct += 1;
+        }
+        try out.print("SPEC-DRAFT distinct={d}/{d} -> {s}\n", .{
+            distinct, chain.len, if (distinct > 1) "non-degenerate" else "DEGENERATE",
+        });
+        try out.flush();
+        return;
+    }
 
     // `common.generate` returns the ids we already streamed; anything it left
     // (a wrong-id probe) is printed here the same way the Qwen3.5 path does.

@@ -107,6 +107,32 @@ pub const Engine = struct {
     max_ctx: u32 = 0,
     n_batch: u32 = 0,
 
+    // ---- speculative-decoding taps (DSpine draft) ----
+    //
+    // The draft consumes the target's hidden state at a fixed set of layer
+    // indices (`dflash_config.target_layer_ids`, `[1,9,17,25,33]` for this
+    // model) and never looks at any other layer.  `forwardChunk` and
+    // `forwardLogits` copy those layers' OUTPUT hidden state into
+    // `tap_hidden`, which the draft's `fc` projection turns into its context.
+    //
+    // LAYOUT: `tap_hidden` is `tap_layers.len * n_batch * hidden`, one
+    // `n_batch * hidden` plane per tap.  The `n_batch` stride (not the chunk
+    // length) is so a short final chunk still lands at a fixed offset.
+    //
+    // Disabled by default (`Buf.empty`), so the normal path pays one usize
+    // compare per layer.  This is the same contract as the Qwen3.5 engine; the
+    // only structural difference is that there is no GDN state to snapshot.
+    tap_layers: []const u32 = &.{},
+    tap_hidden: Buf = Buf.empty,
+    /// Rolling tap ring for the spec context window (`specRingEnable`).
+    ring: []f32 = &.{},
+    ring_ctx: usize = 0,
+    ring_next: usize = 0,
+    ring_filled: usize = 0,
+    /// Per-layer state snapshot for spec rollback.  Qwen3 has no recurrent
+    /// state, so a snapshot is only the KV lengths.
+    spec_snap: []usize = &.{},
+
     pub const max_seq = 40960;
 
     const LayerWeights = struct {
@@ -333,6 +359,80 @@ pub const Engine = struct {
         for (self.kv) |*c| c.len = 0;
     }
 
+    // -----------------------------------------------------------------------
+    // Speculative-decoding support (DSpine draft)
+    // -----------------------------------------------------------------------
+
+    /// Enable the tap planes the draft's `fc` projection reads.
+    ///
+    /// `layers` must be ascending and every index must be a real decoder layer;
+    /// the draft's `target_layer_ids` are checked against this model at load
+    /// time, so a mismatch is a named error here rather than a silently wrong
+    /// hidden state later.
+    pub fn specTapEnable(self: *Engine, layers: []const u32) !void {
+        self.tap_layers = &.{};
+        self.tap_hidden = Buf.empty;
+        if (layers.len == 0) return;
+        // A zero-sized plane would silently disable the taps; refusing is what
+        // the Qwen3.5 engine does for the same reason.
+        if (self.n_batch == 0) return error.BatchingDisabled;
+        var prev: u32 = 0;
+        for (layers, 0..) |l, i| {
+            if (l >= self.cfg.n_layers) return error.TapLayerOutOfRange;
+            if (i > 0 and l <= prev) return error.TapLayersNotAscending;
+            prev = l;
+        }
+        self.tap_hidden = try self.exec.allocBuf(layers.len * self.n_batch * self.cfg.hidden);
+        // Copy the indices: the caller's slice may be a temporary.
+        const owned = try self.alloc.dupe(u32, layers);
+        self.tap_layers = owned;
+    }
+
+    /// Plane `i` of the tap buffer, `rows` rows (`hidden` floats each).
+    pub fn specTapPlane(self: *const Engine, i: usize, rows: usize) Buf {
+        std.debug.assert(i < self.tap_layers.len);
+        std.debug.assert(rows <= self.n_batch);
+        return self.tap_hidden.span(i * self.n_batch * self.cfg.hidden, rows * self.cfg.hidden);
+    }
+
+    /// Copy tap plane `i`'s first `rows` rows into HOST slice `dst`.
+    ///
+    /// `copyOut`, not `copyRange`: the destination is host memory and
+    /// `copyRange` infers direction from the source alone, so a device source
+    /// with a host destination would be issued as a device-to-device move.
+    pub fn specTapPlaneToHost(self: *Engine, dst: []f32, i: usize, rows: usize) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(dst.len >= rows * hidden);
+        self.exec.copyOut(dst[0 .. rows * hidden], self.specTapPlane(i, rows));
+    }
+
+    /// Sequence length the draft's own KV may use (it shares the target's
+    /// caps: a draft row never outlives the target row it predicts).
+    pub fn maxSeqForSpec(self: *const Engine) usize {
+        return self.max_ctx;
+    }
+
+    /// The target's lm_head as a `LinearW`, for the draft's candidate scoring.
+    /// The draft carries no copy of the vocabulary projection.
+    pub fn lmHead(self: *const Engine) LinearW {
+        return self.output_weight orelse self.token_embd;
+    }
+
+    /// Which backend this engine drives (debug/verification helpers use it).
+    pub fn backendKind(self: *const Engine) backend.Kind {
+        return self.backend_kind;
+    }
+
+    /// The token embedding as a packed row set.  The draft expands its `fc`
+    /// input through this, so a model whose embedding is plain f32 has to say
+    /// so rather than hand back a reinterpretation of f32 bytes.
+    pub fn embedRows(self: *const Engine) !gguf.QuantRow {
+        return switch (self.token_embd) {
+            .quant => |qrow| qrow,
+            .f32 => error.EmbeddingNotQuantized,
+        };
+    }
+
     pub fn embedTo(self: *Engine, token: u32, dst: Buf) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len == hidden);
@@ -399,6 +499,22 @@ pub const Engine = struct {
         self.exec.swiglu(self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
         self.exec.matvec(self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
         self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
+
+        // Speculative-decoding tap: this layer's OUTPUT hidden state, written
+        // after BOTH residual adds so it is the value the next layer's norm
+        // consumes -- the same point the Qwen3.5 engine taps, and what DSpine's
+        // `fc` projection was trained on.
+        if (self.tap_hidden.len != 0) {
+            for (self.tap_layers, 0..) |tl, ti| {
+                if (tl == @as(u32, @intCast(li))) {
+                    self.exec.copyRange(
+                        self.tap_hidden.span(ti * self.n_batch * hidden, hidden),
+                        self.x.span(0, hidden),
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     pub fn forwardLogits(self: *Engine, token: u32, pos: u32) Buf {
@@ -530,6 +646,20 @@ pub const Engine = struct {
             self.exec.swiglu(self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
             self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
             self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+
+            // Twin of `layerForward`'s tap, for the batched path: the whole
+            // chunk's rows at once (they are contiguous, so one copy).
+            if (self.tap_hidden.len != 0) {
+                for (self.tap_layers, 0..) |tl, ti| {
+                    if (tl == @as(u32, @intCast(li))) {
+                        self.exec.copyRange(
+                            self.tap_hidden.span(ti * self.n_batch * hidden, k * hidden),
+                            self.xK.span(0, k * hidden),
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         // Last token's logits on the serial tail, so the first sampled logits

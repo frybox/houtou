@@ -57,7 +57,16 @@ def main() -> None:
     FFN = int(cfg["intermediate_size"])
     V = int(cfg["vocab_size"])
     T = int(cfg["block_size"])
-    K = int(cfg["code_bridge_second_pass"]["head_topk"])
+    # `head_topk` (the serial-refinement selector width) lives in TWO places
+    # depending on the checkpoint: the 27B has a top-level
+    # `code_bridge_second_pass`, the 8B does not and keeps the same 16 in
+    # `dflash_config.selected_prefix_last_write_refine`.  Both are the selector
+    # width `src/draft.zig` reads as `dflash.selector_top_k`; prefer the
+    # top-level one when present and fall back to the dflash copy, so the same
+    # script converts either checkpoint without a per-model table.
+    second = cfg.get("code_bridge_second_pass") or {}
+    K = int(second.get("head_topk") or
+            df["selected_prefix_last_write_refine"]["head_topk"])
     TAPS = [int(x) for x in df["target_layer_ids"]]
     R = int(bridge["rank"])
     C = int(bridge["code_size"])
