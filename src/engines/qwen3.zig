@@ -131,7 +131,14 @@ pub const Engine = struct {
     ring_filled: usize = 0,
     /// Per-layer state snapshot for spec rollback.  Qwen3 has no recurrent
     /// state, so a snapshot is only the KV lengths.
-    spec_snap: []usize = &.{},
+    spec_snap: []u32 = &.{},
+    /// `$QWEN35_SPEC_TRACE`: print each round's first proposal next to the
+    /// target's own pick.  Purely diagnostic; set by `main.zig`.
+    spec_trace_dbg: bool = false,
+    /// `$QWEN35_SPEC_POSSTAT`: how far down each block the verifier got.
+    spec_pos_reached: [64]usize = @splat(0),
+    /// Wall time of the last prefill, reported by `generateSpec`.
+    prefill_ms: f64 = 0,
 
     pub const max_seq = 40960;
 
@@ -418,9 +425,155 @@ pub const Engine = struct {
         return self.output_weight orelse self.token_embd;
     }
 
+    /// `lm_head @ x` where `x` is a HOST row (the draft's candidate scorer
+    /// works on host activations).  Same contract as the Qwen3.5 engine's.
+    pub fn lmHeadFromHostRow(self: *Engine, out: []f32, x: []const f32) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(x.len == hidden);
+        std.debug.assert(out.len >= self.cfg.vocab);
+        // `x1` is engine scratch at least `hidden` wide and is rewritten by
+        // every forward anyway, so borrowing it needs no new allocation.
+        const row = self.x1.span(0, hidden);
+        self.exec.copyFromHost(row, x[0..hidden]);
+        switch (self.output_weight orelse self.token_embd) {
+            .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, row),
+        }
+        self.exec.copyOut(out[0..self.cfg.vocab], self.logits);
+    }
+
+    // ---- spec snapshot / rollback ----
+    //
+    // Qwen3 is a plain dense decoder: the ONLY cross-token state is the KV
+    // cache, so "what was the state at position p" is exactly "how long was
+    // each cache".  That is why this is three lines here and a whole
+    // conv+delta-matrix copy on the Qwen3.5 engine -- there is no GDN.
+    //
+    // Restoring is therefore exact and needs no replay: truncating a cache to
+    // its old length leaves rows `[0, len)` untouched, which are the same bytes
+    // the model would have had without the speculative block.
+
+    /// Allocate the per-layer snapshot.  One entry per layer (the spec block
+    /// never runs the nextn slot, and this engine has none).
+    pub fn specSnapshotAlloc(self: *Engine, alloc: std.mem.Allocator) !void {
+        if (self.spec_snap.len > 0) return;
+        const snaps = try alloc.alloc(u32, self.kv.len);
+        for (snaps, 0..) |*s, i| s.* = self.kv[i].len;
+        self.spec_snap = snaps;
+    }
+
+    /// Record the live KV lengths.
+    pub fn specSnapshotTake(self: *Engine) void {
+        for (self.spec_snap, 0..) |*s, i| {
+            if (i < self.kv.len) s.* = self.kv[i].len;
+        }
+    }
+
+    /// Wind the caches back to the snapshot, then advance them by `tokens.len`
+    /// rows -- the verify block was `tokens.len` long and those rows are the
+    /// ones that were accepted.
+    ///
+    /// The replay is a genuine forward pass (not just a length fix): the block
+    /// wrote KV rows for EVERY proposed token, including the rejected ones, so
+    /// the accepted prefix has to be re-written at the right slots.
+    pub fn specRollbackAndReplay(self: *Engine, tokens: []const u32, pos: u32) void {
+        for (self.spec_snap, 0..) |s, i| {
+            if (i < self.kv.len) self.kv[i].len = s;
+        }
+        for (tokens, 0..) |t, i| _ = self.forwardLogits(t, pos + @as(u32, @intCast(i)));
+    }
+
     /// Which backend this engine drives (debug/verification helpers use it).
     pub fn backendKind(self: *const Engine) backend.Kind {
         return self.backend_kind;
+    }
+
+    // ---- rolling tap ring ----
+    //
+    // The draft needs the target's hidden states for the tokens that ALREADY
+    // precede the block, not just the one being predicted.  Re-forwarding that
+    // window every round would cost `ctx_rows` target passes per round, which
+    // measured 651 s for 32 tokens on the 27B before the ring existed.  So the
+    // most recent `ctx_rows` rows of every tap plane are kept, and a round
+    // reads them instead.
+
+    /// Allocate the ring: `n_taps * ctx_rows * hidden` host f32.
+    pub fn specRingEnable(self: *Engine, alloc: std.mem.Allocator, ctx_rows: usize) !void {
+        if (self.tap_layers.len == 0) return error.TapsDisabled;
+        const need = self.tap_layers.len * ctx_rows * self.cfg.hidden;
+        if (self.ring.len < need) {
+            if (self.ring.len > 0) alloc.free(self.ring);
+            self.ring = try alloc.alloc(f32, need);
+        }
+        self.ring_ctx = ctx_rows;
+        self.ring_next = 0;
+        self.ring_filled = 0;
+    }
+
+    /// Append the current tap plane's row 0 to the ring (single-token path).
+    pub fn specRingPush(self: *Engine) void {
+        if (self.ring.len == 0) return;
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const at = self.ring_next;
+        for (0..self.tap_layers.len) |ti| {
+            const src = self.tap_hidden.span(ti * self.n_batch * hidden, hidden);
+            const dst = self.ring[ti * ctx * hidden + at * hidden ..][0..hidden];
+            self.exec.copyOut(dst, src);
+        }
+        self.ring_next = (at + 1) % ctx;
+        if (self.ring_filled < ctx) self.ring_filled += 1;
+    }
+
+    /// Fill the ring from the chunk that just ran, oldest-first, keeping the
+    /// last `ctx_rows` rows.
+    pub fn specRingFillFromChunk(self: *Engine, rows: usize, pos0: u32) void {
+        _ = pos0;
+        if (self.ring.len == 0 or rows == 0) return;
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const take = @min(rows, ctx);
+        const skip = rows - take;
+        for (0..take) |r| {
+            const at = (self.ring_next + r) % ctx;
+            for (0..self.tap_layers.len) |ti| {
+                const src = self.tap_hidden.span(ti * self.n_batch * hidden + (skip + r) * hidden, hidden);
+                self.exec.copyOut(self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
+            }
+        }
+        self.ring_next = (self.ring_next + take) % ctx;
+        self.ring_filled = @min(self.ring_filled + take, ctx);
+    }
+
+    /// How many tokens one `forwardChunk` call can take (`0` = unbatched).
+    pub fn batchLimit(self: *const Engine) usize {
+        return self.n_batch;
+    }
+
+    /// How many rows the ring currently holds (`<= ctx_rows`).
+    pub fn specRingFilled(self: *const Engine) usize {
+        return self.ring_filled;
+    }
+
+    /// Copy the ring's contents into `out` (`n_taps * ctx_rows * hidden`),
+    /// oldest-first, zero-padding any unfilled slots at the front.
+    pub fn specRingRead(self: *Engine, out: []f32) void {
+        const hidden: usize = self.cfg.hidden;
+        const ctx = self.ring_ctx;
+        const nt = self.tap_layers.len;
+        const n = self.ring_filled;
+        const start = (self.ring_next + ctx - n) % ctx;
+        @memset(out[0 .. nt * ctx * hidden], 0);
+        const pad = ctx - n;
+        for (0..nt) |ti| {
+            for (0..n) |r| {
+                const src_at = (start + r) % ctx;
+                @memcpy(
+                    out[ti * ctx * hidden + (pad + r) * hidden ..][0..hidden],
+                    self.ring[ti * ctx * hidden + src_at * hidden ..][0..hidden],
+                );
+            }
+        }
     }
 
     /// The token embedding as a packed row set.  The draft expands its `fc`
@@ -675,6 +828,180 @@ pub const Engine = struct {
             self.exec.matvec(self.logits, self.token_embd, normed);
         }
         return self.logits;
+    }
+
+    /// The draft callback contract (same shape as the Qwen3.5 engine's).
+    pub const DraftFn = *const fn (
+        ctx: *anyopaque,
+        context: []const u32,
+        anchor: u32,
+        block_pos: u32,
+        out: []u32,
+    ) usize;
+
+    /// Speculative decoding: the draft proposes a block, the target verifies it
+    /// with its ORDINARY per-token forward, and only the accepted prefix is
+    /// committed.
+    ///
+    /// WHY THE VERIFY REUSES `forwardLogits`: an accepted block must produce
+    /// exactly the tokens plain greedy decode would have.  Verifying with any
+    /// bespoke argmax walk over a batched forward would make the accepted path
+    /// depend on a different set of kernels, so a "correct" run and a plain run
+    /// could disagree -- and the spec counters would then be measuring the
+    /// verifier, not the draft.
+    ///
+    /// CORRECTNESS OF ROLLBACK: the verify loop writes KV rows for every
+    /// proposed token, including the rejected ones.  `specSnapshotTake` records
+    /// the cache lengths before the block, and `specRollbackAndReplay` truncates
+    /// back to them and re-runs the accepted prefix.  That is exact here because
+    /// a KV cache is append-only and Qwen3 has no other cross-token state.
+    pub fn generateSpec(
+        self: *Engine,
+        alloc: std.mem.Allocator,
+        prompt: []const u32,
+        n_predict: usize,
+        draft_fn: DraftFn,
+        draft_ctx: *anyopaque,
+        max_draft: usize,
+        ctx_rows: usize,
+        progress: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
+        progress_ctx: ?*anyopaque,
+    ) !common.GenResult {
+        self.sampler.reseed();
+        self.reset();
+        if (prompt.len >= self.max_ctx) {
+            std.debug.print(
+                "generateSpec: prompt is {d} tokens, but the context holds {d}\n",
+                .{ prompt.len, self.max_ctx },
+            );
+            return error.ContextLengthExceeded;
+        }
+
+        const io = self.io;
+        self.exec.profReset();
+        self.exec.profPhase(true);
+        const t_start = Io.Clock.Timestamp.now(io, .awake);
+
+        var last_logits: Buf = Buf.empty;
+        var i: usize = 0;
+        const cap: usize = if (self.n_batch == 0) 1 else @intCast(self.n_batch);
+        while (i < prompt.len) {
+            const n = @min(cap, prompt.len - i);
+            last_logits = self.forwardChunk(prompt[i..][0..n], @intCast(i));
+            i += n;
+        }
+        const t_after = Io.Clock.Timestamp.now(io, .awake);
+        self.prefill_ms = @as(f64, @floatFromInt(t_start.durationTo(t_after).raw.nanoseconds)) / 1e6;
+        self.exec.profPrefillEnd();
+
+        // The prompt's own hidden states are the draft's first context window;
+        // without this the first round drafts from a single row and nothing it
+        // proposes can be right.
+        if (self.n_batch != 0) self.specRingFillFromChunk(prompt.len, 0);
+
+        try self.specSnapshotAlloc(alloc);
+
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(alloc);
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(alloc);
+        try history.appendSlice(alloc, prompt);
+
+        var pos: u32 = @intCast(prompt.len);
+        var generated: usize = 0;
+        var gen_ns: i96 = 0;
+        var hit_eos = false;
+        var hit_context_limit = false;
+        var next: u32 = self.exec.sample(last_logits, self.sample_scratch, &self.sampler);
+        var proposed_total: usize = 0;
+        var accepted_total: usize = 0;
+        var rounds: usize = 0;
+
+        const draft_buf = try alloc.alloc(u32, max_draft);
+        defer alloc.free(draft_buf);
+
+        while (generated < n_predict) {
+            if (pos >= self.max_ctx) {
+                hit_context_limit = true;
+                break;
+            }
+            if (next == self.cfg.eos_token_id) {
+                hit_eos = true;
+                break;
+            }
+            try out.append(alloc, next);
+            try history.append(alloc, next);
+            if (progress) |f| f(progress_ctx, next);
+
+            const t0 = Io.Clock.Timestamp.now(io, .awake);
+            const block_pos = pos + 1;
+            const room = @min(max_draft, @min(n_predict - generated - 1, self.max_ctx - block_pos));
+
+            var advanced: usize = 1;
+            var verified = false;
+            if (room > 0) {
+                const from = if (history.items.len > ctx_rows) history.items.len - ctx_rows else 0;
+                const n_draft = draft_fn(draft_ctx, history.items[from..], next, block_pos, draft_buf[0..room]);
+                if (n_draft > 0) {
+                    rounds += 1;
+                    proposed_total += n_draft;
+                    verified = true;
+
+                    self.specSnapshotTake();
+                    var logits = self.forwardLogits(next, pos);
+                    self.specRingPush();
+                    var committed: usize = 0;
+                    var pending: u32 = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    if (self.spec_trace_dbg) {
+                        std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
+                            pos, next, draft_buf[0], pending, n_draft,
+                        });
+                    }
+                    while (committed < n_draft) : (committed += 1) {
+                        const cand = draft_buf[committed];
+                        if (pending != cand) break;
+                        if (generated + 1 + committed >= n_predict) break;
+                        try out.append(alloc, cand);
+                        try history.append(alloc, cand);
+                        if (progress) |f| f(progress_ctx, cand);
+                        const row_pos = block_pos + @as(u32, @intCast(committed));
+                        logits = self.forwardLogits(cand, row_pos);
+                        self.specRingPush();
+                        pending = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    }
+                    accepted_total += committed;
+                    if (committed < self.spec_pos_reached.len) self.spec_pos_reached[committed] += 1;
+                    if (committed > 0) {
+                        self.specRollbackAndReplay(draft_buf[0..committed], block_pos);
+                    }
+                    advanced = committed + 1;
+                    next = pending;
+                }
+            }
+            if (advanced == 1 and !verified) {
+                next = self.step(next, pos);
+                self.specRingPush();
+            }
+            pos += @as(u32, @intCast(advanced));
+            generated += advanced;
+            gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        }
+        self.exec.profPhase(false);
+        const per: f64 = if (out.items.len > 0)
+            @as(f64, @floatFromInt(gen_ns)) / 1e6 / @as(f64, @floatFromInt(out.items.len))
+        else
+            0;
+        return .{
+            .tokens = try out.toOwnedSlice(alloc),
+            .prefill_ms = self.prefill_ms,
+            .ms_per_token = per,
+            .decode_ms = @as(f64, @floatFromInt(gen_ns)) / 1e6,
+            .hit_eos = hit_eos,
+            .hit_context_limit = hit_context_limit,
+            .spec_proposed = proposed_total,
+            .spec_accepted = accepted_total,
+            .spec_rounds = rounds,
+        };
     }
 
     /// Greedy generation through the shared driver loop

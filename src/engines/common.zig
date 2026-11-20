@@ -76,6 +76,12 @@ pub const GenResult = struct {
     ms_per_token: f64,
     hit_eos: bool,
     hit_context_limit: bool,
+    /// Speculative-decoding counters.  Zero for a plain run; `rounds == 0` is
+    /// how a caller tells "no drafting happened" from "drafting happened and
+    /// nothing was accepted".
+    spec_proposed: usize = 0,
+    spec_accepted: usize = 0,
+    spec_rounds: usize = 0,
 };
 
 /// Prompt in, generated ids out.  Greedy or sampled depending on the engine's

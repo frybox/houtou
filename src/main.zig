@@ -25,6 +25,31 @@ const gguf = houtou.gguf;
 /// only known after verification, so its cache would hold rows the target
 /// rejected.  Re-running is `ctx_rows` tokens of TARGET prefill per round, which
 /// is exactly what makes a small `ctx_rows` the right default.
+/// Tap-ring accessors, type-erased for `DraftRunner` (see its `e` field).
+/// One pair per engine; they exist only because the two engines are distinct
+/// structs with the same ring contract.
+fn ringFilledQwen35(ctx: *anyopaque) usize {
+    const e: *houtou.engine.Engine = @ptrCast(@alignCast(ctx));
+    return e.specRingFilled();
+}
+fn ringReadQwen35(ctx: *anyopaque, out: []f32) void {
+    const e: *houtou.engine.Engine = @ptrCast(@alignCast(ctx));
+    e.specRingRead(out);
+}
+fn lmHeadHookQwen3(ctx: *anyopaque, out: []f32, x: []const f32) void {
+    const e: *houtou.engines.qwen3.Engine = @ptrCast(@alignCast(ctx));
+    e.lmHeadFromHostRow(out, x);
+}
+
+fn ringFilledQwen3(ctx: *anyopaque) usize {
+    const e: *houtou.engines.qwen3.Engine = @ptrCast(@alignCast(ctx));
+    return e.specRingFilled();
+}
+fn ringReadQwen3(ctx: *anyopaque, out: []f32) void {
+    const e: *houtou.engines.qwen3.Engine = @ptrCast(@alignCast(ctx));
+    e.specRingRead(out);
+}
+
 /// `Draft.lm_head_matvec` hook: `out = lm_head @ x` on the TARGET's backend.
 fn lmHeadHook(ctx: *anyopaque, out: []f32, x: []const f32) void {
     const e: *houtou.engine.Engine = @ptrCast(@alignCast(ctx));
@@ -32,7 +57,13 @@ fn lmHeadHook(ctx: *anyopaque, out: []f32, x: []const f32) void {
 }
 
 const DraftRunner = struct {
-    e: *houtou.engine.Engine,
+    /// The target engine, type-erased: the Qwen3.5 and Qwen3 engines are
+    /// distinct structs, and everything this runner needs from them is the
+    /// tap ring (below).  Two function pointers are cheaper to carry than a
+    /// generic instantiation of the whole runner.
+    e: *anyopaque,
+    ring_filled_fn: *const fn (ctx: *anyopaque) usize,
+    ring_read_fn: *const fn (ctx: *anyopaque, out: []f32) void,
     dr: *houtou.draft.Draft,
     io: Io,
     /// Trailing committed ids fed to the draft's `fc` projection.
@@ -62,9 +93,9 @@ const DraftRunner = struct {
         // planes; `specRingPush` moved them here.  `context` is only used to
         // size the window (and to fill the block's placeholder rows with real
         // text instead of one repeated id).
-        const n_ctx = @min(self.e.specRingFilled(), self.ctx_rows);
+        const n_ctx = @min(self.ring_filled_fn(self.e), self.ctx_rows);
         if (n_ctx == 0) return 0;
-        self.e.specRingRead(self.tap);
+        self.ring_read_fn(self.e, self.tap);
 
         // ---- draft forward over the block ----
         self.dr.reset();
@@ -412,16 +443,14 @@ fn runInferenceQwen3(
     out: *Io.Writer,
     err_out: *Io.Writer,
 ) !void {
-    // `spec_draft` (the stage-3 self-check: load the draft and run its forward
-    // against a real target chunk) is supported here now: `engines/qwen3.zig`
-    // grew `specTapEnable`/`specTapPlane`/`maxSeqForSpec`/`lmHead` and the tap
-    // hook in both forward paths.  `spec_gen` (the full speculative decode
-    // loop) is NOT ported yet, so that flag is still refused rather than
-    // silently ignored.
-    if (spec_gen or spec_trace or g_dump_path != null) {
+    // Both speculative modes are supported on this engine now: `spec_draft`
+    // (the draft/target pairing self-check) and `spec_gen` (the full
+    // speculative decode loop, `engines/qwen3.zig`'s `generateSpec`).  The
+    // activation-dump sink (`g_dump_path`) is Qwen3.5-only: it is wired into
+    // the draft's per-stage emitter, which this path does not install.
+    if (g_dump_path != null) {
         try err_out.print(
-            "error: the speculative decode loop and draft-dump flags are Qwen3.5-only; " ++
-                "this file is a qwen3 model (QWEN35_SPEC_DRAFT is supported)\n",
+            "error: QWEN35_DRAFT_DUMP is Qwen3.5-only; this file is a qwen3 model\n",
             .{},
         );
         try err_out.flush();
@@ -462,7 +491,85 @@ fn runInferenceQwen3(
     try out.flush();
 
     var stream_ctx = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
-    const res = try houtou.engines.common.generate(
+    const res = if (spec_gen and draft_path != null) blk: {
+        // Speculative decoding.  Same shape as the Qwen3.5 path; the pieces it
+        // does not have (candidate-recall scoring, the per-stage activation
+        // dump) are Qwen3.5-only diagnostics and are simply not wired here.
+        const dfile = std.Io.Dir.cwd().openFile(io, draft_path.?, .{}) catch {
+            try out.print("\n[spec: cannot open the draft gguf; falling back to plain decode]\n", .{});
+            break :blk try houtou.engines.common.generate(
+                e.driver(), arena, io, prompt, n_predict, StreamCtx.onToken, &stream_ctx,
+            );
+        };
+        defer dfile.close(io);
+        const dstat = try dfile.stat(io);
+        var dmm = try std.Io.File.MemoryMap.create(io, dfile, .{
+            .len = @intCast(dstat.size),
+            .protection = .{ .read = true },
+        });
+        defer dmm.destroy(io);
+        var dg = try houtou.gguf.parse(arena, dmm.memory);
+        defer dg.deinit();
+        const er = e.embedRows() catch break :blk try houtou.engines.common.generate(
+            e.driver(), arena, io, prompt, n_predict, StreamCtx.onToken, &stream_ctx,
+        );
+        const kind: houtou.dspine_bridge.Kind =
+            draft_backend_override orelse (if (e.backendKind() == .cuda) .cuda else .cpu);
+        var dr = houtou.draft.load(arena, &dg, er, e.lmHead(), e.maxSeqForSpec(), kind, io, tapl_shift_override) catch |de| {
+            try out.print("\n[spec: draft load failed ({s}); falling back to plain decode]\n", .{@errorName(de)});
+            break :blk try houtou.engines.common.generate(
+                e.driver(), arena, io, prompt, n_predict, StreamCtx.onToken, &stream_ctx,
+            );
+        };
+        defer dr.deinit();
+        const dc = &dr.cfg;
+        dr.disable_bridge = draft_nobridge;
+        // Candidate scoring borrows the TARGET's lm_head (the draft has none).
+        dr.lm_head_matvec = lmHeadHookQwen3;
+        dr.lm_head_ctx = &e;
+
+        e.specTapEnable(dc.target_layers) catch {
+            try out.print("\n[spec: tap enable failed; falling back to plain decode]\n", .{});
+            break :blk try houtou.engines.common.generate(
+                e.driver(), arena, io, prompt, n_predict, StreamCtx.onToken, &stream_ctx,
+            );
+        };
+        // The ring is fed from one `forwardChunk`'s tap planes, so its width is
+        // bounded by the prefill chunk width.
+        const ctx_rows = @min(spec_ctxrows_override orelse dc.block_size, e.batchLimit());
+        e.specRingEnable(arena, ctx_rows) catch {
+            try out.print("\n[spec: ring enable failed; falling back to plain decode]\n", .{});
+            break :blk try houtou.engines.common.generate(
+                e.driver(), arena, io, prompt, n_predict, StreamCtx.onToken, &stream_ctx,
+            );
+        };
+        e.spec_trace_dbg = spec_trace;
+        const tap_buf = try arena.alloc(f32, dc.target_layers.len * ctx_rows * dc.hidden);
+        const toks = try arena.alloc(u32, dc.block_size);
+        var runner = DraftRunner{
+            .e = @ptrCast(&e),
+            .ring_filled_fn = ringFilledQwen3,
+            .ring_read_fn = ringReadQwen3,
+            .dr = &dr,
+            .io = io,
+            .ctx_rows = ctx_rows,
+            .tap = tap_buf,
+            .toks = toks,
+        };
+        try out.print("\n[spec: draft={s} block={d} ctx_rows={d}]\n", .{ @tagName(kind), dc.block_size, ctx_rows });
+        try out.flush();
+        break :blk try e.generateSpec(
+            arena,
+            prompt,
+            n_predict,
+            DraftRunner.draft,
+            &runner,
+            dc.block_size - 1,
+            ctx_rows,
+            StreamCtx.onToken,
+            &stream_ctx,
+        );
+    } else try houtou.engines.common.generate(
         e.driver(),
         arena,
         io,
@@ -636,6 +743,20 @@ fn runInferenceQwen3(
         "Stop reason: context limit reached"
     else
         "Stop reason: max tokens reached"});
+    if (res.spec_rounds > 0) {
+        try out.print(
+            "Spec: rounds={d} proposed={d} accepted={d} ({d:.3} per round) -> acceptance length {d:.3}\n",
+            .{
+                res.spec_rounds,
+                res.spec_proposed,
+                res.spec_accepted,
+                @as(f64, @floatFromInt(res.spec_accepted)) / @as(f64, @floatFromInt(res.spec_rounds)),
+                // "acceptance length" as the model cards report it: tokens
+                // produced per round INCLUDING the verified one.
+                1.0 + @as(f64, @floatFromInt(res.spec_accepted)) / @as(f64, @floatFromInt(res.spec_rounds)),
+            },
+        );
+    }
     try out.flush();
 }
 
@@ -1678,7 +1799,9 @@ fn runInference(
         const tap_buf = try arena.alloc(f32, dc.target_layers.len * ctx_rows * dc.hidden);
         const toks = try arena.alloc(u32, dc.block_size);
         var runner = DraftRunner{
-            .e = &e,
+            .e = @ptrCast(&e),
+            .ring_filled_fn = ringFilledQwen35,
+            .ring_read_fn = ringReadQwen35,
             .dr = &dr,
             .io = io,
             .ctx_rows = ctx_rows,
