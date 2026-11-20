@@ -50,6 +50,74 @@ fn ringReadQwen3(ctx: *anyopaque, out: []f32) void {
     e.specRingRead(out);
 }
 
+/// MTP (nextn) draft callback: the model's OWN nextn head proposes the block.
+///
+/// Unlike the DSpine draft this needs no separate checkpoint and no code
+/// bridge -- the block ships with the target and was trained jointly with it,
+/// which is why its first-step hit rate (79.6% measured) is far above what an
+/// external drafter reaches.
+///
+/// CHAINING: one `nextnPredict` call proposes ONE token and hands back the
+/// normed hidden state it derived, so passing the same buffer as both `hidden`
+/// argument and `out_hidden` turns it into a block.  That is the whole loop;
+/// the head has no "predict k tokens" mode.
+///
+/// INPUT: the head consumes the target's `output_norm`-ed hidden row for the
+/// token at `pos`, which is `specTapNormedPlane(last_tap)` after the verify
+/// forward `generateSpec` runs each round.
+const MtpRunner = struct {
+    e: *houtou.engine.Engine,
+    /// Tap plane holding the last decoder layer (the only tap enabled here).
+    tap_index: usize,
+    /// Hidden row the chain ping-pongs through (device-side on CUDA).
+    h: houtou.backend.Buf,
+    /// Host logits scratch (`vocab`), for the argmax over a proposal.
+    logits: []f32,
+    /// How many tokens one block may propose (`block_size - 1` semantics: the
+    /// caller already sized `out`).
+    max_draft: usize,
+    rounds: usize = 0,
+
+    fn draft(ctx: *anyopaque, context: []const u32, anchor: u32, block_pos: u32, out: []u32) usize {
+        _ = context;
+        const self: *MtpRunner = @ptrCast(@alignCast(ctx));
+        const e = self.e;
+        const cfg = &e.cfg;
+        const hidden: usize = cfg.hidden;
+
+        // The anchor's normed hidden state came out of this round's verify
+        // forward.
+        const normed = e.specTapNormedPlane(self.tap_index, 1) catch return 0;
+        e.copyHiddenRowIn(self.h, normed[0..hidden]);
+
+        const n = @min(out.len, self.max_draft);
+        var tok = anchor;
+        var produced: usize = 0;
+        while (produced < n) : (produced += 1) {
+            // `h` in == `h` out: the head reads the previous row's hidden state
+            // and leaves this row's, which is what makes the chain work.
+            e.nextnPredict(self.h, tok, block_pos + @as(u32, @intCast(produced)), self.h) catch return produced;
+            e.copyLogitsToHost(self.logits) catch return produced;
+            tok = argmaxHost(self.logits);
+            out[produced] = tok;
+        }
+        self.rounds += 1;
+        return produced;
+    }
+};
+
+fn argmaxHost(v: []const f32) u32 {
+    var best: u32 = 0;
+    var bv: f32 = -std.math.inf(f32);
+    for (v, 0..) |x, i| {
+        if (x > bv) {
+            bv = x;
+            best = @intCast(i);
+        }
+    }
+    return best;
+}
+
 /// `Draft.lm_head_matvec` hook: `out = lm_head @ x` on the TARGET's backend.
 fn lmHeadHook(ctx: *anyopaque, out: []f32, x: []const f32) void {
     const e: *houtou.engine.Engine = @ptrCast(@alignCast(ctx));
@@ -266,6 +334,9 @@ var dump_ids = false;
 var spec_taps = false;
 /// `QWEN35_SPEC_NEXTN`: stage-1 self-check for the nextn/MTP drafter.
 var spec_nextn = false;
+/// `QWEN35_SPEC_MTP`: decode with the model's OWN nextn head as the drafter,
+/// instead of an external DSpine checkpoint.  No `QWEN35_DRAFT` needed.
+var spec_mtp = false;
 /// `QWEN35_SPEC_NEXTN_SEQ`: also dump the teacher-forced token sequence.
 var spec_nextn_seq = false;
 /// `QWEN35_SPEC_DRAFT`: stage-3 self-check for the DSpine draft model (load the
@@ -320,6 +391,7 @@ pub fn main(init: std.process.Init) !void {
     dump_ids = init.environ_map.get("QWEN35_DUMP_IDS") != null;
     spec_taps = init.environ_map.get("QWEN35_SPEC_TAPS") != null;
     spec_nextn = init.environ_map.get("QWEN35_SPEC_NEXTN") != null;
+    spec_mtp = init.environ_map.get("QWEN35_SPEC_MTP") != null;
     spec_nextn_seq = init.environ_map.get("QWEN35_SPEC_NEXTN_SEQ") != null;
     spec_draft = init.environ_map.get("QWEN35_SPEC_DRAFT") != null;
     spec_gen = init.environ_map.get("QWEN35_SPEC_GEN") != null;
@@ -1736,7 +1808,65 @@ fn runInference(
     var stream_ctx = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
     try out.print("Output: ", .{});
     try out.flush();
-    const res = if (spec_gen and draft_path != null) blk: {
+    const res = if (spec_mtp) blk: {
+        // MTP speculative decode: the model's own nextn block drafts.
+        //
+        // No external checkpoint, no code bridge, no tap ring: the head is one
+        // extra layer that was trained jointly with the target, so it reads the
+        // target's LAST-layer hidden state (tapped by the verify forward that
+        // `generateSpec` runs anyway) and needs no context window of its own.
+        // The head keeps its OWN KV cache (in the nextn slot), so it is not
+        // reset per round the way the DSpine draft is.
+        if (e.nextn == null) {
+            try out.print("\n[spec-mtp: this model has no nextn/MTP block; falling back to plain decode]\n", .{});
+            break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
+        }
+        const cfg = &e.cfg;
+        const last_layer: u32 = @intCast(cfg.n_layers - 1);
+        e.specTapEnable(&[_]u32{last_layer}) catch {
+            try out.print("\n[spec-mtp: tap enable failed; falling back to plain decode]\n", .{});
+            break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
+        };
+        // Chain length per round.  Measured acceptance length on 27B IQ3_XXS
+        // (24 tokens, "机器学习是什么？"): draft=1 -> 1.64, 2 -> 2.00, 3 -> 2.67,
+        // 4 -> 3.00, 6 -> 3.00.  Four is the plateau, so it is the default;
+        // `QWEN35_SPEC_MTP_DRAFT` overrides it for a sweep.
+        var max_draft: usize = 4;
+        if (houtou.cudart.environ_map) |em| {
+            if (em.get("QWEN35_SPEC_MTP_DRAFT")) |raw| {
+                if (std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10)) |v| {
+                    if (v >= 1) max_draft = @min(v, 31);
+                } else |_| {}
+            }
+        }
+        const hbuf = e.allocHiddenRow() catch {
+            try out.print("\n[spec-mtp: host hidden buffer unavailable; falling back to plain decode]\n", .{});
+            break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
+        };
+        const logits_host = try arena.alloc(f32, cfg.vocab);
+        var runner = MtpRunner{
+            .e = &e,
+            .tap_index = 0,
+            .h = hbuf,
+            .logits = logits_host,
+            .max_draft = max_draft,
+        };
+        try out.print("\n[spec-mtp: draft={d} tokens/round]\n", .{max_draft});
+        try out.flush();
+        break :blk try e.generateSpec(
+            arena,
+            prompt,
+            n_predict,
+            MtpRunner.draft,
+            &runner,
+            max_draft,
+            1, // ctx_rows: unused by this draft (the head reads the last tap only)
+            StreamCtx.onToken,
+            &stream_ctx,
+            null, // cand_fn: QWEN35_SPEC_RECALL is DSpine-only
+            null,
+        );
+    } else if (spec_gen and draft_path != null) blk: {
         // Speculative decoding path.  The draft is loaded here (and only here):
         // the self-check above is a separate mode that returns before reaching
         // this point.

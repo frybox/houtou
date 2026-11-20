@@ -2582,6 +2582,17 @@ pub const Engine = struct {
         }
     }
 
+    /// Copy the engine's current `logits` into HOST slice `dst` (`vocab` wide).
+    /// Debug/verification helper: the MTP drafter scores its own proposals from
+    /// `nextnPredict`, which leaves them in `logits` (`self.logits`), and the
+    /// spec loop needs them on the host to argmax.  CPU-only, like the other
+    /// host-readback helpers here.
+    pub fn copyLogitsToHost(self: *Engine, dst: []f32) !void {
+        if (self.backend_kind != .cpu) return error.HostOnly;
+        std.debug.assert(dst.len >= self.cfg.vocab);
+        self.exec.copyOut(dst[0..self.cfg.vocab], self.logits);
+    }
+
     /// Read-back accessor for tests: the tap plane of `layers[i]`.
     /// `rows * hidden` floats starting at plane `i`, where `rows <= nbatch`.
     /// The target's embedding table as a row view.  The DSpine draft has no
