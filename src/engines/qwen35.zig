@@ -643,6 +643,10 @@ pub const Engine = struct {
     x2K: backend.Buf = backend.Buf.empty,
     mlpK: backend.Buf = backend.Buf.empty,
     mlpK1: backend.Buf = backend.Buf.empty,
+    /// `spec_verify_rows * vocab` f32: every row's lm_head output for a batched
+    /// speculative verify (`forwardChunkVerify`).  The single-row `logits`
+    /// buffer cannot hold a block's worth.
+    logitsK: backend.Buf = backend.Buf.empty,
     /// Top-k order-statistic workspace (quickselect); sized vocab.
     sample_scratch: backend.Buf = backend.Buf.empty,
     /// Sampling policy applied to every produced token.  Default is greedy
@@ -814,6 +818,11 @@ pub const Engine = struct {
     };
 
     pub const max_seq: u32 = 4096;
+
+    /// Rows `forwardChunkVerify` accepts.  A spec block is `block_size` (16 on
+    /// the 27B), so the verify buffer is `16 * vocab` f32 -- distinct from the
+    /// prefill chunk `nbatch` (1024), which would make it 1 GB.
+    pub const spec_verify_rows: usize = 16;
 
     /// One decl per `backend.Kind`, holding the concrete backend type
     /// `selectBackend` picks for it.
@@ -1300,6 +1309,7 @@ pub const Engine = struct {
         e.x2K = try e.exec.allocBuf(K * cfg.hidden);
         e.mlpK = try e.exec.allocBuf(K * cfg.n_ff);
         e.mlpK1 = try e.exec.allocBuf(K * cfg.n_ff);
+        e.logitsK = try e.exec.allocBuf(spec_verify_rows * cfg.vocab);
         try e.exec.allocScratchK(max_q8_cols, K);
         prof_io = io;
         return e;
@@ -1720,6 +1730,44 @@ pub const Engine = struct {
             }
         }
         return self.logits;
+    }
+
+    /// Argmax over row `r` of a `rows * vocab` logits region.
+    ///
+    /// ARGMAX, not `sample`: verification must be deterministic -- a draft row
+    /// is accepted only where its token equals the target's own pick, so "the
+    /// target would have said X" has to be well defined.  This matches the
+    /// greedy path (`temperature <= 0`), which is what every measurement and
+    /// self-check here runs under.
+    pub fn specArgmaxRow(self: *Engine, logits: Buf, r: usize) u32 {
+        const vocab: usize = self.cfg.vocab;
+        return self.exec.argmax(logits.span(r * vocab, vocab));
+    }
+
+    /// Batched speculative verify: every row's lm_head output, `k * vocab`.
+    ///
+    /// Row r must equal `forwardLogits(tokens[r], pos0 + r)` -- the chunk's row
+    /// r has consumed exactly that prefix.  Verifying a draft block by calling
+    /// `forwardLogits` once per token makes speculation a net loss (1 + accepted
+    /// full passes per round), which is why this exists.
+    pub fn forwardChunkVerify(self: *Engine, tokens: []const u32, pos0: u32) Buf {
+        const k = tokens.len;
+        std.debug.assert(k > 0 and k <= self.nbatch and k <= spec_verify_rows);
+        const c = self.cfg;
+        const hidden: usize = c.hidden;
+
+        // Layers, exactly as `forwardChunk` runs them.  Row k-1 also gets its
+        // lm_head there, which the batched projection below recomputes.
+        _ = self.forwardChunk(tokens, pos0);
+        if (k == 1) {
+            self.exec.copyRange(self.logitsK.span(0, c.vocab), self.logits);
+            return self.logitsK.span(0, c.vocab);
+        }
+        // Normalise every row and project them all through lm_head.
+        self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
+        const w = self.output_weight orelse self.token_embd;
+        self.exec.matvecBatchK(self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
+        return self.logitsK.span(0, k * c.vocab);
     }
 
     /// Greedy argmax over the last logits.  Forwards to the backend so the logits
@@ -3134,14 +3182,30 @@ pub const Engine = struct {
                     // decode, which is the whole point: an accepted block must
                     // produce exactly the tokens greedy decode would have.
                     self.specSnapshotTake();
-                    var logits = self.forwardLogits(next, pos);
+                    // ---- BATCHED VERIFY: one forward for the whole block ----
+                    // Rows are `[next, draft[0], draft[1], ...]`, so row r's
+                    // logits are the prediction that FOLLOWS row r's input --
+                    // exactly what `draft_buf[r]` must be compared against.
+                    var vbuf: [spec_verify_rows]u32 = undefined;
+                    var n_verify: usize = 0;
+                    const room_verify = @min(n_draft + 1, spec_verify_rows);
+                    vbuf[n_verify] = next;
+                    n_verify += 1;
+                    while (n_verify < room_verify) : (n_verify += 1) {
+                        vbuf[n_verify] = draft_buf[n_verify - 1];
+                    }
+                    const vlogits = self.forwardChunkVerify(vbuf[0..n_verify], pos);
                     self.specRingPush();
                     var committed: usize = 0;
-                    var pending: u32 = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    var pending: u32 = self.specArgmaxRow(vlogits, 0);
                     if (self.spec_trace_dbg) {
-                        std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
-                            pos, next, draft_buf[0], pending, n_draft,
+                        std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d} rows={d} vbuf:", .{
+                            pos, next, draft_buf[0], pending, n_draft, n_verify,
                         });
+                        for (0..n_verify) |r| std.debug.print(" {d}", .{vbuf[r]});
+                        std.debug.print("  argmax:", .{});
+                        for (0..n_verify) |r| std.debug.print(" {d}", .{self.specArgmaxRow(vlogits, r)});
+                        std.debug.print("\n", .{});
                     }
                     // `QWEN35_SPEC_RECALL`: fetch this round's candidate table.
                     // It is scored inside the verify loop below, where the
@@ -3181,11 +3245,10 @@ pub const Engine = struct {
                         try out.append(alloc, cand);
                         try history.append(alloc, cand);
                         if (progress) |f| f(progress_ctx, cand);
-                        // Advance the target by the token we just accepted.
-                        const row_pos = block_pos + @as(u32, @intCast(committed));
-                        logits = self.forwardLogits(cand, row_pos);
-                        self.specRingPush();
-                        pending = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                        // The NEXT row's logits are already in `vlogits` -- that
+                        // is the point of the batched verify, so there is no
+                        // forward call here any more.
+                        pending = self.specArgmaxRow(vlogits, committed + 1);
                     }
                     accepted_total += committed;
                     // `QWEN35_SPEC_POSSTAT`: how far down the chain each round
@@ -3196,11 +3259,24 @@ pub const Engine = struct {
                     if (self.spec_posstat) {
                         self.spec_pos_reached[committed] += 1;
                     }
-                    // Both branches leave the state reflecting the committed
-                    // rows: never-advanced (committed == 0) needs no rollback,
-                    // and a partial block is wound back and replayed.
-                    if (committed > 0) {
-                        self.specRollbackAndReplay(draft_buf[0..committed], block_pos);
+                    // ALWAYS wind the state back, including the all-rejected
+                    // case (`committed == 0`).  The batched verify pushes the
+                    // whole `[next, draft...]` block into the KV cache, so
+                    // leaving it there when nothing was accepted puts `pos +
+                    // n_verify` rows in the cache while `pos` advances by one --
+                    // every later round's `slot0` is then past the end of the
+                    // real prefix.  (The per-token verify this replaced fed only
+                    // `next` at `pos` and stopped there when `draft[0]` was
+                    // rejected, so it never had to undo anything.)
+                    //
+                    // The replay starts at `next` (position `pos`), not at the
+                    // first drafted token: that is the row the next round's
+                    // chunk expects to find already in the cache.
+                    {
+                        var replay_buf: [spec_verify_rows]u32 = undefined;
+                        replay_buf[0] = next;
+                        @memcpy(replay_buf[1 .. committed + 1], draft_buf[0..committed]);
+                        self.specRollbackAndReplay(replay_buf[0 .. committed + 1], pos);
                     }
                     advanced = committed + 1;
                     next = pending;
