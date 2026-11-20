@@ -1732,18 +1732,6 @@ pub const Engine = struct {
         return self.logits;
     }
 
-    /// Argmax over row `r` of a `rows * vocab` logits region.
-    ///
-    /// ARGMAX, not `sample`: verification must be deterministic -- a draft row
-    /// is accepted only where its token equals the target's own pick, so "the
-    /// target would have said X" has to be well defined.  This matches the
-    /// greedy path (`temperature <= 0`), which is what every measurement and
-    /// self-check here runs under.
-    pub fn specArgmaxRow(self: *Engine, logits: Buf, r: usize) u32 {
-        const vocab: usize = self.cfg.vocab;
-        return self.exec.argmax(logits.span(r * vocab, vocab));
-    }
-
     /// Batched speculative verify: every row's lm_head output, `k * vocab`.
     ///
     /// Row r must equal `forwardLogits(tokens[r], pos0 + r)` -- the chunk's row
@@ -3195,16 +3183,22 @@ pub const Engine = struct {
                         vbuf[n_verify] = draft_buf[n_verify - 1];
                     }
                     const vlogits = self.forwardChunkVerify(vbuf[0..n_verify], pos);
+                    // ONE read-back for every row's pick.  Asking per row meant
+                    // five blocking D2H per round, each waiting on the whole
+                    // round's launches (measured: 6.5 ms of host wait per 9 us
+                    // kernel).
+                    var vpicks: [spec_verify_rows]u32 = undefined;
+                    self.exec.argmaxRows(vlogits, n_verify, vpicks[0..n_verify]);
                     self.specRingPush();
                     var committed: usize = 0;
-                    var pending: u32 = self.specArgmaxRow(vlogits, 0);
+                    var pending: u32 = vpicks[0];
                     if (self.spec_trace_dbg) {
                         std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d} rows={d} vbuf:", .{
                             pos, next, draft_buf[0], pending, n_draft, n_verify,
                         });
                         for (0..n_verify) |r| std.debug.print(" {d}", .{vbuf[r]});
                         std.debug.print("  argmax:", .{});
-                        for (0..n_verify) |r| std.debug.print(" {d}", .{self.specArgmaxRow(vlogits, r)});
+                        for (0..n_verify) |r| std.debug.print(" {d}", .{vpicks[r]});
                         std.debug.print("\n", .{});
                     }
                     // `QWEN35_SPEC_RECALL`: fetch this round's candidate table.
@@ -3248,7 +3242,7 @@ pub const Engine = struct {
                         // The NEXT row's logits are already in `vlogits` -- that
                         // is the point of the batched verify, so there is no
                         // forward call here any more.
-                        pending = self.specArgmaxRow(vlogits, committed + 1);
+                        pending = vpicks[committed + 1];
                     }
                     accepted_total += committed;
                     // `QWEN35_SPEC_POSSTAT`: how far down the chain each round

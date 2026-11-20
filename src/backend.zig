@@ -510,6 +510,14 @@ pub const Exec = struct {
         /// Greedy argmax over logits.  On a device backend this runs on the
         /// device and the token id is the only thing that comes back.
         argmax: *const fn (ctx: *anyopaque, logits: Buf) u32,
+        /// `rows` independent argmaxes over `rows * vocab` contiguous logits
+        /// (the batched speculative verify's output), written to `out[0..rows)`.
+        ///
+        /// A separate slot rather than `rows` calls to `argmax` because on a
+        /// device each `argmax` ends in a BLOCKING read-back: measured on 27B
+        /// MTP, five per-row calls cost 6.5 ms of host wait each against a 9 us
+        /// kernel.  One launch + one copy removes that.
+        argmaxRows: *const fn (ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void,
         /// Sampling.  The policy/PRNG object stays in the engine (set from the
         /// CLI); the backend runs the algorithm wherever the logits live, so a
         /// device backend samples on the device and returns a 4-byte token id.
@@ -790,6 +798,11 @@ pub const Exec = struct {
     }
     pub fn argmax(self: Exec, logits: Buf) u32 {
         return self.vtable.argmax(self.ptr, logits);
+    }
+    /// `rows` argmaxes over `rows * vocab` logits, one launch and one
+    /// read-back on a device backend.  See `VTable.argmaxRows`.
+    pub fn argmaxRows(self: Exec, logits: Buf, rows: usize, out: []u32) void {
+        self.vtable.argmaxRows(self.ptr, logits, rows, out);
     }
     pub fn sample(self: Exec, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         return self.vtable.sample(self.ptr, logits, scratch, sp);

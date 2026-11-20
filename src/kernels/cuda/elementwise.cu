@@ -330,6 +330,41 @@ __global__ void k_argmax_final(const float *__restrict__ d_pv, const int *__rest
     if (tid == 0) *d_out = s_idx[0];
 }
 
+// One block per row: blockIdx.y picks the row, the block strides that row's `n`
+// floats and reduces in shared memory.  A single block per row is enough here
+// because the caller is the spec VERIFY (a handful of vocab scans) rather than
+// per-token decode, and it keeps the whole call to one launch + one D2H.
+__global__ void k_argmax_batch(const float *__restrict__ d_x, int n, int *__restrict__ d_out) {
+    __shared__ float s_val[kArgmaxThreads];
+    __shared__ int s_idx[kArgmaxThreads];
+    const int tid = threadIdx.x;
+    const float *row = d_x + (size_t)blockIdx.y * (size_t)n;
+    const int stride = blockDim.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < n; i += stride) {
+        const float v = row[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    argmax_block_reduce(s_val, s_idx, tid);
+    if (tid == 0) d_out[blockIdx.y] = s_idx[0];
+}
+
+extern "C" int q35_launch_argmax_batch(const float *d_x, int n, int rows,
+                                       int *d_out, void *stream_v) {
+    // `rows` independent argmaxes over `n` contiguous floats each, written to
+    // `d_out[0..rows)`.  One launch, so a speculative verify's per-row picks
+    // cost ONE blocking D2H instead of `rows` of them: measured on 27B MTP, the
+    // five per-row calls each waited 6.5 ms on a 9 us kernel (36 calls, 235 ms
+    // of pure host wait per run).
+    if (n <= 0 || rows <= 0) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_argmax_batch<<<dim3(1, rows), 256, 0, stream>>>(d_x, n, d_out);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;

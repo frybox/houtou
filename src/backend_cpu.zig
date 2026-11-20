@@ -1390,6 +1390,16 @@ pub const CpuBackend = struct {
         return ew.bufArgmax(logits);
     }
 
+    /// CPU oracle for `VTable.argmaxRows`: the same `bufArgmax` per row.  Host
+    /// memory has no read-back cost, so this is literally the loop the device
+    /// slot replaces -- which is what makes the comparison meaningful.
+    fn vArgmaxRows(ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void {
+        _ = ctx;
+        const vocab = logits.len / rows;
+        std.debug.assert(vocab * rows == logits.len and out.len >= rows);
+        for (0..rows) |r| out[r] = ew.bufArgmax(logits.span(r * vocab, vocab));
+    }
+
     fn vSample(ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         _ = ctx;
         return ew.bufSample(logits, scratch, sp);
@@ -1486,6 +1496,7 @@ pub const CpuBackend = struct {
         .copyOut = vCopyOut,
         .zeroBuf = vZeroBuf,
         .argmax = vArgmax,
+        .argmaxRows = vArgmaxRows,
         .sample = vSample,
         .sampledToken = vSampledToken,
         .setThreads = vSetThreads,

@@ -200,6 +200,11 @@ int q35_launch_conv_step_rows(float *d_conv, float *d_y, const float *d_wconv,
 // index of the largest logit (first index wins on ties, matching
 // elementwise.argmaxKernel).  Input is device logits, output a single int.
 int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream);
+// `rows` independent argmaxes over `rows * n` contiguous floats, results in
+// `d_out[0..rows)`.  Exists so a speculative verify's per-row picks cost ONE
+// launch and ONE host read-back instead of `rows` of each (measured: 6.5 ms of
+// blocking wait per 9 us kernel at five rows per round).
+int q35_launch_argmax_batch(const float *d_x, int n, int rows, int *d_out, void *stream);
 
 // --- rotary embedding (src/kernels/cuda/rope.cu) ---------------------------
 //

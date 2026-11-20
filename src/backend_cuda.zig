@@ -150,6 +150,7 @@ const Kernels = struct {
     extern fn q35_launch_conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Index of the largest logit; first index wins on ties.
     extern fn q35_launch_argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_argmax_batch(d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     // Device sampler (sample.cu).  The per-token parameters -- temperature,
     // top_k, top_p, PRNG state -- travel through `d_ctl`, a RESIDENT device
@@ -316,6 +317,7 @@ const Launch = if (cuda_linked) struct {
     const softmax = Kernels.q35_launch_softmax;
     const conv_step = Kernels.q35_launch_conv_step;
     const argmax = Kernels.q35_launch_argmax;
+    const argmax_batch = Kernels.q35_launch_argmax_batch;
     const sample = Kernels.q35_launch_sample;
     const sample_init = Kernels.q35_launch_sample_init;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
@@ -458,6 +460,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_conv, d_y, d_wconv, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn argmax_batch(d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, n, rows, d_out, stream };
         return stubNoCudaKernels();
     }
     fn argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -5358,6 +5364,55 @@ const attn_score_arity: usize = 11;
     // (temperature, top-k/p, RNG) whose reference implementation must not be
     // duplicated, and it needs the whole distribution.
 
+    /// Rows `dArgmaxRows` will accept in one call (the spec verify block).
+    /// Bounds the stack array the read-back lands in; the engine's own block
+    /// size is 16 for both DSpine and MTP.
+    const spec_argmax_rows: usize = 16;
+
+    /// `rows` argmaxes in ONE launch and ONE read-back.
+    ///
+    /// The single-row slot blocks on a 4-byte D2H, which for the batched
+    /// speculative verify meant five copies per round.  Measured on 27B MTP:
+    /// 36 such calls totalled 235 ms of host wait against 9 us of kernel time --
+    /// each one waited on the whole preceding round's launches, so paying that
+    /// wait five times per round was pure loss.
+    fn dArgmaxRows(ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
+        const self = self_(ctx);
+        std.debug.assert(out.len >= rows and rows > 0);
+        if (self.cu == null or logits.len == 0 or logits.len % rows != 0) {
+            // Host memory (or a malformed region): the CPU oracle is the
+            // definition, so fall back to it rather than refusing.
+            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            return;
+        }
+        const px = dBufPtr(logits) orelse {
+            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            return;
+        };
+        const cu = &self.cu.?;
+        const vocab: usize = logits.len / rows;
+        const bytes = rows * @sizeOf(c_int);
+        ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, bytes) catch {
+            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            return;
+        };
+        const rc = Launch.argmax_batch(px, @intCast(vocab), @intCast(rows), @ptrCast(@alignCast(self.d_idx)), null);
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("argmax_batch", rc);
+            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            return;
+        }
+        var host: [spec_argmax_rows]c_int = undefined;
+        std.debug.assert(rows <= spec_argmax_rows);
+        const rc2 = cu.lib.Memcpy(&host, self.d_idx, bytes, cudart.MemcpyDeviceToHost);
+        if (rc2 != cudart.cudaSuccess) {
+            self.ewLaunchFail("argmax_batch index download", rc2);
+            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            return;
+        }
+        for (0..rows) |r| out[r] = @intCast(host[r]);
+    }
+
     fn dArgmax_body(ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
@@ -8265,6 +8320,7 @@ pub const vtable = backend.Exec.VTable{
     .gdnPrefillCore = CudaBackend.dGdnPrefillCore,
     .copyFromHost = CudaBackend.dCopyFromHost,
     .argmax = CudaBackend.dArgmax,
+    .argmaxRows = CudaBackend.dArgmaxRows,
     .sample = CudaBackend.dSample,
     .sampledToken = CudaBackend.dSampledToken,
     // The four pure elementwise slots.  Forwarders, NOT aliases: they need
