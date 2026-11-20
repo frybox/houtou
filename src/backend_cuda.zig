@@ -1838,6 +1838,26 @@ pub const CudaBackend = struct {
         return on;
     }
 
+    /// Turn the decode graph off for the rest of the process.
+    ///
+    /// For op sequences that cannot be captured at all.  The MTP drafter is the
+    /// case that forced this: `nextnPredict` runs a full layer with per-round
+    /// `next_token`/`draft_pos` into the drafter's own KV slot, and there is no
+    /// device-position twin to retarget, so a captured node would replay the
+    /// first round's arguments forever.  Leaving the graph on does not merely
+    /// lose the speedup -- it corrupts the VERIFY forward too, because the
+    /// draft's nodes are recorded inside the same span the target's
+    /// `forwardLogits` opened (measured: the first round's verify returned
+    /// token 0 instead of 119016; `$QWEN35_CUDA_GRAPH=0` gave the right ids).
+    ///
+    /// Must run BEFORE the scratch reservation that arms the graph
+    /// (`rasterizeScratch` reads `graphWanted` once and caches it), which is why
+    /// the spec path calls it right after loading the engine, before any
+    /// prefill.
+    pub fn forceGraphOff() void {
+        g_graph_cached = false;
+    }
+
     /// `QWEN35_GDN_WY=0` forces the per-token GDN kernel (the reference the WY
     /// form was validated against); anything else, including unset, uses WY.
     /// Cached because it is read per GDN layer, ~50 times per prefill.
@@ -1887,11 +1907,12 @@ pub const CudaBackend = struct {
     /// is automatic, so requiring an opt-in would just hide it.  `=0` (or any
     /// of false/no/off) turns it fully off -- that is the A/B switch and the
     /// escape hatch, and with it set nothing below ever runs.
+    /// `graphWanted`'s memo.  Module-level (not a function-local `const S`)
+    /// so `forceGraphOff` can write the same cell.
+    var g_graph_cached: ?bool = null;
+
     fn graphWanted() bool {
-        const S = struct {
-            var cached: ?bool = null;
-        };
-        if (S.cached) |v| return v;
+        if (g_graph_cached) |v| return v;
         var on = true;
         if (cudart.getenv("QWEN35_CUDA_GRAPH")) |raw| {
             const v = mem.trim(u8, raw, " \t\r\n");
@@ -1903,7 +1924,7 @@ pub const CudaBackend = struct {
                 });
             }
         }
-        S.cached = on;
+        g_graph_cached = on;
         return on;
     }
 

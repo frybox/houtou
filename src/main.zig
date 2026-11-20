@@ -71,10 +71,7 @@ const MtpRunner = struct {
     tap_index: usize,
     /// Hidden row the chain ping-pongs through (device-side on CUDA).
     h: houtou.backend.Buf,
-    /// Host logits scratch (`vocab`), for the argmax over a proposal.
-    logits: []f32,
-    /// How many tokens one block may propose (`block_size - 1` semantics: the
-    /// caller already sized `out`).
+    /// How many tokens one block may propose.
     max_draft: usize,
     rounds: usize = 0,
 
@@ -82,13 +79,12 @@ const MtpRunner = struct {
         _ = context;
         const self: *MtpRunner = @ptrCast(@alignCast(ctx));
         const e = self.e;
-        const cfg = &e.cfg;
-        const hidden: usize = cfg.hidden;
 
         // The anchor's normed hidden state came out of this round's verify
-        // forward.
-        const normed = e.specTapNormedPlane(self.tap_index, 1) catch return 0;
-        e.copyHiddenRowIn(self.h, normed[0..hidden]);
+        // forward.  `specTapNormedRowInto` is the device-safe twin of the
+        // host-plane helper: one `rmsnorm` launch, no host round trip, so this
+        // works on CUDA as well.
+        e.specTapNormedRowInto(self.h, self.tap_index, 0);
 
         const n = @min(out.len, self.max_draft);
         var tok = anchor;
@@ -97,8 +93,9 @@ const MtpRunner = struct {
             // `h` in == `h` out: the head reads the previous row's hidden state
             // and leaves this row's, which is what makes the chain work.
             e.nextnPredict(self.h, tok, block_pos + @as(u32, @intCast(produced)), self.h) catch return produced;
-            e.copyLogitsToHost(self.logits) catch return produced;
-            tok = argmaxHost(self.logits);
+            // `argmaxLogits` goes through the backend, so on CUDA the vocab
+            // never crosses PCIe -- only the 4-byte index comes back.
+            tok = e.argmaxLogits();
             out[produced] = tok;
         }
         self.rounds += 1;
@@ -1811,6 +1808,14 @@ fn runInference(
     const res = if (spec_mtp) blk: {
         // MTP speculative decode: the model's own nextn block drafts.
         //
+        // GRAPH OFF, and before the prefill: `nextnPredict` is per-round and
+        // has no device-position twin, so a captured node would replay the first
+        // round's arguments -- and because the draft runs INSIDE the span the
+        // verify forward opened, that corrupts the verify too (measured: the
+        // first round verified token 0 instead of 119016).  See
+        // `CudaBackend.forceGraphOff`.
+        if (e.backendKind() == .cuda) houtou.backend_cuda.CudaBackend.forceGraphOff();
+        //
         // No external checkpoint, no code bridge, no tap ring: the head is one
         // extra layer that was trained jointly with the target, so it reads the
         // target's LAST-layer hidden state (tapped by the verify forward that
@@ -1840,15 +1845,14 @@ fn runInference(
             }
         }
         const hbuf = e.allocHiddenRow() catch {
-            try out.print("\n[spec-mtp: host hidden buffer unavailable; falling back to plain decode]\n", .{});
+            try out.print("\n[spec-mtp: hidden buffer unavailable; falling back to plain decode]\n", .{});
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
-        const logits_host = try arena.alloc(f32, cfg.vocab);
+        e.spec_trace_dbg = spec_trace;
         var runner = MtpRunner{
             .e = &e,
             .tap_index = 0,
             .h = hbuf,
-            .logits = logits_host,
             .max_draft = max_draft,
         };
         try out.print("\n[spec-mtp: draft={d} tokens/round]\n", .{max_draft});

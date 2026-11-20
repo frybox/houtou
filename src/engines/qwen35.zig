@@ -2455,8 +2455,17 @@ pub const Engine = struct {
             if (i < self.kv.len) self.kv[i].len = s.kv_len;
             if (i < self.gdn.len) {
                 const g = &self.gdn[i];
-                if (g.conv.len > 0) self.exec.copyRange(g.conv, backend.Buf.wrap(s.conv));
-                if (g.state.len > 0) self.exec.copyRange(g.state, backend.Buf.wrap(s.state));
+                // `copyFromHost`, NOT `copyRange(Buf.wrap(...))`: the snapshot
+                // is HOST memory, and `copyRange` infers the direction from the
+                // SOURCE alone -- a device source with a host destination is
+                // issued as a device-to-device move, i.e. it reads a host
+                // address as if it were VRAM.  That went unnoticed because the
+                // CPU backend treats both sides as host; on CUDA it silently
+                // restored garbage into the GDN state, which then made the
+                // TARGET predict wrong tokens (observed: the verify forward
+                // returned token 0 at the first round).
+                if (g.conv.len > 0) self.exec.copyFromHost(g.conv, s.conv);
+                if (g.state.len > 0) self.exec.copyFromHost(g.state, s.state);
                 g.conv_len = s.conv_len;
             }
         }
@@ -2550,8 +2559,19 @@ pub const Engine = struct {
     /// (`Buf.slice()` there is a device pointer; a host `@memcpy` segfaults --
     /// observed as a core dump with `QWEN35_SPEC_TAPS=1 --backend cuda`).
     pub fn allocHiddenRow(self: *Engine) !backend.Buf {
-        if (self.backend_kind != .cpu) return error.HostOnly;
+        // Backend-agnostic: on CUDA this is a device region and the caller must
+        // only hand it to backend slots (`copyRange`/`rmsnorm`/`nextnPredict`),
+        // never to `slice()`.  The host-readback helpers below still refuse a
+        // device backend.
         return self.exec.allocBuf(self.cfg.hidden);
+    }
+
+    /// `argmax` over the engine's current `logits`, wherever they live.
+    ///
+    /// On CUDA this is a device reduction that returns a 4-byte index, so the
+    /// MTP drafter scores its proposals without a vocab-sized D2H per token.
+    pub fn argmaxLogits(self: *Engine) u32 {
+        return self.exec.argmax(self.logits);
     }
 
     /// Copy a host f32 row into `dst` (debug/verification helper).  See
@@ -2766,6 +2786,24 @@ pub const Engine = struct {
             rmsNorm(out[r * hidden ..][0..hidden], plane[r * hidden ..][0..hidden], w, self.cfg.rms_eps);
         }
         return out;
+    }
+
+    /// Device-side twin of `specTapNormedPlane`: `output_norm` applied to tap
+    /// row `row` of plane `i`, written into the caller's buffer `dst` (at least
+    /// `hidden` long, `Buf` so it can live on the device).
+    ///
+    /// The MTP drafter consumes exactly this value, and it must stay on the
+    /// device: `specTapNormedPlane` returns a HOST slice (it calls `slice()` on
+    /// the tap plane), which on CUDA dereferences a device pointer.  One
+    /// `rmsnorm` launch keeps the whole draft on the GPU.
+    pub fn specTapNormedRowInto(self: *Engine, dst: backend.Buf, i: usize, row: usize) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(dst.len >= hidden);
+        std.debug.assert(row < self.nbatch);
+        // Row `row` of plane `i`: the plane is `nbatch` rows, so the offset is
+        // `row * hidden` inside it.
+        const src = self.specTapPlane(i, self.nbatch).span(row * hidden, hidden);
+        self.exec.rmsnorm(dst.span(0, hidden), src, self.output_norm, self.cfg.rms_eps);
     }
 
     pub const GenResult = struct {
