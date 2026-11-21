@@ -3527,6 +3527,141 @@ test "q8ScratchBytes: ceil(cols/32) blocks of 34 bytes" {
     try std.testing.expectEqual(@as(usize, 544 * 34), q8ScratchBytes(17408));
 }
 
+test "gdn chunk state: rows=r == r single steps (the rollback's premise)" {
+    // SPECULATIVE ROLLBACK DEPENDS ON THIS, and nothing tested it before.
+    //
+    // A round verifies a block of `k` rows, then keeps only `accepted + 1`.  The
+    // cheap rollback replaces "replay the accepted prefix through the whole
+    // model" with "restore the pre-verify state and re-step `rows` rows through
+    // the state kernel".  That is only valid if the chunk kernel's `rows`-row
+    // run is exactly the same recurrence as `rows` single steps -- this test is
+    // that claim, stated once, on the kernel pair the engine actually calls.
+    //
+    // The first version of the rollback change broke acceptance 47.6% -> 2.8%
+    // and this test did not exist; every one of those failures would have been
+    // caught here in milliseconds instead of by a 27B run.
+    const alloc = std.testing.allocator;
+    const heads = 2;
+    const nk = 2;
+    const kd = 128;
+    const vd = 128;
+    const rows = 5;
+    const kb = try alloc.alloc(f32, rows * nk * kd);
+    defer alloc.free(kb);
+    const vb = try alloc.alloc(f32, rows * heads * vd);
+    defer alloc.free(vb);
+    const qb = try alloc.alloc(f32, rows * nk * kd);
+    defer alloc.free(qb);
+    const gb = try alloc.alloc(f32, rows * heads);
+    defer alloc.free(gb);
+    const bb = try alloc.alloc(f32, rows * heads);
+    defer alloc.free(bb);
+    var prng = std.Random.DefaultPrng.init(0x9E3779B97F4A7C15);
+    const rnd = prng.random();
+    for (kb) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (vb) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (qb) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (gb) |*x| x.* = 0.80 + rnd.float(f32) * 0.18;
+    for (bb) |*x| x.* = 0.25 + rnd.float(f32) * 0.5;
+
+    const st0 = try alloc.alloc(f32, heads * kd * vd);
+    defer alloc.free(st0);
+    for (st0) |*x| x.* = (rnd.float(f32) - 0.5) * 0.1;
+
+    var g: gguf.File = undefined;
+    var cpu = backend_cpu.CpuBackend.init(alloc, &g);
+    const ex = cpu.exec();
+
+    // Reference: `rows` separate single-token steps (what the serial decode
+    // path does), each with its own km/delta/out scratch.
+    const st_ref = try alloc.alloc(f32, st0.len);
+    defer alloc.free(st_ref);
+    @memcpy(st_ref, st0);
+    const km = try alloc.alloc(f32, heads * vd);
+    defer alloc.free(km);
+    const dl = try alloc.alloc(f32, heads * vd);
+    defer alloc.free(dl);
+    const o = try alloc.alloc(f32, heads * vd);
+    defer alloc.free(o);
+    for (0..rows) |t| {
+        for (0..heads) |h| {
+            const kv = h % nk;
+            gdnFused(
+                st_ref[h * kd * vd ..][0 .. kd * vd],
+                kb[t * nk * kd + kv * kd ..][0..kd],
+                vb[t * heads * vd + h * vd ..][0..vd],
+                qb[t * nk * kd + kv * kd ..][0..kd],
+                km[h * vd ..][0..vd],
+                dl[h * vd ..][0..vd],
+                o[h * vd ..][0..vd],
+                gb[t * heads + h],
+                bb[t * heads + h],
+                vd,
+            );
+        }
+    }
+
+    // Candidate: one chunk call over `rows`, from the same starting state.
+    const st_chunk = try alloc.alloc(f32, st0.len);
+    defer alloc.free(st_chunk);
+    @memcpy(st_chunk, st0);
+    const kmc = try alloc.alloc(f32, rows * heads * vd);
+    defer alloc.free(kmc);
+    const dlc = try alloc.alloc(f32, rows * heads * vd);
+    defer alloc.free(dlc);
+    const oc = try alloc.alloc(f32, rows * heads * vd);
+    defer alloc.free(oc);
+    ex.gdnStepRowsChunk(
+        Buf.wrap(st_chunk),
+        Buf.wrap(kb),
+        Buf.wrap(vb),
+        Buf.wrap(qb),
+        Buf.wrap(kmc),
+        Buf.wrap(dlc),
+        Buf.wrap(oc),
+        Buf.wrap(gb),
+        Buf.wrap(bb),
+        heads,
+        nk,
+        kd,
+        vd,
+        rows,
+        nk * kd,
+        heads * vd,
+        nk * kd,
+    );
+
+    // 1. the carried state must match exactly -- loose equality would hide
+    //    precisely the kind of mistake this guards (a wrong row offset).
+    for (st_ref, st_chunk) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    // 2. and so must each row's delta, which is the only per-row quantity the
+    //    reference keeps: re-run the reference one row at a time and compare
+    //    against the chunk's `dlc[t]`.
+    const st_walk = try alloc.alloc(f32, st0.len);
+    defer alloc.free(st_walk);
+    @memcpy(st_walk, st0);
+    for (0..rows) |t| {
+        for (0..heads) |h| {
+            const kv = h % nk;
+            gdnFused(
+                st_walk[h * kd * vd ..][0 .. kd * vd],
+                kb[t * nk * kd + kv * kd ..][0..kd],
+                vb[t * heads * vd + h * vd ..][0..vd],
+                qb[t * nk * kd + kv * kd ..][0..kd],
+                km[h * vd ..][0..vd],
+                dl[h * vd ..][0..vd],
+                o[h * vd ..][0..vd],
+                gb[t * heads + h],
+                bb[t * heads + h],
+                vd,
+            );
+            for (0..vd) |j| {
+                try std.testing.expectApproxEqAbs(dl[h * vd + j], dlc[t * heads * vd + h * vd + j], 1e-6);
+            }
+        }
+    }
+}
+
 test "maxQ8Cols: widest matvec INPUT is n_ff, not conv_dim / 2*q_dim" {
     // 27B (read from the GGUF metadata): n_ff=17408 > conv_dim=10240 >
     // q_dim=value_dim=6144 > hidden=5120
