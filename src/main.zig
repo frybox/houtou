@@ -389,6 +389,8 @@ pub fn main(init: std.process.Init) !void {
     spec_taps = init.environ_map.get("QWEN35_SPEC_TAPS") != null;
     spec_nextn = init.environ_map.get("QWEN35_SPEC_NEXTN") != null;
     spec_mtp = init.environ_map.get("QWEN35_SPEC_MTP") != null;
+    houtou.engines.qwen35.spec_dummy_alloc =
+        init.environ_map.get("QWEN35_SPEC_DUMMYALLOC") != null;
     spec_nextn_seq = init.environ_map.get("QWEN35_SPEC_NEXTN_SEQ") != null;
     spec_draft = init.environ_map.get("QWEN35_SPEC_DRAFT") != null;
     spec_gen = init.environ_map.get("QWEN35_SPEC_GEN") != null;

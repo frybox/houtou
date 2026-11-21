@@ -22,6 +22,11 @@
 //!     Qwen3_5RMSNorm-family weights and stores ssm_a = -A_log.exp().
 
 const std = @import("std");
+
+/// `$QWEN35_SPEC_DUMMYALLOC`: DIAGNOSTIC.  Allocates one throwaway device
+/// region during speculative setup, to test whether the MTP path's output
+/// depends on the device allocator's layout (it should not).
+pub var spec_dummy_alloc = false;
 const gguf = @import("../gguf.zig");
 const backend = @import("../backend.zig");
 const backend_cpu = @import("../backend_cpu.zig");
@@ -2447,6 +2452,19 @@ pub const Engine = struct {
     /// 31.4 MB for the 27B (48 GDN layers), taken once per round.
     pub fn specSnapshotAlloc(self: *Engine, alloc: std.mem.Allocator) !void {
         if (self.spec_snap.len > 0) return;
+        if (spec_dummy_alloc) {
+            // `$QWEN35_SPEC_DUMMYALLOC`: reserve one throwaway device region
+            // during speculative setup.  Used to check that the MTP path's
+            // output does NOT depend on the device allocator's layout: with this
+            // set the token stream is still bit-identical (measured 3/3), so a
+            // change in behaviour between two builds is real logic, not address
+            // luck.
+            //
+            // Do NOT touch `Buf.slice()` here: on CUDA a `Buf` is a DEVICE
+            // address, so writing through it from the host is an illegal access
+            // and the process dies silently (measured).
+            _ = try self.exec.allocBuf(48 * 16 * 10240);
+        }
         const n = self.nSlots();
         const snaps = try alloc.alloc(SnapLayer, n);
         errdefer alloc.free(snaps);
