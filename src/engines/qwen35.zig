@@ -3662,6 +3662,127 @@ test "gdn chunk state: rows=r == r single steps (the rollback's premise)" {
     }
 }
 
+test "gdn prelude: chunk(rows=r) == r single-token steps, conv history included" {
+    // The other half of the rollback's premise.  Re-stepping the state is only
+    // enough if the CONV HISTORY also reflects exactly `rows` rows: the chunk
+    // prelude advances it over the whole verify block, so the rollback has to
+    // re-run the prelude for the accepted prefix from the pre-verify snapshot.
+    //
+    // Missing this is what made an earlier attempt land at 2.8% acceptance, and
+    // it is invisible to the state-only test above -- hence a separate test that
+    // compares the conv history, the rewritten ab, and the qkv rows.
+    const alloc = std.testing.allocator;
+    // The reference prelude is written with the elementwise primitives the CPU
+    // backend itself uses (`backend_cpu.vGdnPrefillCore` spells the same
+    // per-token sequence), imported HERE rather than at module scope: the
+    // engine must not depend on a backend module (AGENTS.md §1.1).
+    const ew = @import("../elementwise.zig");
+    const nv = 2;
+    const nk = 2;
+    const kd = 8;
+    const conv_dim = 2 * nk * kd + nv * kd;
+    const kq_dim = nk * kd;
+    const conv_k = 4;
+    const rows = 5;
+
+    const qkv = try alloc.alloc(f32, rows * conv_dim);
+    defer alloc.free(qkv);
+    const ab = try alloc.alloc(f32, rows * 2 * nv);
+    defer alloc.free(ab);
+    const wconv = try alloc.alloc(f32, conv_dim * conv_k);
+    defer alloc.free(wconv);
+    const ssm_a = try alloc.alloc(f32, nv);
+    defer alloc.free(ssm_a);
+    const dt_bias = try alloc.alloc(f32, nv);
+    defer alloc.free(dt_bias);
+    var prng = std.Random.DefaultPrng.init(0x1234_5678_9ABC_DEF0);
+    const rnd = prng.random();
+    for (qkv) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (ab) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (wconv) |*x| x.* = (rnd.float(f32) - 0.5) * 0.25;
+    for (ssm_a) |*x| x.* = -0.5 - rnd.float(f32);
+    for (dt_bias) |*x| x.* = rnd.float(f32) * 0.1;
+
+    var g: gguf.File = undefined;
+    var cpu = backend_cpu.CpuBackend.init(alloc, &g);
+    const ex = cpu.exec();
+
+    // Reference: one prelude step per token, sharing ONE conv history -- exactly
+    // what the serial decode path does.
+    const conv_ref = try alloc.alloc(f32, conv_dim * (conv_k - 1));
+    defer alloc.free(conv_ref);
+    @memset(conv_ref, 0);
+    const qkv_ref = try alloc.alloc(f32, rows * conv_dim);
+    defer alloc.free(qkv_ref);
+    @memcpy(qkv_ref, qkv);
+    const ab_ref = try alloc.alloc(f32, rows * 2 * nv);
+    defer alloc.free(ab_ref);
+    @memcpy(ab_ref, ab);
+    const gam_ref = try alloc.alloc(f32, rows * nv);
+    defer alloc.free(gam_ref);
+    const qscale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+    for (0..rows) |t| {
+        const y = Buf.wrap(qkv_ref[t * conv_dim ..][0..conv_dim]);
+        ew.bufConvStep(Buf.wrap(conv_ref), y, Buf.wrap(wconv), conv_k);
+        ew.bufGdnGamma(
+            Buf.wrap(ab_ref[0 * nv + t * nv ..][0..nv]),
+            Buf.wrap(ab_ref[rows * nv + t * nv ..][0..nv]),
+            Buf.wrap(ssm_a),
+            Buf.wrap(dt_bias),
+            Buf.wrap(gam_ref[t * nv ..][0..nv]),
+            nv,
+        );
+        var h: usize = 0;
+        while (h < nk) : (h += 1) ew.bufL2norm(y.span(h * kd, kd));
+        h = 0;
+        while (h < nk) : (h += 1) ew.bufL2norm(y.span(kq_dim + h * kd, kd));
+        var j: usize = 0;
+        while (j < kq_dim) : (j += kd) ew.bufScaleVec(y.span(j, kd), qscale);
+    }
+
+    // Candidate: ONE prelude call over `rows`, from the same zero history.
+    const conv_c = try alloc.alloc(f32, conv_dim * (conv_k - 1));
+    defer alloc.free(conv_c);
+    @memset(conv_c, 0);
+    const qkv_c = try alloc.alloc(f32, rows * conv_dim);
+    defer alloc.free(qkv_c);
+    @memcpy(qkv_c, qkv);
+    const ab_c = try alloc.alloc(f32, rows * 2 * nv);
+    defer alloc.free(ab_c);
+    @memcpy(ab_c, ab);
+    const gam_c = try alloc.alloc(f32, rows * nv);
+    defer alloc.free(gam_c);
+    ex.gdnPrefillCore(
+        Buf.wrap(qkv_c),
+        Buf.wrap(conv_c),
+        Buf.wrap(wconv),
+        Buf.wrap(ab_c),
+        Buf.wrap(ssm_a),
+        Buf.wrap(dt_bias),
+        Buf.wrap(gam_c),
+        rows,
+        conv_dim,
+        0,
+        rows * nv,
+        nv,
+        nv,
+        kq_dim,
+        nv,
+        nk,
+        kd,
+        conv_k,
+        1e-6,
+    );
+
+    // The conv history is the part a state-only rollback cannot restore.
+    for (conv_ref, conv_c) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    // The convolved+silu'd rows, which the state kernel then consumes.
+    for (qkv_ref, qkv_c) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    // beta, rewritten in place, and the decay scalars.
+    for (ab_ref, ab_c) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    for (gam_ref, gam_c) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+}
+
 test "maxQ8Cols: widest matvec INPUT is n_ff, not conv_dim / 2*q_dim" {
     // 27B (read from the GGUF metadata): n_ff=17408 > conv_dim=10240 >
     // q_dim=value_dim=6144 > hidden=5120
