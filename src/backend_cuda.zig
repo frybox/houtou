@@ -1504,6 +1504,8 @@ pub const CudaBackend = struct {
     /// decode path uses 0, the speculative verify path uses 1.
     g_slots: [2]GraphSlot = .{ .{}, .{} },
     g_cur: usize = 0,
+    /// 见 `gOpGate`：非 graph 管辖段。
+    g_direct: bool = false,
 
     /// 设备端的一个 int：当前 KV 写入的起始行号。`q35_launch_kv_quant_dslot`
     /// 从它读行号，所以 graph 捕获下来的指针在重放时仍然有效（每 token 只需
@@ -2089,6 +2091,10 @@ pub const CudaBackend = struct {
     /// Without this the host path re-runs the whole step on the default stream
     /// next to the graph -- see `g_op_seen`.
     fn gOpGate(self: *CudaBackend, seen: *bool) bool {
+        // `g_direct`：当前这段代码不在任何 graph 的管辖范围内（MTP 的 draft
+        // 循环就是这样跑的）。它必须真正执行，而不是被当成"已由 graph 重放
+        // 吸收"而跳过 —— 否则 draft 什么都不算，verify 拿到垃圾。
+        if (self.g_direct) return false;
         switch (self.gs().state) {
             .rec => {
                 seen.* = true;
@@ -7573,6 +7579,33 @@ const attn_score_arity: usize = 11;
         }
     }
 
+    /// `VTable.selectGraphSlot`：切换 graph 状态槽。0 = decode，1 = verify。
+    ///
+    /// 两份 graph 形状不同（1 行 vs k 行），共用一槽会让
+    /// `graphUpdateRequired` 每次切换都为真，等于每步重捕获。
+    /// `VTable.graphDirect`：进入/离开"非 graph 管辖"段。MTP 的 draft 循环在
+    /// verify 的 graph 之外运行，这段里的每个 op 都必须真正执行。
+    fn dGraphDirect(ctx: *anyopaque, on: bool) void {
+        const self = self_(ctx);
+        self.g_direct = on;
+    }
+
+    fn dSelectGraphSlot(ctx: *anyopaque, slot: u8) void {
+        const self = self_(ctx);
+        self.g_cur = @min(@as(usize, slot), self.g_slots.len - 1);
+        // `graphReserve` 只在 decode 启动前跑过一次（那时 `g_cur == 0`），
+        // 所以第二槽永远停在 `.off`、`stepBegin` 也就什么都不做。这里给它
+        // 补上同样的 arm 条件：scratch 早已预留完，可以直接 warm。
+        if (self.gs().state == .off and graphWanted() and self.gpuReady()) {
+            self.gs().state = .warm;
+        }
+        if (cudart.getenv("QWEN35_GRAPHDBG") != null) {
+            std.debug.print("[graphdbg] slot={d} state={s} wanted={} gpu={}\n", .{
+                self.g_cur, @tagName(self.gs().state), graphWanted(), self.gpuReady(),
+            });
+        }
+    }
+
     /// Close a decode step: if this step was captured, instantiate the graph so
     /// the NEXT step can replay it.
     fn dStepEnd(ctx: *anyopaque) void {
@@ -8563,6 +8596,8 @@ pub const vtable = backend.Exec.VTable{
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
     .stepBegin = CudaBackend.dStepBegin,
     .stepEnd = CudaBackend.dStepEnd,
+    .selectGraphSlot = CudaBackend.dSelectGraphSlot,
+    .graphDirect = CudaBackend.dGraphDirect,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .profReport = CudaBackend.dProfReport,

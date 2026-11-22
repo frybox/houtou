@@ -999,6 +999,18 @@ pub const CpuBackend = struct {
         _ = ctx;
     }
 
+    /// `VTable.selectGraphSlot`: the CPU backend has no CUDA graph, so the
+    /// slot selection is a no-op.
+    fn vSelectGraphSlot(ctx: *anyopaque, slot: u8) void {
+        _ = ctx;
+        _ = slot;
+    }
+
+    fn vGraphDirect(ctx: *anyopaque, on: bool) void {
+        _ = ctx;
+        _ = on;
+    }
+
     fn vName(ctx: *anyopaque) []const u8 {
         _ = ctx;
         return "cpu";
@@ -1557,6 +1569,8 @@ pub const CpuBackend = struct {
         .profPrefillEnd = vProfPrefillEnd,
         .stepBegin = vStepBegin,
         .stepEnd = vStepEnd,
+        .selectGraphSlot = vSelectGraphSlot,
+        .graphDirect = vGraphDirect,
         .name = vName,
         .describe = vDescribe,
         .setTier = vSetTier,

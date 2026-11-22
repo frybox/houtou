@@ -594,6 +594,14 @@ pub const Exec = struct {
         // and a device backend must be free to ignore them.
         stepBegin: *const fn (ctx: *anyopaque, pos: u32) void,
         stepEnd: *const fn (ctx: *anyopaque) void,
+        /// 选择哪一份 graph 状态。0 = decode（1 行 `forwardLogits`），
+        /// 1 = speculative verify（k 行 `forwardChunkVerify`）。两者形状不同，
+        /// 必须各自捕获一份；CPU 后端是空操作。
+        selectGraphSlot: *const fn (ctx: *anyopaque, slot: u8) void,
+        /// 进入/离开"不在任何 graph 管辖范围"的代码段。段内的每个 op 都必须
+        /// 真正执行（不能被"已由 graph 吸收"的判据跳过）。MTP 的 draft 循环
+        /// 就是这样跑的。CPU 后端是空操作。
+        graphDirect: *const fn (ctx: *anyopaque, on: bool) void,
 
         // ---- introspection --------------------------------------------------
         name: *const fn (ctx: *anyopaque) []const u8,
@@ -855,6 +863,12 @@ pub const Exec = struct {
     /// boundary hint the backend may ignore, and the CPU backend does.
     pub fn stepBegin(self: Exec, pos: u32) void {
         self.vtable.stepBegin(self.ptr, pos);
+    }
+    pub fn selectGraphSlot(self: Exec, slot: u8) void {
+        self.vtable.selectGraphSlot(self.ptr, slot);
+    }
+    pub fn graphDirect(self: Exec, on: bool) void {
+        self.vtable.graphDirect(self.ptr, on);
     }
     pub fn stepEnd(self: Exec) void {
         self.vtable.stepEnd(self.ptr);
