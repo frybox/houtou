@@ -225,6 +225,8 @@ const Kernels = struct {
     extern fn q35_func_copy_range() callconv(.c) ?*anyopaque;
     extern fn q35_launch_kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_kv_quant() callconv(.c) ?*anyopaque;
+    extern fn q35_launch_attn_chunk_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_attn_chunk_dyn_smem(hd: c_int, kv_kind: c_int) callconv(.c) c_ulonglong;
     extern fn q35_launch_kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_kv_quant_dslot() callconv(.c) ?*anyopaque;
 };
@@ -312,6 +314,8 @@ const Launch = if (cuda_linked) struct {
     const copy_range = Kernels.q35_launch_copy_range;
     const kv_quant = Kernels.q35_launch_kv_quant;
     const kv_quant_dslot = Kernels.q35_launch_kv_quant_dslot;
+    const attn_chunk_dyn = Kernels.q35_launch_attn_chunk_dyn;
+    const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
     const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
@@ -431,6 +435,14 @@ const Launch = if (cuda_linked) struct {
     fn kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, kind, stream };
         return stubNoCudaKernels();
+    }
+    fn attn_chunk_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_chunk_dyn_smem(hd: c_int, kv_kind: c_int) callconv(.c) c_ulonglong {
+        _ = .{ hd, kv_kind };
+        return 0;
     }
     fn kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream };
@@ -981,6 +993,10 @@ const GraphSlot = struct {
     rope_dyn_pos: u32 = 0xFFFF_FFFF,
     rope_dyn_base: f32 = 0.0,
     attn_dyn: ?*anyopaque = null,
+    /// 设备端 int：attnChunk 的起始行。graph 重放时从它读。
+    d_attn_slot: ?*anyopaque = null,
+    /// Host 镜像，只有值变了才 H2D。
+    d_attn_slot_host: c_int = -1,
     graph: ?*anyopaque = null,
     exec: ?*anyopaque = null,
     rope_nodes: [graph_max_layers]?*anyopaque = @splat(null),
@@ -8346,6 +8362,39 @@ const attn_score_arity: usize = 11;
         }
 
         if (maxrows != 0) {
+            // CUDA-graph 重放：起始行必须从设备读，dynamic shared 固定最大值。
+            // 否则捕获时固化的 `slot0`/`smem` 会让每个 token 都要重新捕获。
+            if (self.gs().state == .live and self.gs().d_attn_slot != null and
+                rows <= maxrows and self.kvKind() == 0 and n_tot <= 12288)
+            {
+                const want: c_int = @intCast(slot0);
+                if (want != self.gs().d_attn_slot_host) {
+                    if (self.cu.?.lib.MemcpyAsync(self.gs().d_attn_slot.?, &want,
+                            @sizeOf(c_int), cudart.MemcpyHostToDevice, self.launchStream()) ==
+                        cudart.cudaSuccess)
+                    {
+                        self.gs().d_attn_slot_host = want;
+                    }
+                }
+                if (dBufPtr(q)) |pq| {
+                    if (dBufPtr(gate)) |pgate| {
+                        if (dBufPtr(kcache)) |pk| {
+                            if (dBufPtr(vcache)) |pv| {
+                                if (dBufPtr(gout)) |pgout| {
+                                    const rc = Launch.attn_chunk_dyn(
+                                        pq, pgate, pk, pv, pgout,
+                                        @ptrCast(@alignCast(self.gs().d_attn_slot.?)),
+                                        @intCast(rows), @intCast(heads), @intCast(gqa),
+                                        @intCast(hd), @intCast(kv_dim), scale,
+                                        self.kvKind(), self.launchStream());
+                                    if (rc == cudart.cudaSuccess) return;
+                                    self.ewLaunchFail("attn_chunk_dyn", rc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (dBufPtr(q)) |pq| {
                 if (dBufPtr(gate)) |pgate| {
                     if (dBufPtr(kcache)) |pk| {

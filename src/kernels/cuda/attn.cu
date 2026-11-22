@@ -348,8 +348,12 @@ __global__ void q35_attn_chunk_kernel(
     const float *__restrict__ d_kcache,
     const float *__restrict__ d_vcache,
     float *__restrict__ d_gout,
-    int slot0, int heads, int gqa, int hd, int kv_dim, float scale)
+    int slot0, const int *__restrict__ d_slot0,
+    int heads, int gqa, int hd, int kv_dim, float scale)
 {
+    // `d_slot0` != null 时从设备读起始行，供 CUDA graph 重放使用（捕获时那个
+    // 标量会被固化）。指针与形状不变，graph 节点无需重定向。
+    if (d_slot0 != nullptr) slot0 = *d_slot0;
     const int r = blockIdx.x;               // token within the chunk
     const int h = blockIdx.y;               // head
     const int tid = threadIdx.x;
@@ -564,26 +568,63 @@ extern "C" int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
     switch (kv_kind) {
         case 0:
             q35_attn_chunk_kernel<0><<<grid, 128, smem, (cudaStream_t)stream>>>(
-                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, nullptr, heads, gqa, hd, kv_dim, scale);
             break;
         case 1:
             q35_attn_chunk_kernel<1><<<grid, 128, smem, (cudaStream_t)stream>>>(
-                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, nullptr, heads, gqa, hd, kv_dim, scale);
             break;
         case 2:
             q35_attn_chunk_kernel<2><<<grid, 128, smem, (cudaStream_t)stream>>>(
-                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, nullptr, heads, gqa, hd, kv_dim, scale);
             break;
         default:
             q35_attn_chunk_kernel<-1><<<grid, 128, smem, (cudaStream_t)stream>>>(
-                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+                d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, nullptr, heads, gqa, hd, kv_dim, scale);
             break;
     }
     return (int)cudaGetLastError();
 }
 
-extern "C" int q35_attn_chunk_max_rows(int slot0, int hd, int kv_kind)
+// CUDA-graph 变体：起始行从设备读、dynamic shared 固定为最大值。
+//
+// 捕获时 `slot0` 会被固化，`smem` 也会固化。重放时两者都必须保持不变，否则
+// 每个 token 都要重新捕获（等于没捕获）。把 slot 放进设备内存 + 固定 smem
+// 交给 `cudaFuncSetAttribute` 之后，graph 节点就彻底静态了 —— 与
+// `q35_launch_attn_decode_dyn` 同一个思路。
+extern "C" int q35_launch_attn_chunk_dyn(const float *d_q, const float *d_gate,
+                                         const float *d_kcache, const float *d_vcache,
+                                         float *d_gout, const int *d_slot0, int rows,
+                                         int heads, int gqa, int hd, int kv_dim,
+                                         float scale, int kv_kind, void *stream)
 {
+    if (rows <= 0 || heads <= 0 || hd <= 0) return (int)cudaSuccess;
+    // 固定最大值：`slot0 + rows` 最多到 `Q35_ATTN_CHUNK_SMEM_MAX`。
+    const size_t smem = (size_t)Q35_ATTN_CHUNK_SMEM_MAX * sizeof(float) +
+                        q35_attn_chunk_extra_smem(hd, kv_kind);
+    dim3 grid((unsigned)rows, (unsigned)heads);
+    #define Q35_CHUNK_DYN_LAUNCH(K) \
+        q35_attn_chunk_kernel<K><<<grid, 128, smem, (cudaStream_t)stream>>>( \
+            d_q, d_gate, d_kcache, d_vcache, d_gout, 0, d_slot0, heads, gqa, hd, kv_dim, scale)
+    switch (kv_kind) {
+        case 0:  Q35_CHUNK_DYN_LAUNCH(0); break;
+        case 1:  Q35_CHUNK_DYN_LAUNCH(1); break;
+        case 2:  Q35_CHUNK_DYN_LAUNCH(2); break;
+        default: Q35_CHUNK_DYN_LAUNCH(-1); break;
+    }
+    #undef Q35_CHUNK_DYN_LAUNCH
+    return (int)cudaGetLastError();
+}
+
+/// 上面那个 launcher 需要的 dynamic shared 字节数，用于
+/// `cudaFuncSetAttribute`。与 `q35_attn_chunk_extra_smem` 同源。
+extern "C" unsigned long long q35_attn_chunk_dyn_smem(int hd, int kv_kind)
+{
+    return (unsigned long long)((size_t)Q35_ATTN_CHUNK_SMEM_MAX * sizeof(float) +
+                                q35_attn_chunk_extra_smem(hd, kv_kind));
+}
+
+extern "C" int q35_attn_chunk_max_rows(int slot0, int hd, int kv_kind){
     if (slot0 < 0 || slot0 >= Q35_ATTN_CHUNK_SMEM_MAX) return 0;
     if (hd <= 0) return 0;
     // Room left for scores once the fixed part (2 scalars + the q8_0 copy of Q

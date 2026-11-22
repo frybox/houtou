@@ -439,6 +439,17 @@ int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
                           int kv_kind, void *stream);
 int q35_attn_chunk_max_rows(int slot0, int hd, int kv_kind);
 
+// `q35_launch_attn_chunk` 的 CUDA-graph 变体：起始行 `slot0` 从设备读
+// （`d_slot0`，一个 int），dynamic shared 固定为最大值（调用方须先用
+// `q35_attn_chunk_dyn_smem` 调 `cudaFuncSetAttribute`）。捕获后指针、形状、
+// smem 全部不变，重放无需节点重定向。
+int q35_launch_attn_chunk_dyn(const float *d_q, const float *d_gate,
+                              const float *d_kcache, const float *d_vcache,
+                              float *d_gout, const int *d_slot0, int rows,
+                              int heads, int gqa, int hd, int kv_dim,
+                              float scale, int kv_kind, void *stream);
+unsigned long long q35_attn_chunk_dyn_smem(int hd, int kv_kind);
+
 // Same kernel, but `slot` is read from DEVICE memory (`d_slot`, one int) and the
 // dynamic shared block is the fixed maximum.  Because neither the argument block
 // nor `shared_mem_bytes` changes between tokens, a captured decode-graph node
