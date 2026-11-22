@@ -894,7 +894,13 @@ pub const Engine = struct {
         backend_cpu.setSimdTier(name);
     }
 
-    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize, backend_kind: backend.Kind, kv_type: backend.KvType) !Engine {
+    /// `spec` = 调用方是否要在本次运行里跑推测解码（MTP）。
+    ///
+    /// 它决定 `gdn_in`/`spec_snap` 是否在加载时分配：让不需要推测解码的运行
+    /// 完全不付这块显存（27B 上 6 MB 缓存 + 31 MB 状态快照）。加载时就能
+    /// 确定的事（模型有 nextn 块 + 用户开了开关）不应该拖到第一次
+    /// `generateSpec` 才去分配。
+    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize, backend_kind: backend.Kind, kv_type: backend.KvType, spec: bool) !Engine {
         var nt = n_threads;
         if (nt == 0) {
             const ncpu = std.Thread.getCpuCount() catch 1;
@@ -1344,7 +1350,16 @@ pub const Engine = struct {
         e.mlpK = try e.exec.allocBuf(K * cfg.n_ff);
         e.mlpK1 = try e.exec.allocBuf(K * cfg.n_ff);
         e.logitsK = try e.exec.allocBuf(spec_verify_rows * cfg.vocab);
+        // 推测解码回滚的每层投影缓存（见 `gdn_in`）。加载时就分配：
+        // "要不要跑推测解码"在 `load` 之前就定了（`spec` 参数 + 模型是否有
+        // nextn 块），把这块拖到第一次 `generateSpec` 只会让分配点离使用点
+        // 更远，也让 `specSnapshotAlloc` 混着做两件不相干的事。
+        try e.allocGdnIn(alloc, spec);
         try e.exec.allocScratchK(max_q8_cols, K);
+        // 推测解码的状态快照（`spec_snap`）。与 `gdn_in` 同一原则：要不要跑
+        // 推测解码在加载时就已确定，快照尺寸（`gdn[i].conv/state` 的长度）也
+        // 在逐层分配时定下来了，所以一起在这里分配。普通运行两者都不分配。
+        try e.allocSpecSnapshot(alloc, spec);
         prof_io = io;
         return e;
     }
@@ -1420,6 +1435,11 @@ pub const Engine = struct {
         self.freeCachesUpTo(self.nSlots());
         if (self.kv.len > 0) a.free(self.kv);
         if (self.gdn.len > 0) a.free(self.gdn);
+        // `gdn_in` 与 `spec_snap` 只有 host 侧的数组本身要在这里回收：它们指向的
+        // `qkv`/`gamma`/`conv`/`state` 是 `allocBuf` 区域，上面 `freeScratch()`
+        // 已经连带释放。
+        if (self.gdn_in.len > 0) a.free(self.gdn_in);
+        if (self.spec_snap.len > 0) a.free(self.spec_snap);
         // `tap_layers` is a host allocation made by `specTapEnable` (the
         // `tap_hidden` region itself is backend scratch and goes with
         // `freeScratch()` above).
@@ -2476,55 +2496,61 @@ pub const Engine = struct {
     // Speculative-decoding rollback (stage 2)
     // -----------------------------------------------------------------
 
-    /// Allocate the snapshot a spec round needs to undo a partially accepted
-    /// verify block.  One call per process; the buffers are the same size every
-    /// round.
+    /// 在 `load` 里分配推测解码回滚用的每层投影缓存（`gdn_in`）。
     ///
-    /// WHAT IS SAVED (the complete list -- nothing else carries per-token
-    /// state, see `spec_rollback.zig`'s header):
-    ///   * full-attention layers: only `KvCache.len`.  The ROWS are not copied:
-    ///     the next verify overwrites them and nothing reads past `len`, so
-    ///     rewinding the count is the whole undo.
-    ///   * GDN layers: `conv` (the last K-1 raw samples per channel) and
-    ///     `state` (the [nv, kd, vd] delta-rule matrix) are copied whole.  Both
-    ///     are consumed non-linearly (the conv shifts, the delta rule divides by
-    ///     a running norm), so there is no cheap inverse -- copy and restore.
+    /// `spec = false`、模型没有 nextn 块（`e.nextn == null`，此时
+    /// `generateSpec` 会直接退回普通解码）、或 `nbatch == 0`（批量路径不可用）
+    /// 时什么都不做，`gdn_in` 保持空 —— 这些运行完全不付这块显存。
+    /// 27B 上它是 48 层 × (16×10240 + 16×96) floats ≈ 6 MB。
     ///
-    /// 31.4 MB for the 27B (48 GDN layers), taken once per round.
-    pub fn specSnapshotAlloc(self: *Engine, alloc: std.mem.Allocator) !void {
-        if (self.spec_snap.len > 0) return;
-        // 每层 GDN 的状态内核输入，按 verify 块的大小分配。27B 上约 6 MB，
-        // 而"每个 token 存一份完整状态"的设计需要 151 MB。
-        if (self.gdn_in.len == 0 and self.nbatch != 0 and self.gdn.len > 0) {
-            const c = self.cfg;
-            const nv: usize = c.gdn_n_heads;
-            const nk: usize = c.gdn_num_k_heads;
-            const kd: usize = c.gdn_head_dim;
-            const conv_dim: usize = 2 * nk * kd + nv * kd;
-            // `@min` 的结果类型会窄化到整数常量的位宽（16 -> `u5`），
-            // 于是 `rows * 2 * nv` 在 ReleaseFast 下静默回绕成 0
-            // （实测：`gamma` 拿到长度 0，缓存从未写入）。乘积必须留在 `usize` 里。
-            const rows: usize = @min(spec_verify_rows, self.nbatch);
-            const ins = try alloc.alloc(GdnIn, self.gdn.len);
-            errdefer alloc.free(ins);
-            @memset(ins, .{});
-            for (ins) |*gi| {
-                gi.qkv = try self.exec.allocBuf(rows * conv_dim);
-                gi.gamma = try self.exec.allocBuf(rows * 2 * nv);
-            }
-            self.gdn_in = ins;
+    /// 调用点必须在 `e.nextn` 赋值之后（`load` 的逐层分配之后）。
+    fn allocGdnIn(self: *Engine, alloc: std.mem.Allocator, spec: bool) !void {
+        if (!spec or self.nextn == null or self.nbatch == 0 or self.gdn.len == 0) return;
+        const c = self.cfg;
+        const nv: usize = c.gdn_n_heads;
+        const nk: usize = c.gdn_num_k_heads;
+        const kd: usize = c.gdn_head_dim;
+        const conv_dim: usize = 2 * nk * kd + nv * kd;
+        // `@min` 的结果类型会窄化到整数常量的位宽（16 -> `u5`），
+        // 于是 `rows * 2 * nv` 在 ReleaseFast 下静默回绕成 0
+        // （实测：`gamma` 拿到长度 0，缓存从未写入）。乘积必须留在 `usize` 里。
+        const rows: usize = @min(spec_verify_rows, self.nbatch);
+        const ins = try alloc.alloc(GdnIn, self.gdn.len);
+        // 中途失败时只回收 host 数组：`allocBuf` 的区域归 `exec.freeScratch()`，
+        // 不能在这里单独 free（会与它二次释放）。
+        errdefer alloc.free(ins);
+        @memset(ins, .{});
+        for (ins) |*gi| {
+            gi.qkv = try self.exec.allocBuf(rows * conv_dim);
+            gi.gamma = try self.exec.allocBuf(rows * 2 * nv);
         }
+        self.gdn_in = ins;
+    }
+
+    /// 在 `load` 里分配一轮推测解码回滚所需的快照。
+    ///
+    /// 快照保存的是"verify 一个块之前"每个携带状态的地方，回滚时据此恢复
+    /// （`spec_rollback.zig` 的文件头解释了为什么没有增量逆运算可选）：
+    ///   * full-attention 层：只存 `KvCache.len`。ROWS 不拷贝——下一次 verify
+    ///     会覆盖它们，而且越过 `len` 的行从不被读，所以回退计数就是全部撤销。
+    ///   * GDN 层：`conv`（每通道最后 K-1 个原始样本）与 `state`
+    ///     （[nv, kd, vd] 的 delta 规则矩阵）整块拷贝。两者都按非线性方式被消费
+    ///     （卷积会移位，delta 规则除以一个运行中的范数），所以便宜地求逆。
+    ///
+    /// 27B（48 个 GDN 层）约 31.4 MB，全程一次。
+    ///
+    /// `spec = false` / 无 nextn 块 / `nbatch == 0` 时不分配，`spec_snap` 保持空。
+    /// 必须在 `e.gdn` 逐层分配之后调用（尺寸取自它）。
+    fn allocSpecSnapshot(self: *Engine, alloc: std.mem.Allocator, spec: bool) !void {
+        if (!spec or self.nextn == null or self.gdn.len == 0) return;
         if (spec_dummy_alloc) {
-            // `$QWEN35_SPEC_DUMMYALLOC`: reserve one throwaway device region
-            // during speculative setup.  Used to check that the MTP path's
-            // output does NOT depend on the device allocator's layout: with this
-            // set the token stream is still bit-identical (measured 3/3), so a
-            // change in behaviour between two builds is real logic, not address
-            // luck.
+            // `$QWEN35_SPEC_DUMMYALLOC`：在推测解码的设置阶段预留一块一次性设备区域。
+            // 用来检查 MTP 路径的输出**不**依赖设备分配器的布局：开着它 token 流
+            // 仍逐位一致（实测 3/3），所以两个构建间行为变化是真的逻辑差异，
+            // 不是地址运气。
             //
-            // Do NOT touch `Buf.slice()` here: on CUDA a `Buf` is a DEVICE
-            // address, so writing through it from the host is an illegal access
-            // and the process dies silently (measured).
+            // 不要在这里碰 `Buf.slice()`：CUDA 上 `Buf` 是**设备**地址，从主机侧
+            // 写它是非法访问，进程会静默死掉（实测）。
             _ = try self.exec.allocBuf(48 * 16 * 10240);
         }
         const n = self.nSlots();
@@ -2534,8 +2560,8 @@ pub const Engine = struct {
             s.* = .{ .conv = backend.Buf.empty, .state = backend.Buf.empty, .conv_len = 0, .kv_len = 0 };
             if (i < self.gdn.len) {
                 const g = self.gdn[i];
-                // Backend regions, mirroring the live buffers' own residency:
-                // on CUDA this is VRAM, so the round's copy is D2D.
+                // 后端区域，与活缓冲的 residency 一致：CUDA 上是 VRAM，
+                // 所以每轮的拷贝是 D2D。
                 if (g.conv.len > 0) s.conv = try self.exec.allocBuf(g.conv.len);
                 if (g.state.len > 0) s.state = try self.exec.allocBuf(g.state.len);
             }
@@ -3315,8 +3341,6 @@ pub const Engine = struct {
         // without this the first round drafts from a single row (`nctx=1`) and
         // nothing it proposes can be right.
         if (self.nbatch != 0) self.specRingFillFromChunk(prompt.len, 0);
-
-        try self.specSnapshotAlloc(alloc);
 
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(alloc);

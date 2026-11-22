@@ -987,7 +987,7 @@ fn runInference(
         },
     }
 
-    var e = engine.Engine.load(arena, path, io, n_threads, backend_kind, kv_type) catch |e2| {
+    var e = engine.Engine.load(arena, path, io, n_threads, backend_kind, kv_type, spec_mtp) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;
