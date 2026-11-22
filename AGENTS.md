@@ -591,8 +591,69 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 - **CALLS 表必须逐行抄 `QWEN35_MVLIST` 的真实输出**。曾手写一条 `5120x5120 q8_0`
   （模型里不存在），把该类型的字节数放大了 100 倍。
 
-## 6. 手动运行与性能对比（模型与 target）
+### 5.y 推测解码（MTP）的实测结论：不要重走这些弯路
 
+**现状：MTP 在 27B IQ3_XXS 上约 21 tok/s，plain 解码 53+ tok/s。MTP 目前是净负。**
+
+逐项都是实测，不是推断：
+
+- **接受长度 2.82 tokens/轮（47.6% 接受率）**，草稿头本身有效。理论上限约 85 tok/s。
+- **差距 100% 在提交侧**（每轮 11926 次 `cudaLaunchKernel`，设备在两次提交之间空转），
+  但两条消除它的路都试过且失败：
+  - **给 draft 头单独的可捕获图**（llama.cpp 的 `LLAMA_CONTEXT_TYPE_MTP` 做法，
+    `common/speculative.cpp:2659`）。已完整实现（`VTable.specStep` + 独立 capture），
+    但**实测净亏**：重放会重跑整段录下的 chunk，而主机侧未被吸收的 op 照常执行，
+    批量 matvec 调用从 3478 翻倍到 7454，tok/s 从 21 掉到 12。接受率同时从
+    47.6% 崩到 11.9%（`dequantRow` 在主机侧按 `next_token` 选行，指针在捕获时固化）。
+  - **免重放回滚**（缓存每层 prelude 输入，回滚时只重算 `accepted` 行）。
+    实现了 4 个版本，全部失败。下面 §5.z 记录了为什么。
+- **`mv_batchk` 占一轮的 91%**（`$QWEN35_PROF`，16 token：`mv_batchk calls=199 pct=91.4%`），
+  不是草稿链。回滚即使优化到零也只省其中约 37%。
+
+**判别正确的唯一可靠手段**：`QWEN35_SPEC_MTP=1 QWEN35_DUMP_IDS=1 ... -n 16` 的
+`IDS:` 行 md5 必须等于 `857b78f30003c6f3417265269845c4d7`（27B IQ3_XXS，
+prompt "天空为什么是蓝色的？"）。这是**调试判据，不是验收标准**（§4）。
+推测解码的接受路径按定义必须与 greedy 逐位一致，所以这个 md5 是合法的等价性探针。
+
+### 5.z 免重放回滚：五个已验证的前提，和一个仍未解释的失败
+
+想用"缓存 prelude 输入 + 重跑 accepted 行"代替"重放整个 65 层 forward"。
+每一步单独验证都通过，整体结果仍错。已固定的测试（都是可敏感验证的）：
+
+| 测试 | commit | 敏感性验证 |
+|---|---|---|
+| `gdnStepRowsChunk(rows=r)` == `r` 次单步 | `3cb421d` | k 行跨步改 1 个元素即失败 |
+| chunk prelude == `r` 次单 token（含 conv 历史） | `b9d1cd4` | `conv_k-1` 即失败 |
+| prelude 输出 → 状态内核（`rows<k`）的组合 | `53a64d0` | 参照里 k 段偏移改回 `kq*kd` 即失败 |
+
+逐项探针（`$QWEN35_SPEC_ROLLBACK_DIAG`，一轮内 A/B 重建 vs 重放）：
+
+```
+prelude 输入的原始 qkv   ndiff=0/10240     ✓
+prelude 输出（卷积后）   ndiff=0/10240     ✓
+卷积历史                ndiff=0/30720     ✓
+快照恢复后的起始 state   ndiff=0/37748736  ✓
+最终 state              ndiff≈92%         ✗  ← 仍未解释
+```
+
+**已经确认并修掉的真实缺陷（都会重犯）**：
+
+1. **`ab` 的布局是 `[a: k*nv][b: k*nv]`**（`k` = verify 块行数）。按 `rows`
+   压缩成 `[a: rows*nv][b: rows*nv]` 会让第 r 行读到别行的 alpha 当 beta。
+2. **CUDA 的 `gdnPrefillCore` 曾把 l2norm 重复 `nv/nk` 次（27B 上 3 次）**，
+   CPU 只做一次。`l2norm` **不幂等**（每多一次除以 `sqrt(1+eps)`）。已在
+   `d79d79f` 修正。**这条意味着 2026-11-22 之前所有 CPU/CUDA 的 GDN A/B 都不可信**。
+3. **KV 回滚是"截断到 `kv_len + rows`"**，不是恢复到 `kv_len`：verify 已写入全部
+   `k` 行，被接受前缀是它们的前缀。恢复成 `kv_len` 会丢掉下一轮要 attend 的行。
+4. **`tap_hidden` 第 0 行必须是被接受 token 的隐藏态**（`rows-1` 行搬过来）。
+   重放原本靠"每 token 覆盖一次"得到它，重建不会自然产生。
+
+**仍未解决的**：上述四项全对，最终 GDN 状态仍然错约 92%。这说明还存在一个
+未被定位的耦合。**下次继续时不要再用单点比对**——需要给整条 GDN 路径加
+指令级追踪（每个 kernel 调用前后记录输入输出哈希），否则会像本轮一样反复
+在"每一环都对但整体错"里打转。
+
+## 6. 手动运行与性能对比（模型与 target）
 > 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
 > 提交前必跑的步骤。以下 target 只用于手动调试与性能对比。
 
