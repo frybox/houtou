@@ -225,6 +225,8 @@ const Kernels = struct {
     extern fn q35_func_copy_range() callconv(.c) ?*anyopaque;
     extern fn q35_launch_kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_kv_quant() callconv(.c) ?*anyopaque;
+    extern fn q35_launch_kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_func_kv_quant_dslot() callconv(.c) ?*anyopaque;
 };
 
 /// Row-range split factor for decode attention.  `0` disables it (one block per
@@ -309,6 +311,8 @@ const Launch = if (cuda_linked) struct {
     const add_resid = Kernels.q35_launch_add_resid;
     const copy_range = Kernels.q35_launch_copy_range;
     const kv_quant = Kernels.q35_launch_kv_quant;
+    const kv_quant_dslot = Kernels.q35_launch_kv_quant_dslot;
+    const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
     const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
     const zero_buf = Kernels.q35_launch_zero_buf;
@@ -427,6 +431,13 @@ const Launch = if (cuda_linked) struct {
     fn kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, kind, stream };
         return stubNoCudaKernels();
+    }
+    fn kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream };
+        return stubNoCudaKernels();
+    }
+    fn func_kv_quant_dslot() callconv(.c) ?*anyopaque {
+        return null;
     }
     fn deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_src, heads, hd, stream };
@@ -1415,6 +1426,12 @@ pub const CudaBackend = struct {
     //              must be redirectable to `g_stream`.
     //   live    -- `g_exec` holds a replayable graph.
     g_state: GraphState = .off,
+    /// 设备端的一个 int：当前 KV 写入的起始行号。`q35_launch_kv_quant_dslot`
+    /// 从它读行号，所以 graph 捕获下来的指针在重放时仍然有效（每 token 只需
+    /// 更新这一个 int）。非 graph 路径不使用它。
+    d_kv_slot: ?*anyopaque = null,
+    /// Host 镜像，用来判断是否需要重新 H2D（只有值变了才写）。
+    d_kv_slot_host: c_int = -1,
     /// Non-default stream the graph was captured on and is replayed on.
     /// Created lazily (a CUDA build that never enables the feature pays
     /// nothing), never the legacy default stream -- capture of that one is
@@ -2156,6 +2173,15 @@ pub const CudaBackend = struct {
                 return false;
             }
             self.g_stream = s;
+        }
+        if (self.d_kv_slot == null) {
+            var p: ?*anyopaque = null;
+            if (cu.lib.Malloc(&p, @sizeOf(c_int)) != cudart.cudaSuccess or p == null) {
+                self.g_failed = true;
+                return false;
+            }
+            self.d_kv_slot = p;
+            self.d_kv_slot_host = -1;
         }
         if (self.g_ev == null) {
             // Disable timing: this event is a pure ordering token, and the
@@ -4774,10 +4800,32 @@ const attn_score_arity: usize = 11;
             cpu_mod.CpuBackend.vtable.kvAppend(@ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
             return;
         }
+        const cu = &self.cu.?;
         // `dst` is the layer's WHOLE region (an f32 view); the cache row for
         // `slot` is `slot * row_bytes` bytes past the base.
         const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst.ptr));
         const out_ptr: [*]u8 = dst_bytes + slot * row_bytes;
+        // While a graph is LIVE (replay), the row number comes from the device
+        // so the captured pointers stay valid.  During CAPTURE we must NOT use
+        // this path: the H2D below would itself be recorded into the graph and
+        // replayed with a stale value.  Capture keeps the historical
+        // `out_ptr` + retargeting route instead.
+        if (self.g_state == .live and self.kv_type == .f16 and rows == 1 and self.d_kv_slot != null) {
+            const want: c_int = @intCast(slot);
+            if (want != self.d_kv_slot_host) {
+                if (cu.lib.MemcpyAsync(self.d_kv_slot.?, &want, @sizeOf(c_int),
+                        cudart.MemcpyHostToDevice, self.launchStream()) == cudart.cudaSuccess)
+                {
+                    self.d_kv_slot_host = want;
+                }
+            }
+            const nbp = @as(c_int, @intCast(kv_dim / 32));
+            const rc0 = Launch.kv_quant_dslot(src.ptr, @ptrCast(dst_bytes),
+                @ptrCast(@alignCast(self.d_kv_slot.?)), nbp, 1,
+                @intCast(row_bytes), self.launchStream());
+            if (rc0 == cudart.cudaSuccess) return;
+            self.ewLaunchFail("kv_quant_dslot", rc0);
+        }
         // Record the captured destination (row `slot`) for graph retargeting.
         if (self.capturing() and rows == 1) {
             self.graphNoteKvDst(@ptrCast(out_ptr), row_bytes);

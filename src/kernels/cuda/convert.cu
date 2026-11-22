@@ -761,6 +761,57 @@ extern "C" int q35_launch_quantize_q8_0(const float *d_x, void *d_out_v,
 // captured nodes on this value (see `q35_func_copy_range`).
 extern "C" void *q35_func_kv_quant(void) { return (void *)&q35_k_kv_quant; }
 
+// 变体：目标行号从 DEVICE 读（`d_slot`，一个 int），行基址固定。
+//
+// 为什么（CUDA graph）：decode 的 KV 写入点每 token 前进一行。原 launcher 把
+// `d_out + slot*row_bytes` 算在 host 上，graph 捕获后那个地址就被冻住了，
+// 重放会把每个 token 的 k/v 都写回捕获时的行——数字全错且没有任何报错。
+// 把 slot 放进设备内存后，指针和形状在捕获和重放之间完全一致，graph 无需
+// 任何节点重定向（llama.cpp 就是这么做的：KV 视图固定、位置经设备张量传，
+// 见 `ggml-cuda.cu:4706` 的 `properties_changed` 判据）。
+//
+// 只实现 `kind == 0`（f16，本仓库 decode 的默认 KV 类型）。其它类型由调用方
+// 回退到 host-slot 的 `q35_launch_kv_quant`，那条路本来就带 graph 重定向。
+__global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
+                                     unsigned char *__restrict__ out_base,
+                                     const int *__restrict__ d_slot,
+                                     int nblocks_per_row, int rows_this,
+                                     int row_bytes)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = nblocks_per_row * rows_this;
+    if (b >= total) return;
+    const int row = b / nblocks_per_row;
+    const int bi = b - row * nblocks_per_row;
+    const int slot = *d_slot + row;
+    const float *xb = x + (size_t)b * Q35_QK8_0;
+    unsigned char *ob = out_base + (size_t)slot * row_bytes + (size_t)bi * 64;
+    // 块内算术逐字照抄 `q35_k_kv_quant` 的 kind==0 分支。
+#pragma unroll
+    for (int k = 0; k < Q35_QK8_0; ++k) {
+        const unsigned short h = q35_st_scale_bits(xb[k]);
+        ob[2 * k] = (unsigned char)(h & 0xffu);
+        ob[2 * k + 1] = (unsigned char)(h >> 8);
+    }
+}
+
+extern "C" int q35_launch_kv_quant_dslot(const float *d_x, void *d_out_base,
+                                         const int *d_slot, int nblocks_per_row,
+                                         int rows_this, int row_bytes,
+                                         void *stream_v)
+{
+    if (nblocks_per_row <= 0 || rows_this <= 0) return (int)cudaSuccess;
+    const int total = nblocks_per_row * rows_this;
+    const int threads = 128;
+    const int blocks = (total + threads - 1) / threads;
+    q35_k_kv_quant_dslot<<<blocks, threads, 0, (cudaStream_t)stream_v>>>(
+        d_x, (unsigned char *)d_out_base, d_slot, nblocks_per_row, rows_this,
+        row_bytes);
+    return (int)cudaGetLastError();
+}
+
+extern "C" void *q35_func_kv_quant_dslot(void) { return (void *)&q35_k_kv_quant_dslot; }
+
 // `nblocks` = number of 32-element blocks in the rows being written.
 extern "C" int q35_launch_kv_quant(const float *d_x, void *d_out_v, int nblocks,
                                    int kind, void *stream_v)
