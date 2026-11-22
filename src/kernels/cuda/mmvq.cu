@@ -779,6 +779,65 @@ static int q35_coop_warps(int nblk) {
 // type cannot support (`q35_split_units(ttype) % split != 0`) is clamped down to
 // the largest supported divisor at the call site, so the env var can never make
 // the kernel read a slice that does not exist.
+
+/// 诊断开关 `$QWEN35_CUDA_NOSPLIT=<Q35_TT_* 数值>`：让该类型的 decode matvec
+/// 不走 K-split 形态（退回 1-block-per-warp 的 coop 形态）。
+///
+/// 用途只有一个：量出"某类型在 decode 流量里的份额及其 split 带来的收益"。
+/// host-only，设备侧绝不读环境变量 —— 那样会静默污染结果，是本仓库踩过的坑。
+static int q35_split_disabled_for(int ttype) {
+    static int cached = -2;   // -2 = 未初始化, -1 = 关闭
+    if (cached == -2) {
+        const char *raw = getenv("QWEN35_CUDA_NOSPLIT");
+        cached = (raw != NULL && *raw) ? atoi(raw) : -1;
+    }
+    return cached >= 0 && cached == ttype;
+}
+
+static int q35_split_for(int ttype) {
+    static int cached_global = -1;
+    if (cached_global < 0) {
+        int v = 8;   // measured-best on sm_89 for IQ3_XXS (see the kernel header)
+        const char *raw = getenv("QWEN35_CUDA_SPLIT");
+        if (raw != NULL && *raw) {
+            int t = atoi(raw);
+            if (t == 0 || t == 1 || t == 2 || t == 4 || t == 8 || t == 16 || t == 32) v = t;
+            else fprintf(stderr, "cuda kernels: QWEN35_CUDA_SPLIT='%s' is not one of 0/1/2/4/8/16/32; using 8\n", raw);
+        }
+        cached_global = v;
+        fprintf(stderr, "cuda kernels: decode K-split lanes/block = %d ($QWEN35_CUDA_SPLIT overrides)\n", cached_global);
+    }
+    // 诊断：`$QWEN35_CUDA_SPLIT_TT="<ttype>:<split>,<ttype>:<split>"` 按类型覆盖。
+    // 只用于找每型最优；host-only。
+    static int parsed = -1;
+    static int over_t[32];
+    static int over_v[32];
+    static int over_n = 0;
+    if (parsed < 0) {
+        parsed = 0;
+        const char *raw = getenv("QWEN35_CUDA_SPLIT_TT");
+        if (raw != NULL && *raw && over_n < 32) {
+            const char *p = raw;
+            while (*p && over_n < 32) {
+                int tt = atoi(p);
+                const char *c = strchr(p, ':');
+                if (c == NULL) break;
+                int sp = atoi(c + 1);
+                over_t[over_n] = tt;
+                over_v[over_n] = sp;
+                over_n++;
+                const char *n = strchr(c + 1, ',');
+                if (n == NULL) break;
+                p = n + 1;
+            }
+        }
+    }
+    for (int i = 0; i < over_n; ++i) {
+        if (over_t[i] == ttype) return over_v[i];
+    }
+    return cached_global;
+}
+
 static int q35_split() {
     static int cached = -1;
     if (cached >= 0) return cached;
@@ -845,8 +904,8 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
         // count so an unsupported value degrades to a valid shape instead of
         // reading a slice that does not exist.
         {
-            const int units = q35_split_units(ttype);
-            int split = q35_split();
+            const int units = q35_split_disabled_for(ttype) ? 0 : q35_split_units(ttype);
+            int split = q35_split_for(ttype);
             if (units > 0 && split > 1) {
                 // Clamp to the largest divisor of the unit count, capped at the
                 // unit count itself: `split > units` would give every lane an

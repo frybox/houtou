@@ -1889,6 +1889,7 @@ fn runInference(
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
         e.spec_trace_dbg = spec_trace;
+        e.spec_posstat = spec_posstat;
         // 草稿头的置信度早停阈值（llama.cpp 的 `p_min`）。实测 0.9 最好：
         // p_min 0/0.3/0.5/0.7/0.9 → 37.7/39.1/40.9/43.0/43.0 tok/s（draft=2）。
         var p_min: f32 = 0.9;
