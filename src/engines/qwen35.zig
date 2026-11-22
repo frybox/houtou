@@ -23,6 +23,13 @@
 
 const std = @import("std");
 
+/// `$QWEN35_SPEC_FASTROLLBACK=0`：A/B 切回整段重放。快速路径已是默认，
+/// 因为已验证它与重放逐位一致。
+pub var spec_fast_rollback = true;
+
+/// `$QWEN35_SPEC_RBDBG`：打印快速回滚路径的决策与状态比对。
+pub var cudart_debug_rollback = false;
+
 /// `$QWEN35_SPEC_DUMMYALLOC`: DIAGNOSTIC.  Allocates one throwaway device
 /// region during speculative setup, to test whether the MTP path's output
 /// depends on the device allocator's layout (it should not).
@@ -626,6 +633,18 @@ pub const Engine = struct {
     /// `forwardGdnCore`.  Separate from `gamma_scratch` so the serial decode path
     /// keeps its single-row region untouched.
     gdn_prefill_gamma: backend.Buf,
+    /// 每层 GDN 在 verify 块上的**原始投影**缓存（pre-conv 的 `qkv` 与 `ab`）。
+    ///
+    /// 这是让推测解码的回滚变便宜的东西：verify 已经把整块每一行都算过，
+    /// 而被接受的前缀就是这些行的前缀，所以从快照恢复后只把那些行重走一遍
+    /// `gdnStepRowsChunk` 就能精确复现状态——不必重跑 65 层投影。
+    /// 实测：MTP 每 32 个 token 要 7951 次批量 matvec（plain 只有 496），
+    /// 多出来的全在重放里。
+    ///
+    /// 必须缓存 pre-conv 的原始投影，不能缓存 conv 之后的字节：卷积历史由
+    /// prelude 推进，且无法从 conv 的**输出**反推，所以缓存 post-conv 会让
+    /// 回滚退回"重跑整条链"。见 `specRollbackAndReplay`。
+    gdn_in: []GdnIn = &.{},
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
@@ -823,6 +842,16 @@ pub const Engine = struct {
     };
 
     pub const max_seq: u32 = 4096;
+
+    /// 一层 GDN 的状态内核输入缓存（见 `gdn_in`）。
+    pub const GdnIn = struct {
+        /// 该层 `matvecBatchK` 产出的**原始** `[q|k|v]` 投影行，`K * conv_dim`。
+        /// 刻意缓存 pre-conv 的字节：回滚要重跑 prelude，让卷积历史只前进
+        /// `accepted` 步，而不是 verify 的 `k` 步。
+        qkv: backend.Buf = backend.Buf.empty,
+        /// 每 token 的原始 `[a|b]` 投影，`K * 2 * nv`（即 prelude 的输入）。
+        gamma: backend.Buf = backend.Buf.empty,
+    };
 
     /// Rows `forwardChunkVerify` accepts.  A spec block is `block_size` (16 on
     /// the 27B), so the verify buffer is `16 * vocab` f32 -- distinct from the
@@ -1663,6 +1692,18 @@ pub const Engine = struct {
                 self.exec.matvecBatchK(self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
                 self.exec.matvecBatchK(self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
                 self.exec.matvecBatchK(self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
+                // 为推测解码回滚保留 PRE-prelude 的投影。必须是原始行：
+                // 回滚只对 `rows` 个 token 重跑 prelude，而 prelude 会推进卷积
+                // 历史并就地重写 `qkv`/`ab`——这两样都无法从 POST-prelude 的
+                // 字节恢复（实测：缓存那些字节会让 conv 停在 `k` 深，而 state
+                // 已退到 `rows`）。
+                if (li < self.gdn_in.len) {
+                    const gi = &self.gdn_in[li];
+                    if (gi.qkv.len >= k * conv_dim and gi.gamma.len >= k * 2 * nv) {
+                        self.exec.copyRange(gi.qkv.span(0, k * conv_dim), self.qkvK.span(0, k * conv_dim));
+                        self.exec.copyRange(gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
+                    }
+                }
                 t = 0;
                 // Chunk-wide GDN prelude: conv+silu, gamma/beta and the
                 // l2norm/scale passes do not touch the running state, and
@@ -2452,6 +2493,27 @@ pub const Engine = struct {
     /// 31.4 MB for the 27B (48 GDN layers), taken once per round.
     pub fn specSnapshotAlloc(self: *Engine, alloc: std.mem.Allocator) !void {
         if (self.spec_snap.len > 0) return;
+        // 每层 GDN 的状态内核输入，按 verify 块的大小分配。27B 上约 6 MB，
+        // 而"每个 token 存一份完整状态"的设计需要 151 MB。
+        if (self.gdn_in.len == 0 and self.nbatch != 0 and self.gdn.len > 0) {
+            const c = self.cfg;
+            const nv: usize = c.gdn_n_heads;
+            const nk: usize = c.gdn_num_k_heads;
+            const kd: usize = c.gdn_head_dim;
+            const conv_dim: usize = 2 * nk * kd + nv * kd;
+            // `@min` 的结果类型会窄化到整数常量的位宽（16 -> `u5`），
+            // 于是 `rows * 2 * nv` 在 ReleaseFast 下静默回绕成 0
+            // （实测：`gamma` 拿到长度 0，缓存从未写入）。乘积必须留在 `usize` 里。
+            const rows: usize = @min(spec_verify_rows, self.nbatch);
+            const ins = try alloc.alloc(GdnIn, self.gdn.len);
+            errdefer alloc.free(ins);
+            @memset(ins, .{});
+            for (ins) |*gi| {
+                gi.qkv = try self.exec.allocBuf(rows * conv_dim);
+                gi.gamma = try self.exec.allocBuf(rows * 2 * nv);
+            }
+            self.gdn_in = ins;
+        }
         if (spec_dummy_alloc) {
             // `$QWEN35_SPEC_DUMMYALLOC`: reserve one throwaway device region
             // during speculative setup.  Used to check that the MTP path's
@@ -2508,18 +2570,151 @@ pub const Engine = struct {
     /// (`spec_rollback.zig` explains why an incremental undo is not available).
     /// `tokens` holds the ACCEPTED ids; their logits are discarded.
     pub fn specRollbackAndReplay(self: *Engine, tokens: []const u32, pos: u32) void {
-        for (self.spec_snap, 0..) |*s, i| {
-            if (i < self.kv.len) self.kv[i].len = s.kv_len;
+        const rows = tokens.len;
+        if (!spec_fast_rollback or self.gdn_in.len != self.gdn.len) {
+            // 参照路径：恢复快照，然后逐 token 重跑整个 forward。
+            for (self.spec_snap, 0..) |*s, i| {
+                if (i < self.kv.len) self.kv[i].len = s.kv_len;
+                if (i < self.gdn.len) {
+                    const g = &self.gdn[i];
+                    // 设备到设备，与 `specSnapshotTake` 对称。快照就是放在
+                    // 后端内存里，所以这里永远不跨 PCIe。
+                    if (g.conv.len > 0) self.exec.copyRange(g.conv, s.conv);
+                    if (g.state.len > 0) self.exec.copyRange(g.state, s.state);
+                    g.conv_len = s.conv_len;
+                }
+            }
+            for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            return;
+        }
+        if (cudart_debug_rollback) {
+            // `$QWEN35_SPEC_RBDBG`：用两个可逐字节比较的方式重建一次状态。
+            // 先恢复到快照、跑 `specRollbackFast`（prelude + 状态内核），再恢复
+            // 快照、用参照重放算同一件事；两者不一致就指名是重建的问题，
+            // 因为重放自己会恢复每一个承载状态的缓冲。最终以重放的结果继续。
+            self.specRestoreSnapshot();
+            self.specRollbackFast(rows);
+            const a = self.alloc.alloc(f32, self.gdn[0].state.len) catch return;
+            defer self.alloc.free(a);
+            self.exec.copyOut(a, self.gdn[0].state);
+            self.specRestoreSnapshot();
+            for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            const b = self.alloc.alloc(f32, self.gdn[0].state.len) catch return;
+            defer self.alloc.free(b);
+            self.exec.copyOut(b, self.gdn[0].state);
+            var nd: usize = 0;
+            var w: f32 = 0;
+            for (a, b) |x, y| {
+                const d = @abs(x - y);
+                if (d > 1e-6) nd += 1;
+                if (d > w) w = d;
+            }
+            std.debug.print("[rbfast] rows={d} L0 state fast-vs-replay ndiff={d}/{d} w={e}\n", .{ rows, nd, a.len, w });
+            return;
+        }
+        self.specRollbackFast(rows);
+    }
+
+    /// 把 GDN 状态回滚到 `rows` 个 token，**不重放 forward**。
+    ///
+    /// verify 已经把整块每一行都跑过状态内核，而被接受的前缀就是这些行的
+    /// 前缀，所以：
+    ///
+    ///   * KV：只改长度。verify 已追加全部 `k` 行，而越过 `len` 的行从不被读，
+    ///     所以 `snapshot + rows` 就是整个回滚。
+    ///   * GDN 的 state 与 conv：从 verify 前的快照恢复，然后用**缓存输入**
+    ///     (`gdn_in`) 把被接受的行重新走一遍 `gdnStepRowsChunk`——每层一次内核
+    ///     调用，而不是整个 65 层 forward。
+    ///
+    /// 卷积历史在这里不需要单独处理：`gdn_in` 存的是**原始投影（pre-conv）**，
+    /// 所以对 accepted 行重跑 prelude 会让 `conv` 恰好前进 `rows` 步，并就地
+    /// 重写 `qkv`/`ab`，随后状态内核看到的就是它本来会看到的输入。
+    /// （缓存 post-conv 的行是错的——实测：卷积历史无法从它自己的输出反推，
+    /// 于是 `conv` 停在 `k` 深而 state 已退到 `rows`。）
+    fn specRestoreSnapshot(self: *Engine) void {
+        for (self.spec_snap, 0..) |*sn, i| {
+            if (i < self.kv.len) self.kv[i].len = sn.kv_len;
             if (i < self.gdn.len) {
                 const g = &self.gdn[i];
-                // Device-to-device, mirroring `specSnapshotTake`.  The snapshot
-                // lives in backend memory precisely so this never crosses PCIe.
-                if (g.conv.len > 0) self.exec.copyRange(g.conv, s.conv);
-                if (g.state.len > 0) self.exec.copyRange(g.state, s.state);
-                g.conv_len = s.conv_len;
+                if (g.conv.len > 0) self.exec.copyRange(g.conv, sn.conv);
+                if (g.state.len > 0) self.exec.copyRange(g.state, sn.state);
+                g.conv_len = sn.conv_len;
             }
         }
-        for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+    }
+
+    fn specRollbackFast(self: *Engine, rows: usize) void {
+        if (rows == 0) return;
+        const c = self.cfg;
+        const nv: usize = c.gdn_n_heads;
+        const nk: usize = c.gdn_num_k_heads;
+        const kd: usize = c.gdn_head_dim;
+        const vd: usize = c.gdn_head_dim;
+        const conv_dim: usize = 2 * nk * kd + nv * kd;
+        const kq_dim: usize = nk * kd;
+        const value_dim: usize = nv * vd;
+
+        for (self.spec_snap, 0..) |*sn, i| {
+            if (i < self.kv.len) self.kv[i].len = sn.kv_len + @as(u32, @intCast(rows));
+            if (i >= self.gdn.len) continue;
+            const g = &self.gdn[i];
+            if (g.state.len == 0) continue;
+            // 先把承载状态的缓冲恢复到 verify 之前的内容。
+            if (g.conv.len > 0) self.exec.copyRange(g.conv, sn.conv);
+            g.conv_len = sn.conv_len;
+            self.exec.copyRange(g.state, sn.state);
+            if (i >= self.gdn_in.len) continue;
+            const gi = &self.gdn_in[i];
+            if (gi.qkv.len < rows * conv_dim or gi.gamma.len < rows * 2 * nv) continue;
+            const lw = &self.layers[i];
+            if (lw.attn_qkv == null) continue;
+            // 1. 用**恢复后的**卷积历史，对 accepted 行重跑 prelude。这一步让
+            //    conv 前进 `rows` 步（而不是 verify 的 `k` 步），并就地重算
+            //    gamma/beta。
+            self.exec.copyRange(self.qkvK.span(0, rows * conv_dim), gi.qkv.span(0, rows * conv_dim));
+            self.exec.copyRange(self.abK.span(0, rows * 2 * nv), gi.gamma.span(0, rows * 2 * nv));
+            self.exec.gdnPrefillCore(
+                self.qkvK.span(0, rows * conv_dim),
+                g.conv,
+                lw.ssm_conv1d,
+                self.abK.span(0, 2 * rows * nv),
+                lw.ssm_a,
+                lw.ssm_dt_bias,
+                self.gdn_prefill_gamma.span(0, rows * nv),
+                rows,
+                conv_dim,
+                0,
+                rows * nv,
+                nv,
+                nv,
+                kq_dim,
+                nv,
+                nk,
+                kd,
+                c.conv_kernel,
+                1e-6,
+            );
+            // 2. 然后对同样的行跑状态递推，用的就是 prelude 刚产出的行。
+            self.exec.gdnStepRowsChunk(
+                g.state,
+                self.qkvK.span(kq_dim, rows * conv_dim - kq_dim),
+                self.qkvK.span(2 * kq_dim, rows * conv_dim - 2 * kq_dim),
+                self.qkvK.span(0, rows * conv_dim),
+                self.kv_mem,
+                self.delta,
+                self.goutK.span(0, rows * value_dim),
+                self.gdn_prefill_gamma.span(0, rows * nv),
+                self.abK.span(rows * nv, rows * nv),
+                nv,
+                nk,
+                kd,
+                vd,
+                rows,
+                conv_dim,
+                conv_dim,
+                conv_dim,
+            );
+        }
     }
 
     /// Enable speculative-decoding hidden-state taps (DSpine port, stage 0).
