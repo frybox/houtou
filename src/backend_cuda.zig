@@ -963,6 +963,64 @@ const kernel_max_args: usize = 24;
 /// is 8 because the widest thing stored is a pointer.
 const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
 
+/// One graph's captured state.
+///
+/// Two instances exist:
+///   * slot 0 -- the DECODE graph: one `forwardLogits` (1 row).
+///   * slot 1 -- the VERIFY graph: one `forwardChunkVerify` (k rows).
+///
+/// They cannot share one graph: the node set (and every `ne`/`nb` the
+/// backend compares in `graphUpdateRequired`) differs between a 1-row
+/// and a k-row forward, so a shared slot would re-capture on every
+/// switch.  The stream and the two ordering events ARE shared
+/// (`g_stream`/`g_ev`/`g_ev_out`): capture and replay on one stream is
+/// legal for any number of graphs.
+const GraphSlot = struct {
+    state: GraphState = .off,
+    rope_dyn: ?*anyopaque = null,
+    rope_dyn_pos: u32 = 0xFFFF_FFFF,
+    rope_dyn_base: f32 = 0.0,
+    attn_dyn: ?*anyopaque = null,
+    graph: ?*anyopaque = null,
+    exec: ?*anyopaque = null,
+    rope_nodes: [graph_max_layers]?*anyopaque = @splat(null),
+    rope_n: usize = 0,
+    attn_nodes: [graph_max_layers]?*anyopaque = @splat(null),
+    attn_n: usize = 0,
+    rope_args: [graph_max_layers]c_uint = @splat(0),
+    rope_base: [graph_max_layers]f32 = @splat(0),
+    attn_args: [graph_max_layers]c_int = @splat(0),
+    rope_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
+    attn_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
+    rope_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
+    attn_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
+    rope_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
+    attn_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
+    expect_rope: usize = 0,
+    expect_attn: usize = 0,
+    rec_pos: u32 = 0,
+    rec_slot: usize = 0,
+    base_captured: f32 = 0,
+    kv_dst_captured: [graph_max_layers]?*anyopaque = @splat(null),
+    kv_stride: [graph_max_layers]usize = @splat(0),
+    expect_kv: usize = 0,
+    order_nodes: [capture_nodes_max]?*anyopaque = undefined,
+    order_n: usize = 0,
+    cluster_n: usize = 0,
+    cluster_appends: usize = 0,
+    kv_partner: [graph_max_layers]usize = @splat(0),
+    kv_nodes: [graph_max_layers]?*anyopaque = @splat(null),
+    kv_n: usize = 0,
+    kv_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
+    kv_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
+    kv_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
+    kv_dst_cells: [graph_max_layers]?*anyopaque = @splat(null),
+    capturing: bool = false,
+    capturing_step: bool = false,
+    op_seen: GhOpFlags = .{},
+    failed: bool = false,
+};
+
 pub const CudaBackend = struct {
     /// Ring size for the per-call timing events; see `ev_pool`.
     ///
@@ -1425,7 +1483,12 @@ pub const CudaBackend = struct {
     //   rec     -- inside `cudaStreamBeginCapture`..`EndCapture`; every launch
     //              must be redirectable to `g_stream`.
     //   live    -- `g_exec` holds a replayable graph.
-    g_state: GraphState = .off,
+
+    /// The two graph slots.  `g_cur` selects which one `gs()` returns; the
+    /// decode path uses 0, the speculative verify path uses 1.
+    g_slots: [2]GraphSlot = .{ .{}, .{} },
+    g_cur: usize = 0,
+
     /// 设备端的一个 int：当前 KV 写入的起始行号。`q35_launch_kv_quant_dslot`
     /// 从它读行号，所以 graph 捕获下来的指针在重放时仍然有效（每 token 只需
     /// 更新这一个 int）。非 graph 路径不使用它。
@@ -1453,7 +1516,6 @@ pub const CudaBackend = struct {
     /// `k_rope64_dpos`.  Allocated on first use and then just written, so the
     /// 448 rope nodes of a 27B decode graph carry a constant pointer and never
     /// need `GraphExecKernelNodeSetParams`.  See `dRope64_body`.
-    g_rope_dyn: ?*anyopaque = null,
     /// Host alias of `g_rope_dyn` (the mapped pinned page).  Writing here is how
     /// a token's `pos`/`base` reaches `k_rope64_dpos`.
     /// What is currently published in `g_rope_dyn`, so the writer kernel runs
@@ -1475,15 +1537,12 @@ pub const CudaBackend = struct {
         cols: usize = 0,
         fam: cpu_mod.ActFamily = .q8_0,
     } = .{},
-    g_rope_dyn_pos: u32 = 0xFFFF_FFFF,
-    g_rope_dyn_base: f32 = 0.0,
     /// Device int holding the decode `slot` (the KV prefix length minus one).
     /// `attn_decode` reads it instead of taking `slot` as a launch argument, so
     /// the captured node's argument block AND its `shared_mem_bytes` are
     /// constants and the per-token/per-layer `GraphExecKernelNodeSetParams` --
     /// which cost 14.3 ms of the 27B's 33.8 ms decode -- disappears entirely.
     /// Allocated once, written once per token by `set_int1`.
-    g_attn_dyn: ?*anyopaque = null,
     /// PV partials for the split attention path: `heads * split * hd` floats.
     d_att_part: ?*anyopaque = null,
     d_att_part_bytes: usize = 0,
@@ -1499,9 +1558,7 @@ pub const CudaBackend = struct {
     /// (`$QWEN35_CUDA_ATTN_SPLIT`, 0 = off -> coalesced kernel).
     attn_split: usize = 0,
     /// The captured graph, kept only between EndCapture and Instantiate.
-    g_graph: ?*anyopaque = null,
     /// Replayable instantiation.  This is the only thing used per token.
-    g_exec: ?*anyopaque = null,
     /// Kernel nodes to retarget every token, in the order they were launched.
     /// Both are variables of the *decode step*, not of the model:
     ///   - `rope64`'s `pos` advances once per token (one launch per layer);
@@ -1512,29 +1569,20 @@ pub const CudaBackend = struct {
     /// read fixed pointers, and matvec's operands are all fixed regions of the
     /// KV cache / weights.  That was checked against every `Launch.*` call site
     /// in this file, not assumed.
-    g_rope_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    g_rope_n: usize = 0,
-    g_attn_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    g_attn_n: usize = 0,
     /// Argument blocks handed to `cudaGraphExecKernelNodeSetParams`.  Each is
     /// the *value* of one changed argument (`pos`, `slot`), so these are four
     /// bytes each and outlive the call only in the sense that the runtime
     /// copies them -- but they must stay addressable between the `SetParams`
     /// and it returning, which a plain field guarantees.
-    g_rope_args: [graph_max_layers]c_uint = @splat(0),
     /// `rope64`'s `base` (theta), the OTHER per-token argument of that kernel.
     /// It is not a constant of the model: the engine re-derives it each step
     /// (context-length dependent RoPE scaling), so a snapshot would rotate
     /// every replayed token with the capture token's theta.
-    g_rope_base: [graph_max_layers]f32 = @splat(0),
-    g_attn_args: [graph_max_layers]c_int = @splat(0),
     /// Per-node parameter definitions captured at capture time (grid/block/func
     /// plus a pointer to the argument array).  Rebuilt rather than mutated
     /// because `cudaGraphKernelNodeGetParams` may return either a
     /// `kernelParams` array or an `extra` blob and only the former is safe to
     /// hand back to `SetParams`.
-    g_rope_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
-    g_attn_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
     /// Owned copies of every tracked node's argument VALUES, one
     /// `[kernel_max_args]ArgSlot` per node.  `cudaGraphKernelNodeGetParams`
     /// hands back a `kernelParams` array that belongs to the runtime and that we
@@ -1543,29 +1591,20 @@ pub const CudaBackend = struct {
     /// this array.  `pos`/`slot` occupy one slot each and that slot's pointer is
     /// retargeted at `g_rope_args[i]`/`g_attn_args[i]`, so a later token only has
     /// to store a new value in that field.
-    g_rope_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
-    g_attn_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
     /// The pointers handed to `SetParams` as `kernelParams`: one per tracked
     /// node, each pointing at that node's `g_*_argv[i]` row above.
-    g_rope_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
-    g_attn_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
     /// How many `rope64` / `attn_decode` launches the engine issued while the
     /// capture was open.  Reconciled against the number of matched nodes before
     /// the graph is trusted: a shortfall means a launch produced no node we can
     /// retarget, so replay would feed it a stale `pos`/`slot` -- wrong numbers,
     /// no error.  See `graphBuild`.
-    g_expect_rope: usize = 0,
-    g_expect_attn: usize = 0,
     /// `pos`/`slot` the capture recorded, used to prove the node identification
     /// actually found the right nodes before trusting the graph (see
     /// `graphSelfCheck`).
-    g_rec_pos: u32 = 0,
-    g_rec_slot: usize = 0,
     /// The rope64 `base`/theta the graph was CAPTURED with.  It is a model
     /// constant (`rope_freq_base`), so the captured value stays right for every
     /// replay -- recorded rather than assumed so a future RoPE regime change is
     /// a visible mismatch instead of silent garbage.
-    g_base_captured: f32 = 0,
     /// KV-cache writes captured from `copyRange`.  Their DESTINATION pointer is
     /// `cache.{k,v} + slot * kv_dim`, i.e. it advances by exactly one row per
     /// token, so a plain snapshot would append every later token's k/v to the
@@ -1577,46 +1616,30 @@ pub const CudaBackend = struct {
     /// byte stride per token (`kv_dim * sizeof(f32)`).  `g_kv_expect` is the
     /// count the engine declared; it has to equal the number of nodes found, or
     /// the graph is dropped (see `graphBuild`).
-    g_kv_dst_captured: [graph_max_layers]?*anyopaque = @splat(null),
-    g_kv_stride: [graph_max_layers]usize = @splat(0),
-    g_expect_kv: usize = 0,
     /// `g_order_nodes[0..g_order_n]` is the captured decode step's nodes in
     /// EXECUTION order, recovered by `graphCaptureOrder` -- see the note there
     /// for why the list `cudaGraphGetNodes` returns cannot be used as-is.
-    g_order_nodes: [capture_nodes_max]?*anyopaque = undefined,
-    g_order_n: usize = 0,
 
     /// Append counter of the layer cluster currently being walked by
     /// `graphBuild`: 0 before the cluster's first append, 1 after it.  See
     /// `kvSlotFromCluster`.
-    g_cluster_n: usize = 0,
-    g_cluster_appends: usize = 0,
 
     /// For every KV append captured, the slot that the OTHER append of the same
     /// layer group belongs to: during a capture the engine issues a group's two
     /// appends consecutively, so the second one of a cluster is the partner of
     /// the first (see `kvSlotFromCluster`).
-    g_kv_partner: [graph_max_layers]usize = @splat(0),
-    g_kv_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    g_kv_n: usize = 0,
-    g_kv_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
-    g_kv_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
-    g_kv_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
     /// Per-node cell holding the destination POINTER for `SetParams`.  A token
     /// advances it by `g_kv_stride[i]` bytes, so this is the one argument that
     /// `copyArgs` must leave pointing at our storage rather than copying.
-    g_kv_dst_cells: [graph_max_layers]?*anyopaque = @splat(null),
     /// True while a capture is being assembled for the token whose argument
     /// values are (`g_rec_pos`, `g_rec_slot`); argmax's blocking copy and any
     /// host fallback clear it so a doomed capture is abandoned instead of
     /// instantiated.
-    g_capturing: bool = false,
     /// True between `stepBegin` opening a capture and `stepEnd` closing it.
     /// Distinct from `g_capturing`, which a mid-step abandonment clears: this
     /// one records *ownership* of the open capture so `stepEnd` knows it has to
     /// close something (or clean up after an abandonment) rather than being
     /// called on an uncaptured step.
-    g_capturing_step: bool = false,
     /// WHICH ops the captured graph actually contains.  Set during capture by
     /// `gOpGate`, consumed during replay to suppress the host-side launch.
     ///
@@ -1634,14 +1657,12 @@ pub const CudaBackend = struct {
     /// Recording the flags from an actual capture (rather than guessing a list)
     /// is deliberate: an op that never entered the graph must keep running on
     /// the host, and one that did must not.
-    g_op_seen: GhOpFlags = .{},
     /// Counters, printed once when the graph first goes live and again at
     /// deinit, so a report can state whether replay actually happened.
     stat_g_replay: usize = 0,
     stat_g_abandon: usize = 0,
     /// Set when `$QWEN35_CUDA_GRAPH` said "off" or the first capture failed;
     /// makes the decision one-way so a per-token retry cannot thrash.
-    g_failed: bool = false,
     // No gamma/beta staging buffer any more: `gdnGamma` writes both INTO
     // backend regions (`gamma_scratch`, and the b half of `ab` in place) and
     // `gdnStepRows` consumes them straight from those device pointers.  The
@@ -1953,6 +1974,11 @@ pub const CudaBackend = struct {
     /// so `forceGraphOff` can write the same cell.
     var g_graph_cached: ?bool = null;
 
+    /// The graph slot currently in use.
+    inline fn gs(self: anytype) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
+        return &self.g_slots[self.g_cur];
+    }
+
     fn graphWanted() bool {
         if (g_graph_cached) |v| return v;
         var on = true;
@@ -2027,7 +2053,7 @@ pub const CudaBackend = struct {
     }
 
     fn launchStream(self: *CudaBackend) ?*anyopaque {
-        return switch (self.g_state) {
+        return switch (self.gs().state) {
             .rec => self.g_stream,
             else => null,
         };
@@ -2036,7 +2062,7 @@ pub const CudaBackend = struct {
     /// True when a launch happening right now is being captured, i.e. when its
     /// arguments must be recorded for the per-token retarget.
     fn capturing(self: *const CudaBackend) bool {
-        return self.g_state == .rec;
+        return self.gs().state == .rec;
     }
 
     /// Suppress a host-side launch when the captured graph already contains it.
@@ -2047,7 +2073,7 @@ pub const CudaBackend = struct {
     /// Without this the host path re-runs the whole step on the default stream
     /// next to the graph -- see `g_op_seen`.
     fn gOpGate(self: *CudaBackend, seen: *bool) bool {
-        switch (self.g_state) {
+        switch (self.gs().state) {
             .rec => {
                 seen.* = true;
                 return false;
@@ -2063,7 +2089,7 @@ pub const CudaBackend = struct {
     /// printed once (not per token) -- a per-token flood would bury the real
     /// message and cost measurable time in the very path being measured.
     fn graphAbandon(self: *CudaBackend, why: []const u8) void {
-        if (self.g_state != .rec) return;
+        if (self.gs().state != .rec) return;
         self.stat_g_abandon += 1;
         if (self.stat_g_abandon == 1) {
             std.debug.print(
@@ -2105,12 +2131,12 @@ pub const CudaBackend = struct {
                 }
                 _ = cu.lib.GraphDestroy(gg);
             }
-            self.g_graph = null;
+            self.gs().graph = null;
         }
-        self.g_state = .warm;
-        self.g_rope_n = 0;
-        self.g_attn_n = 0;
-        self.g_failed = true;
+        self.gs().state = .warm;
+        self.gs().rope_n = 0;
+        self.gs().attn_n = 0;
+        self.gs().failed = true;
     }
 
     /// Bring every growable scratch buffer up to the size a *prefill* call would
@@ -2137,7 +2163,7 @@ pub const CudaBackend = struct {
         // feature: before this point `g_state` stays `.off` and `stepBegin` does
         // nothing, which is right because a capture that early would have to
         // allocate scratch inside the graph.
-        if (self.g_state == .off and graphWanted()) self.g_state = .warm;
+        if (self.gs().state == .off and graphWanted()) self.gs().state = .warm;
     }
 
     /// Open the capture.  `pos` and `slot` are this token's values, recorded so
@@ -2149,8 +2175,8 @@ pub const CudaBackend = struct {
     /// `g_failed` was set after a real failure.
     fn graphBegin(self: *CudaBackend, pos: u32, slot: usize) bool {
         const cu = &(self.cu orelse return false);
-        if (self.g_failed) return false;
-        if (self.g_state == .live) {
+        if (self.gs().failed) return false;
+        if (self.gs().state == .live) {
             // A live graph is being replayed; a second capture would have to
             // destroy it, which is never what we want mid-generation.
             return false;
@@ -2169,7 +2195,7 @@ pub const CudaBackend = struct {
             const rc = cu.lib.StreamCreateWithFlags(&s, cudart.StreamNonBlocking);
             if (rc != cudart.cudaSuccess or s == null) {
                 self.ewLaunchFail("decode graph: stream create", rc);
-                self.g_failed = true;
+                self.gs().failed = true;
                 return false;
             }
             self.g_stream = s;
@@ -2177,7 +2203,7 @@ pub const CudaBackend = struct {
         if (self.d_kv_slot == null) {
             var p: ?*anyopaque = null;
             if (cu.lib.Malloc(&p, @sizeOf(c_int)) != cudart.cudaSuccess or p == null) {
-                self.g_failed = true;
+                self.gs().failed = true;
                 return false;
             }
             self.d_kv_slot = p;
@@ -2190,7 +2216,7 @@ pub const CudaBackend = struct {
             const erc = cu.lib.EventCreate(&ev, cudart.EventDisableTiming);
             if (erc != cudart.cudaSuccess or ev == null) {
                 self.ewLaunchFail("decode graph: event create", erc);
-                self.g_failed = true;
+                self.gs().failed = true;
                 return false;
             }
             self.g_ev = ev;
@@ -2200,7 +2226,7 @@ pub const CudaBackend = struct {
             const erc = cu.lib.EventCreate(&ev, cudart.EventDisableTiming);
             if (erc != cudart.cudaSuccess or ev == null) {
                 self.ewLaunchFail("decode graph: ordering event create", erc);
-                self.g_failed = true;
+                self.gs().failed = true;
                 return false;
             }
             self.g_ev_out = ev;
@@ -2213,18 +2239,18 @@ pub const CudaBackend = struct {
         const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeThreadLocal);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("decode graph: begin capture", rc);
-            self.g_failed = true;
+            self.gs().failed = true;
             return false;
         }
-        self.g_state = .rec;
-        self.g_capturing = true;
-        self.g_rec_pos = pos;
-        self.g_rec_slot = slot;
-        self.g_rope_n = 0;
-        self.g_attn_n = 0;
-        self.g_expect_rope = 0;
-        self.g_expect_attn = 0;
-        self.g_expect_kv = 0;
+        self.gs().state = .rec;
+        self.gs().capturing = true;
+        self.gs().rec_pos = pos;
+        self.gs().rec_slot = slot;
+        self.gs().rope_n = 0;
+        self.gs().attn_n = 0;
+        self.gs().expect_rope = 0;
+        self.gs().expect_attn = 0;
+        self.gs().expect_kv = 0;
         return true;
     }
 
@@ -2235,16 +2261,16 @@ pub const CudaBackend = struct {
     /// array points at it, so the *same* `KernelNodeParams` instance serves
     /// every subsequent token -- only the value behind the pointer changes.
     fn graphNoteRope(self: *CudaBackend, pos: u32, base: f32) void {
-        if (self.g_rope_n >= graph_max_layers) {
+        if (self.gs().rope_n >= graph_max_layers) {
             self.graphAbandon("too many rope64 nodes");
             return;
         }
-        const i = self.g_rope_n;
-        self.g_rope_args[i] = @bitCast(pos);
-        self.g_rope_base[i] = base;
-        if (self.g_rope_n == 0) self.g_base_captured = base;
-        self.g_rope_n += 1;
-        self.g_expect_rope += 1;
+        const i = self.gs().rope_n;
+        self.gs().rope_args[i] = @bitCast(pos);
+        self.gs().rope_base[i] = base;
+        if (self.gs().rope_n == 0) self.gs().base_captured = base;
+        self.gs().rope_n += 1;
+        self.gs().expect_rope += 1;
     }
 
     /// A KV append: `copyRange` to `cache + slot * kv_dim`.  Records the exact
@@ -2252,13 +2278,13 @@ pub const CudaBackend = struct {
     /// matching node among the many `copy_range` launches of a token (the
     /// tensor copies use the same kernel and the same stub).
     fn graphNoteKvDst(self: *CudaBackend, dst: *anyopaque, stride_bytes: usize) void {
-        if (self.g_expect_kv >= graph_max_layers) {
+        if (self.gs().expect_kv >= graph_max_layers) {
             self.graphAbandon("too many kv append nodes");
             return;
         }
-        const i = self.g_expect_kv;
-        self.g_kv_dst_captured[i] = dst;
-        self.g_kv_stride[i] = stride_bytes;
+        const i = self.gs().expect_kv;
+        self.gs().kv_dst_captured[i] = dst;
+        self.gs().kv_stride[i] = stride_bytes;
         // A layer group's two appends are issued back to back, so they arrive
         // here as consecutive slots.  `graphBuild` walks the graph in execution
         // order and needs to know, for the FIRST append of a cluster, which slot
@@ -2266,22 +2292,22 @@ pub const CudaBackend = struct {
         // append and even for the layer groups, which is what the pairing below
         // keys on (see `kvSlotFromCluster`).
         if (i % 2 == 1) {
-            self.g_kv_partner[i - 1] = i;
-            self.g_kv_partner[i] = i - 1;
+            self.gs().kv_partner[i - 1] = i;
+            self.gs().kv_partner[i] = i - 1;
         }
-        self.g_expect_kv += 1;
+        self.gs().expect_kv += 1;
     }
 
     /// Same for `attn_decode`, whose only per-token variable is `slot`.
     fn graphNoteAttn(self: *CudaBackend, slot: usize) void {
-        if (self.g_attn_n >= graph_max_layers) {
+        if (self.gs().attn_n >= graph_max_layers) {
             self.graphAbandon("too many attn_decode nodes");
             return;
         }
-        const i = self.g_attn_n;
-        self.g_attn_args[i] = @intCast(slot);
-        self.g_attn_n += 1;
-        self.g_expect_attn += 1;
+        const i = self.gs().attn_n;
+        self.gs().attn_args[i] = @intCast(slot);
+        self.gs().attn_n += 1;
+        self.gs().expect_attn += 1;
     }
 
     /// `graphNoteAttn` for a launcher that emits `n` attn-class nodes per call.
@@ -2292,15 +2318,15 @@ pub const CudaBackend = struct {
 
     fn graphEnd(self: *CudaBackend) bool {
         const cu = &(self.cu orelse return false);
-        self.g_capturing = false;
-        if (self.g_state != .rec) return false;
+        self.gs().capturing = false;
+        if (self.gs().state != .rec) return false;
         var graph: ?*anyopaque = null;
         const rc = cu.lib.StreamEndCapture(self.g_stream, &graph);
         if (rc != cudart.cudaSuccess or graph == null) {
             self.ewLaunchFail("decode graph: end capture", rc);
             if (graph) |g| _ = cu.lib.GraphDestroy(g);
-            self.g_state = .warm;
-            self.g_failed = true;
+            self.gs().state = .warm;
+            self.gs().failed = true;
             return false;
         }
         return self.graphBuild(graph.?);
@@ -2492,10 +2518,10 @@ pub const CudaBackend = struct {
             };
             if (seen[k]) return false; // a live node claimed twice: not a permutation
             seen[k] = true;
-            self.g_order_nodes[i] = live[k];
+            self.gs().order_nodes[i] = live[k];
         }
         // The probe order must be a permutation of the recorded list.
-        for (self.g_order_nodes[0..n]) |maybe| {
+        for (self.gs().order_nodes[0..n]) |maybe| {
             const node = maybe orelse return false;
             var found = false;
             for (recorded) |maybe2| {
@@ -2506,7 +2532,7 @@ pub const CudaBackend = struct {
             }
             if (!found) return false;
         }
-        self.g_order_n = n;
+        self.gs().order_n = n;
         return true;
     }
 
@@ -2521,7 +2547,7 @@ pub const CudaBackend = struct {
         const g = graph.?;
         var prev: ?*anyopaque = null;
         var prev_buf: [1]?*anyopaque = undefined;
-        for (self.g_order_nodes[0..self.g_order_n]) |maybe| {
+        for (self.gs().order_nodes[0..self.gs().order_n]) |maybe| {
             const node = maybe orelse {
                 _ = cu.lib.GraphDestroy(g);
                 return null;
@@ -2557,15 +2583,15 @@ pub const CudaBackend = struct {
     /// `g_kv_dst_captured[i]` is the address cache entry `i` had at capture time,
     /// so it names a row, not an append.
     fn kvSlotFromCluster(self: *CudaBackend) ?usize {
-        if (self.g_cluster_appends == 0) {
-            self.g_cluster_appends = 1;
-            return self.g_cluster_n;
+        if (self.gs().cluster_appends == 0) {
+            self.gs().cluster_appends = 1;
+            return self.gs().cluster_n;
         }
-        const layer = self.g_cluster_n;
-        self.g_cluster_appends = 0;
-        self.g_cluster_n += 1;
-        if (self.g_cluster_n >= graph_max_layers) return null;
-        return self.g_kv_partner[layer];
+        const layer = self.gs().cluster_n;
+        self.gs().cluster_appends = 0;
+        self.gs().cluster_n += 1;
+        if (self.gs().cluster_n >= graph_max_layers) return null;
+        return self.gs().kv_partner[layer];
     }
 
     /// Identify the retargetable nodes inside a freshly captured graph, then
@@ -2628,8 +2654,8 @@ pub const CudaBackend = struct {
         var attn_dyn_found: usize = 0;
         var kv_found: usize = 0;
         var kernel_nodes: usize = 0;
-        self.g_cluster_n = 0;
-        self.g_cluster_appends = 0;
+        self.gs().cluster_n = 0;
+        self.gs().cluster_appends = 0;
         for (nodes[0..n]) |maybe_node| {
             const node = maybe_node orelse continue;
             var ntype: c_int = -1;
@@ -2652,11 +2678,11 @@ pub const CudaBackend = struct {
                         // text was garbage from the very first token.  `base` is a
                         // constant for the whole run, so it belongs in the
                         // ordinary argument snapshot.
-                        if (!copyArgs(.rope, &p, &self.g_rope_argv[rope_found], &self.g_rope_kptr[rope_found], &.{
-                            .{ .at = rope_pos_arg, .cell = &self.g_rope_args[rope_found] },
+                        if (!copyArgs(.rope, &p, &self.gs().rope_argv[rope_found], &self.gs().rope_kptr[rope_found], &.{
+                            .{ .at = rope_pos_arg, .cell = &self.gs().rope_args[rope_found] },
                         })) continue;
-                        self.g_rope_params[rope_found] = p;
-                        self.g_rope_nodes[rope_found] = node;
+                        self.gs().rope_params[rope_found] = p;
+                        self.gs().rope_nodes[rope_found] = node;
                         rope_found += 1;
                     },
                     .rope_dpos => {
@@ -2680,11 +2706,11 @@ pub const CudaBackend = struct {
                     },
                     .attn => {
                         if (attn_found >= graph_max_layers) continue;
-                        if (!copyArgs(.attn, &p, &self.g_attn_argv[attn_found], &self.g_attn_kptr[attn_found], &.{
-                            .{ .at = attn_slot_arg, .cell = &self.g_attn_args[attn_found] },
+                        if (!copyArgs(.attn, &p, &self.gs().attn_argv[attn_found], &self.gs().attn_kptr[attn_found], &.{
+                            .{ .at = attn_slot_arg, .cell = &self.gs().attn_args[attn_found] },
                         })) continue;
-                        self.g_attn_params[attn_found] = p;
-                        self.g_attn_nodes[attn_found] = node;
+                        self.gs().attn_params[attn_found] = p;
+                        self.gs().attn_nodes[attn_found] = node;
                         attn_found += 1;
                     },
                     .kv => {
@@ -2703,10 +2729,10 @@ pub const CudaBackend = struct {
                         // cross-layer writes corrupted the cache from the 4th
                         // replayed token on.
                         const at = self.kvSlotOf(.kv, &p) orelse continue;
-                        if (self.g_kv_nodes[at] != null) continue;
-                        if (!copyKvArgs(.kv, &p, &self.g_kv_argv[at], &self.g_kv_kptr[at], &self.g_kv_dst_cells[at])) continue;
-                        self.g_kv_params[at] = p;
-                        self.g_kv_nodes[at] = node;
+                        if (self.gs().kv_nodes[at] != null) continue;
+                        if (!copyKvArgs(.kv, &p, &self.gs().kv_argv[at], &self.gs().kv_kptr[at], &self.gs().kv_dst_cells[at])) continue;
+                        self.gs().kv_params[at] = p;
+                        self.gs().kv_nodes[at] = node;
                         kv_found += 1;
                     },
                     .kvq => {
@@ -2718,10 +2744,10 @@ pub const CudaBackend = struct {
                         // so the shared `kv_found` counter and the
                         // `g_kv_dst_captured` table serve both arms.
                         const at = self.kvSlotOf(.kvq, &p) orelse continue;
-                        if (self.g_kv_nodes[at] != null) continue;
-                        if (!copyKvArgs(.kvq, &p, &self.g_kv_argv[at], &self.g_kv_kptr[at], &self.g_kv_dst_cells[at])) continue;
-                        self.g_kv_params[at] = p;
-                        self.g_kv_nodes[at] = node;
+                        if (self.gs().kv_nodes[at] != null) continue;
+                        if (!copyKvArgs(.kvq, &p, &self.gs().kv_argv[at], &self.gs().kv_kptr[at], &self.gs().kv_dst_cells[at])) continue;
+                        self.gs().kv_params[at] = p;
+                        self.gs().kv_nodes[at] = node;
                         kv_found += 1;
                     },
                 }
@@ -2732,9 +2758,9 @@ pub const CudaBackend = struct {
         // `rope64` issues once per layer; `attn_decode` once per full-attention
         // layer, which is <= the layer count.  Zero attn nodes is legal (an
         // all-GDN model); a count over the layer budget is not.
-        self.g_rope_n = rope_found;
-        self.g_attn_n = attn_found;
-        self.g_kv_n = kv_found;
+        self.gs().rope_n = rope_found;
+        self.gs().attn_n = attn_found;
+        self.gs().kv_n = kv_found;
         if (rope_found == 0 and attn_found == 0 and attn_dyn_found == 0) {
             self.graphAbandon("no rope64/attn_decode argument matched; identification untrustworthy");
             _ = cu.lib.GraphDestroy(graph);
@@ -2764,21 +2790,21 @@ pub const CudaBackend = struct {
         // node went unmatched -- a stub address that changed, a node the runtime
         // encoded differently -- and replaying it would use a stale `pos`/`slot`,
         // which is wrong numbers with no error.  So: abstain.
-        if (kv_found != self.g_expect_kv) {
+        if (kv_found != self.gs().expect_kv) {
             std.debug.print(
                 "cuda backend: decode graph skipped: matched {d}/{d} KV append nodes\n",
-                .{ kv_found, self.g_expect_kv },
+                .{ kv_found, self.gs().expect_kv },
             );
             self.graphAbandon("KV append node count mismatch");
             return false;
         }
-        if (rope_found != self.g_rope_n or attn_found != self.g_attn_n or
-            rope_found + rope_dpos_found != self.g_expect_rope or
-            attn_found + attn_dyn_found != self.g_expect_attn)
+        if (rope_found != self.gs().rope_n or attn_found != self.gs().attn_n or
+            rope_found + rope_dpos_found != self.gs().expect_rope or
+            attn_found + attn_dyn_found != self.gs().expect_attn)
         {
             std.debug.print(
                 "cuda backend: decode graph skipped: matched {d}/{d} rope64 and {d}/{d} attn_decode nodes\n",
-                .{ rope_found, self.g_expect_rope, attn_found, self.g_expect_attn },
+                .{ rope_found, self.gs().expect_rope, attn_found, self.gs().expect_attn },
             );
             self.graphAbandon("retargetable node count mismatch");
             return false;
@@ -2792,8 +2818,8 @@ pub const CudaBackend = struct {
         const rc = cu.lib.GraphInstantiate(&new_exec, graph, 0);
         if (rc != cudart.cudaSuccess or new_exec == null) {
             self.ewLaunchFail("decode graph: instantiate", rc);
-            self.g_state = .warm;
-            self.g_failed = true;
+            self.gs().state = .warm;
+            self.gs().failed = true;
             return false;
         }
         graph_kept = true;
@@ -2803,9 +2829,9 @@ pub const CudaBackend = struct {
         // `g_attn_nodes` entry and the next token's retarget would fail with
         // `invalid argument` (measured: exactly that).  Both objects are
         // released together in `graphDestroy`.
-        self.g_graph = graph;
-        self.g_exec = new_exec;
-        self.g_state = .live;
+        self.gs().graph = graph;
+        self.gs().exec = new_exec;
+        self.gs().state = .live;
         // THE CAPTURE STEP NEVER RAN.  `cudaStreamBeginCapture` puts the stream
         // in capture mode, where launches are *recorded* instead of executed --
         // so the token whose arguments are in the graph has had no kernel run
@@ -2815,10 +2841,10 @@ pub const CudaBackend = struct {
         // garbage, because the graph kept rewriting the capture slot and the
         // cache permanently missed one row.  Launching the graph once, with the
         // capture step's own arguments, is what makes that step happen.
-        if (!self.graphReplayInner(self.g_rec_pos, self.g_rec_slot, false)) return false;
+        if (!self.graphReplayInner(self.gs().rec_pos, self.gs().rec_slot, false)) return false;
         // Upload once so the first replay does not pay the loading cost inside
         // the token being measured.
-        _ = cu.lib.GraphUpload(self.g_exec, self.g_stream);
+        _ = cu.lib.GraphUpload(self.gs().exec, self.g_stream);
         std.debug.print(
             "cuda backend: decode graph live ({d} kernels, {d} rope64 (frozen: pos from device) + {d} rope64-retargeted + {d} attn_decode + {d} kv-append nodes)\n",
             .{ kernel_nodes, rope_dpos_found, rope_found, attn_found + attn_dyn_found, kv_found },
@@ -3151,7 +3177,7 @@ const attn_score_arity: usize = 11;
     /// tensor `copy_range` rather than a cache append.
     fn kvSlotOf(self: *CudaBackend, cls: NodeClass, p: *const cudart.KernelNodeParams) ?usize {
         const want = kvDstOf(cls, p) orelse return null;
-        for (self.g_kv_dst_captured[0..self.g_expect_kv], 0..) |maybe, i| {
+        for (self.gs().kv_dst_captured[0..self.gs().expect_kv], 0..) |maybe, i| {
             const have = maybe orelse continue;
             if (have == want) return i;
         }
@@ -3322,8 +3348,8 @@ const attn_score_arity: usize = 11;
     /// tears the graph down, so the numbers stay right and only the speedup is
     /// lost -- never silently wrong text.
     fn graphVarsChanged(self: *CudaBackend, cls: NodeClass, pos_or_slot: u64) bool {
-        if (self.g_state != .live) return false;
-        const expected: u64 = @as(u64, self.g_rec_pos) + @as(u64, self.stat_g_replay) + 1;
+        if (self.gs().state != .live) return false;
+        const expected: u64 = @as(u64, self.gs().rec_pos) + @as(u64, self.stat_g_replay) + 1;
         if (pos_or_slot == expected) return false;
         std.debug.print(
             "cuda backend: decode graph invalidated at replay {d} -- {s} value {d} (expected {d}); falling back to direct launches\n",
@@ -3350,8 +3376,8 @@ const attn_score_arity: usize = 11;
     /// token at `g_rec_pos`, not one after it.
     fn graphReplayInner(self: *CudaBackend, pos: u32, slot: usize, advance: bool) bool {
         const cu = &(self.cu orelse return false);
-        if (self.g_state != .live) return false;
-        const gexec = self.g_exec orelse return false;
+        if (self.gs().state != .live) return false;
+        const gexec = self.gs().exec orelse return false;
         // The pos/slot law, checked HERE rather than inside the ops: since
         // `gOpGate` suppresses every gated launch on a replayed step, the ops
         // that used to prove it (`rope64`, `attn_decode`) no longer run on this
@@ -3361,15 +3387,15 @@ const attn_score_arity: usize = 11;
         // captured node list no longer describes this token.
         if (advance and self.graphVarsChanged(.attn, slot)) return false;
 
-        for (self.g_rope_nodes[0..self.g_rope_n], 0..) |maybe_node, i| {
+        for (self.gs().rope_nodes[0..self.gs().rope_n], 0..) |maybe_node, i| {
             const node = maybe_node orelse continue;
             // The VALUE first: the node's `kernelParams[rope_pos_arg]` points at
             // this very cell (see `copyArgs`), so writing it is all a new `pos`
             // needs.  `SetParams` is still called because the runtime snapshots
             // the argument block at set time rather than reading it at launch.
-            self.g_rope_args[i] = @bitCast(pos);
-            var p = self.g_rope_params[i];
-                        p.kernel_params = @ptrCast(&self.g_rope_kptr[i]);
+            self.gs().rope_args[i] = @bitCast(pos);
+            var p = self.gs().rope_params[i];
+                        p.kernel_params = @ptrCast(&self.gs().rope_kptr[i]);
             p.extra = null;
             const rc = cu.lib.GraphExecKernelNodeSetParams(gexec, node, &p);
             if (rc != cudart.cudaSuccess) {
@@ -3377,15 +3403,15 @@ const attn_score_arity: usize = 11;
                 return false;
             }
         }
-        for (self.g_attn_nodes[0..self.g_attn_n], 0..) |maybe_node, i| {
+        for (self.gs().attn_nodes[0..self.gs().attn_n], 0..) |maybe_node, i| {
             const node = maybe_node orelse continue;
             // `slot` grows every token, and with it the number of KV rows this
             // kernel must read (`slot + 1`).  The cache POINTERS do not change --
             // the engine hands over a longer prefix of the same device region --
             // so retargeting the integer is the whole update.
-            self.g_attn_args[i] = @intCast(slot);
-            var p = self.g_attn_params[i];
-            p.kernel_params = @ptrCast(&self.g_attn_kptr[i]);
+            self.gs().attn_args[i] = @intCast(slot);
+            var p = self.gs().attn_params[i];
+            p.kernel_params = @ptrCast(&self.gs().attn_kptr[i]);
             p.extra = null;
             // `shared_mem_bytes` is a SECOND per-token input, not just an
             // integer argument: `q35_launch_attn_decode` sizes the dynamic
@@ -3407,14 +3433,14 @@ const attn_score_arity: usize = 11;
         // overwrites the capture token's slot forever and every later token
         // attends to a cache that never grew -- correct-looking control flow,
         // garbage text, no error anywhere.
-        const slot_delta = slot - self.g_rec_slot;
-        for (self.g_kv_nodes[0..self.g_kv_n], 0..) |maybe_node, i| {
+        const slot_delta = slot - self.gs().rec_slot;
+        for (self.gs().kv_nodes[0..self.gs().kv_n], 0..) |maybe_node, i| {
             const node = maybe_node orelse continue;
-            const dst_at_capture = self.g_kv_dst_captured[i] orelse continue;
-            const moved: *anyopaque = @ptrFromInt(@intFromPtr(dst_at_capture) + slot_delta * self.g_kv_stride[i]);
-            self.g_kv_dst_cells[i] = moved;
-            var p = self.g_kv_params[i];
-            p.kernel_params = @ptrCast(&self.g_kv_kptr[i]);
+            const dst_at_capture = self.gs().kv_dst_captured[i] orelse continue;
+            const moved: *anyopaque = @ptrFromInt(@intFromPtr(dst_at_capture) + slot_delta * self.gs().kv_stride[i]);
+            self.gs().kv_dst_cells[i] = moved;
+            var p = self.gs().kv_params[i];
+            p.kernel_params = @ptrCast(&self.gs().kv_kptr[i]);
             p.extra = null;
             const rc2 = cu.lib.GraphExecKernelNodeSetParams(gexec, node, &p);
             if (rc2 != cudart.cudaSuccess) {
@@ -3436,7 +3462,7 @@ const attn_score_arity: usize = 11;
         // Published on `g_stream` ITSELF, immediately before the graph launch:
         // stream order alone guarantees the write is visible to every node of the
         // graph, so there is no event dance to get wrong.
-        if (self.g_attn_dyn) |pdyn| {
+        if (self.gs().attn_dyn) |pdyn| {
             const sslot: [*]c_int = @ptrCast(@alignCast(pdyn));
             const wrc = Launch.set_int1(sslot, @intCast(slot), self.g_stream);
             if (wrc != cudart.cudaSuccess) {
@@ -3484,29 +3510,29 @@ const attn_score_arity: usize = 11;
         // The device channel may already hold a value for a pos this run never
         // published through the direct path; drop the cache so the next `rope64`
         // rewrites it unconditionally instead of assuming it is current.
-        self.g_rope_dyn_pos = 0xFFFF_FFFF;
+        self.gs().rope_dyn_pos = 0xFFFF_FFFF;
         if (self.cu) |*cu| {
-            if (self.g_exec) |e| {
+            if (self.gs().exec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
-                self.g_exec = null;
+                self.gs().exec = null;
             }
         }
-        self.g_state = .warm;
-        self.g_failed = true;
-        self.g_rope_n = 0;
-        self.g_attn_n = 0;
+        self.gs().state = .warm;
+        self.gs().failed = true;
+        self.gs().rope_n = 0;
+        self.gs().attn_n = 0;
     }
 
     /// Free the graph state.  Idempotent; called from `deinit`.
     fn graphDestroy(self: *CudaBackend) void {
         if (self.cu) |*cu| {
-            if (self.g_exec) |e| {
+            if (self.gs().exec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
-                self.g_exec = null;
+                self.gs().exec = null;
             }
-            if (self.g_graph) |g| {
+            if (self.gs().graph) |g| {
                 _ = cu.lib.GraphDestroy(g);
-                self.g_graph = null;
+                self.gs().graph = null;
             }
             if (self.g_ev_out) |ev| {
                 _ = cu.lib.EventDestroy(ev);
@@ -3521,7 +3547,7 @@ const attn_score_arity: usize = 11;
                 self.g_stream = null;
             }
         }
-        self.g_state = .off;
+        self.gs().state = .off;
         if (self.stat_g_replay != 0 or self.stat_g_abandon != 0) {
             std.debug.print("cuda: graph replays={d} abandoned-tokens={d}\n", .{
                 self.stat_g_replay, self.stat_g_abandon,
@@ -3983,7 +4009,7 @@ const attn_score_arity: usize = 11;
 
     fn vMatvec_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.matvec)) return;
+        if (self.gOpGate(&self.gs().op_seen.matvec)) return;
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
             self.clearDevBuf(outBuf);
@@ -4778,7 +4804,7 @@ const attn_score_arity: usize = 11;
     /// device (mirrors `dCopyRange`), never the normal route.
     fn dKvAppend_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.kv_append)) return;
+        if (self.gOpGate(&self.gs().op_seen.kv_append)) return;
         if (rows == 0) return;
         // f32: the historical path, unchanged (and graph-identical).
         if (self.kv_type == .f32) {
@@ -4810,7 +4836,7 @@ const attn_score_arity: usize = 11;
         // this path: the H2D below would itself be recorded into the graph and
         // replayed with a stale value.  Capture keeps the historical
         // `out_ptr` + retargeting route instead.
-        if (self.g_state == .live and self.kv_type == .f16 and rows == 1 and self.d_kv_slot != null) {
+        if (self.gs().state == .live and self.kv_type == .f16 and rows == 1 and self.d_kv_slot != null) {
             const want: c_int = @intCast(slot);
             if (want != self.d_kv_slot_host) {
                 if (cu.lib.MemcpyAsync(self.d_kv_slot.?, &want, @sizeOf(c_int),
@@ -5020,7 +5046,7 @@ const attn_score_arity: usize = 11;
 
     fn dScaleVec_body(ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.scale_vec)) return;
+        if (self.gOpGate(&self.gs().op_seen.scale_vec)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.scale_vec(px, s, @intCast(x.len), self.launchStream());
@@ -5033,7 +5059,7 @@ const attn_score_arity: usize = 11;
 
     fn dAddResid_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.add_resid)) return;
+        if (self.gOpGate(&self.gs().op_seen.add_resid)) return;
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
         // zips the two slices).  A mismatch is an engine bug, so refuse to guess
         // rather than silently truncating to the shorter.
@@ -5094,7 +5120,7 @@ const attn_score_arity: usize = 11;
         // captured node is retargeted to it.  Running the host copy as well would
         // write the same row twice (idempotent, so invisible in the numbers) while
         // making every replay pay one extra D2D move per layer.
-        if (self.gOpGate(&self.g_op_seen.kv_append)) return;
+        if (self.gOpGate(&self.gs().op_seen.kv_append)) return;
         _ = slot;
         if (self.capturing() and src.len == dst.len) {
             if (dBufPtr(dst)) |pd| {
@@ -5141,7 +5167,7 @@ const attn_score_arity: usize = 11;
 
     fn dZeroBuf_body(ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.zero_buf)) return;
+        if (self.gOpGate(&self.gs().op_seen.zero_buf)) return;
         if (self.cu != null) {
             if (dBufPtr(buf)) |p| {
                 const rc = Launch.zero_buf(p, @intCast(buf.len), self.launchStream());
@@ -5254,7 +5280,7 @@ const attn_score_arity: usize = 11;
 
     fn dRmsnorm_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.rmsnorm)) return;
+        if (self.gOpGate(&self.gs().op_seen.rmsnorm)) return;
         // The CPU reference asserts out.len == x.len == w.len (one row).  The
         // kernel supports several rows (w reused per row) for the shape the
         // engine does not currently produce, so the only mismatch worth
@@ -5284,7 +5310,7 @@ const attn_score_arity: usize = 11;
     /// geometry does not hold, which is what the CPU side does anyway.
     fn dRmsnormRows_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.rmsnorm_rows)) return;
+        if (self.gOpGate(&self.gs().op_seen.rmsnorm_rows)) return;
         const n = w.len;
         if (rows_in != 0 and n != 0 and x.len == rows_in * n and out.len == rows_in * n and self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -5338,7 +5364,7 @@ const attn_score_arity: usize = 11;
 
     fn dSiluInPlace_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.silu_in_place)) return;
+        if (self.gOpGate(&self.gs().op_seen.silu_in_place)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.silu(px, @intCast(x.len), self.launchStream());
@@ -5351,7 +5377,7 @@ const attn_score_arity: usize = 11;
 
     fn dMulSilu_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.mul_silu)) return;
+        if (self.gOpGate(&self.gs().op_seen.mul_silu)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
             cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
@@ -5371,7 +5397,7 @@ const attn_score_arity: usize = 11;
 
     fn dMulSigmoid_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.mul_sigmoid)) return;
+        if (self.gOpGate(&self.gs().op_seen.mul_sigmoid)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
             cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
@@ -5391,7 +5417,7 @@ const attn_score_arity: usize = 11;
 
     fn dSwiglu_body(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.swiglu)) return;
+        if (self.gOpGate(&self.gs().op_seen.swiglu)) return;
         if (up.len != gate.len) {
             std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
             cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
@@ -5411,7 +5437,7 @@ const attn_score_arity: usize = 11;
 
     fn dSoftmax_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.softmax)) return;
+        if (self.gOpGate(&self.gs().op_seen.softmax)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.softmax(px, @intCast(x.len), self.launchStream());
@@ -5533,7 +5559,7 @@ const attn_score_arity: usize = 11;
 
     fn dArgmaxConf(ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
         const self = self_(ctx);
-        if (self.g_state == .live) p.* = 1.0; // the graph already ran it
+        if (self.gs().state == .live) p.* = 1.0; // the graph already ran it
         return self.argmaxConf(logits, p);
     }
 
@@ -5830,7 +5856,7 @@ const attn_score_arity: usize = 11;
         // `gOpGate` cannot be used verbatim: it returns true for a REPLAYED step,
         // where this call still has to produce a token (from the graph's own
         // output), so the sampler branch is spelled out.
-        const replayed = self.g_state == .live;
+        const replayed = self.gs().state == .live;
         if (replayed) {
             // The graph already ran the sampler on `g_stream`.  `stepEnd` ordered
             // that stream before the default one, so the control block holds this
@@ -5894,7 +5920,7 @@ const attn_score_arity: usize = 11;
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.gdn_step)) return;
+        if (self.gOpGate(&self.gs().op_seen.gdn_step)) return;
         // vd != 128 is the CPU `gdnFused`'s slow path (four separate kernels);
         // the device kernel is written for the fast path only, so route the odd
         // shape to the CPU rather than launching a kernel that would refuse.
@@ -5938,7 +5964,7 @@ const attn_score_arity: usize = 11;
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.gdn_step_rows)) return;
+        if (self.gOpGate(&self.gs().op_seen.gdn_step_rows)) return;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and
             gamma.len >= heads and beta.len >= heads and
             state.len >= heads * kd * vd and k.len >= nk * kd and q.len >= nk * kd and
@@ -5994,7 +6020,7 @@ const attn_score_arity: usize = 11;
     fn dGdnGamma_body(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.gdn_gamma)) return;
+        if (self.gOpGate(&self.gs().op_seen.gdn_gamma)) return;
         // Every operand here is a backend region.  The two weight rows
         // (`ssm_a`, `dt_bias`) are per-layer constants and, like the norm
         // weights, are device `Buf`s uploaded exactly once at load time
@@ -6148,7 +6174,7 @@ const attn_score_arity: usize = 11;
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.attn_decode)) return;
+        if (self.gOpGate(&self.gs().op_seen.attn_decode)) return;
         // `kcache`/`vcache` are the first `slot+1` rows of the layer's cache, so
         // they are sized (slot+1)*kv_dim, not max_seq*kv_dim (the engine passes
         // exactly that span).  `att` needs slot+1 floats.
@@ -6186,7 +6212,7 @@ const attn_score_arity: usize = 11;
                                     // the direct path, where there is no node to
                                     // retarget and the smaller shared block is free.
                                     const want_dyn = graphWanted() and
-                                        (self.g_state == .live or self.g_state == .rec or self.capturing());
+                                        (self.gs().state == .live or self.gs().state == .rec or self.capturing());
                                     if (want_dyn) {
                                         if (self.ensureAttnDyn()) |pdyn| {
                                             // DO NOT publish `slot` here.  During
@@ -6337,7 +6363,7 @@ const attn_score_arity: usize = 11;
     /// launch stream (`k_rope64_setenv`), which captures like any other node and
     /// costs one launch per token instead of 448 retargets.
     fn ensureRopeDyn(self: *CudaBackend) ?*anyopaque {
-        if (self.g_rope_dyn) |p| return p;
+        if (self.gs().rope_dyn) |p| return p;
         const cu = &(self.cu orelse return null);
         var p: ?*anyopaque = null;
         const rc = cu.lib.Malloc(&p, @sizeOf([2]i32));
@@ -6345,14 +6371,14 @@ const attn_score_arity: usize = 11;
             self.ewLaunchFail("rope64_dpos alloc", rc);
             return null;
         }
-        self.g_rope_dyn = p;
+        self.gs().rope_dyn = p;
         return p;
     }
 
     /// Lazily allocate the device int that carries the decode `slot` to
     /// `q35_attn_decode_kernel_dyn`.  Returns null only if the allocation fails.
     fn ensureAttnDyn(self: *CudaBackend) ?*anyopaque {
-        if (self.g_attn_dyn) |p| return p;
+        if (self.gs().attn_dyn) |p| return p;
         const cu = &(self.cu orelse return null);
         var p: ?*anyopaque = null;
         const rc = cu.lib.Malloc(&p, @sizeOf(c_int));
@@ -6360,7 +6386,7 @@ const attn_score_arity: usize = 11;
             self.ewLaunchFail("attn_dyn alloc", rc);
             return null;
         }
-        self.g_attn_dyn = p;
+        self.gs().attn_dyn = p;
         return p;
     }
 
@@ -6369,21 +6395,21 @@ const attn_score_arity: usize = 11;
     /// token would otherwise publish 448 times).  Returns true if it launched the
     /// writer, i.e. if the caller must not assume the values are already there.
     fn ropeDynPublished(self: *CudaBackend, pos: u32, base: f32) bool {
-        if (self.g_rope_dyn == null) return false;
-        if (self.g_rope_dyn_pos == pos and self.g_rope_dyn_base == base) return false;
-        const rc = Launch.rope64_setenv(self.g_rope_dyn, @bitCast(pos), base, self.launchStream());
+        if (self.gs().rope_dyn == null) return false;
+        if (self.gs().rope_dyn_pos == pos and self.gs().rope_dyn_base == base) return false;
+        const rc = Launch.rope64_setenv(self.gs().rope_dyn, @bitCast(pos), base, self.launchStream());
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("rope64_setenv", rc);
             return false;
         }
-        self.g_rope_dyn_pos = pos;
-        self.g_rope_dyn_base = base;
+        self.gs().rope_dyn_pos = pos;
+        self.gs().rope_dyn_base = base;
         return true;
     }
 
     fn dRope64_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.rope64)) return;
+        if (self.gOpGate(&self.gs().op_seen.rope64)) return;
         const max_head: usize = 256;
         var host: [max_head]f32 = undefined;
         const n = @min(x.len, max_head);
@@ -6471,7 +6497,7 @@ const attn_score_arity: usize = 11;
     /// out to the per-row loop when a capture is live.  Prefill does not capture.
     fn dRope64Rows_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.rope64_rows)) return;
+        if (self.gOpGate(&self.gs().op_seen.rope64_rows)) return;
         const row_len = heads_in * hd_in;
         if (!ropeOnDevice() or
             heads_in == 0 or hd_in < 64 or rows_in == 0 or
@@ -6490,7 +6516,7 @@ const attn_score_arity: usize = 11;
         // `pos`/`base` are published into the same device channel the per-head
         // path uses (`ropeSetEnv` runs once per token, not once per call), so
         // the captured node reads them fresh on every replay.
-        if (self.capturing() or self.g_state == .live) {
+        if (self.capturing() or self.gs().state == .live) {
             if (self.ensureRopeDyn()) |dyn| {
                 _ = self.ropeDynPublished(pos, base);
                 if (dBufPtr(x)) |px| {
@@ -6516,7 +6542,7 @@ const attn_score_arity: usize = 11;
 
     fn dConvStep_body(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
-        if (self.gOpGate(&self.g_op_seen.conv_step)) return;
+        if (self.gOpGate(&self.gs().op_seen.conv_step)) return;
         // `conv` is the GDN sliding window and is BOTH read and written (the
         // kernel shifts it in place); `y` likewise (read as the 4th tap, then
         // overwritten).  Both are device-resident, so both are passed directly.
@@ -6816,7 +6842,7 @@ const attn_score_arity: usize = 11;
         // -- the pairs would measure empty intervals.  The graph path reports
         // its own totals via `stat_ns_token_dev`; disable the pool instead of
         // printing a table of zeros.
-        if (self.g_state == .live) return null;
+        if (self.gs().state == .live) return null;
         if (self.slot_depth != 0) return null;
         if (!self.gpuEvEnsure()) {
             self.gpu_ev_on = false;
@@ -7501,11 +7527,11 @@ const attn_score_arity: usize = 11;
         self.actQClear();
         if (!graphWanted()) {
             // `$QWEN35_CUDA_GRAPH=0`: the direct path, untouched.
-            self.g_state = .off;
+            self.gs().state = .off;
             return;
         }
         if (cudart.getenv("QWEN35_GRTIME") != null) self.grMark(true);
-        if (self.g_state == .live) {
+        if (self.gs().state == .live) {
             // `slot` starts at `pos` in this engine (`slot == kv.len`, advanced
             // once per step), but it is only a *seed*: `attn_decode`'s own slot is
             // recorded from the launch itself, so the replay retargets whichever
@@ -7519,7 +7545,7 @@ const attn_score_arity: usize = 11;
             }
                         return;
         }
-        if (self.g_state == .warm and !self.g_failed) {
+        if (self.gs().state == .warm and !self.gs().failed) {
             // Allocate the rope {pos, base} channel BEFORE the capture opens.
             // A `cudaMalloc` inside an open stream capture is not legal, and the
             // first `rope64` of the capture step is where it would have landed:
@@ -7527,7 +7553,7 @@ const attn_score_arity: usize = 11;
             // previous error during capture" with the graph abandoned from the
             // very first token.
             _ = self.ensureRopeDyn();
-            if (self.graphBegin(pos, pos)) self.g_capturing_step = true;
+            if (self.graphBegin(pos, pos)) self.gs().capturing_step = true;
         }
     }
 
@@ -7539,7 +7565,7 @@ const attn_score_arity: usize = 11;
             std.debug.print("[qstat] hit={d} miss={d}\n", .{ self0.q_hit, self0.q_miss });
         }
         const self = self_(ctx);
-        if (!self.g_capturing_step) {
+        if (!self.gs().capturing_step) {
             // A REPLAYED step lands here.  Its launches went to `g_stream`, and
             // nothing else orders that private stream against the legacy default
             // one: `sample`/`argmax` reads logits on the default stream and the
@@ -7556,7 +7582,7 @@ const attn_score_arity: usize = 11;
                     .{ self.gr_n, self.gr_ms, if (self.gr_n > 0) self.gr_ms / @as(f64, @floatFromInt(self.gr_n)) else 0,
                         if (self.gr_ms > 0) @as(f64, @floatFromInt(self.gr_n)) * 1000.0 / self.gr_ms else 0 });
             }
-            if (self.g_state == .live) self.graphSyncToDefault();
+            if (self.gs().state == .live) self.graphSyncToDefault();
             // The graph's tail IS the sampler, so its result is only readable now
             // -- after the ordering barrier above, and outside any capture, which
             // is the only place a blocking D2H is legal.  This is the single
@@ -7567,7 +7593,7 @@ const attn_score_arity: usize = 11;
             }
             return;
         }
-        self.g_capturing_step = false;
+        self.gs().capturing_step = false;
         _ = self.graphEnd();
         // The captured step ran on `g_stream` (capture still executes).  Its
         // results -- the token's logits, and the KV row it appended -- have to be
@@ -7579,7 +7605,7 @@ const attn_score_arity: usize = 11;
         // barrier most -- the capture step, the only one which executed on the
         // graph stream before any replay -- is the one where `g_state` is
         // already `.live` on entry to this function.
-        if (self.g_state == .live) self.graphSyncToDefault();
+        if (self.gs().state == .live) self.graphSyncToDefault();
         // The capture step executed too (capture still runs the kernels), so its
         // token has to be downloaded the same way a replayed step's is.
         if (self.sample_pending) {
