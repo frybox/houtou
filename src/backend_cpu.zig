@@ -1259,6 +1259,32 @@ pub const CpuBackend = struct {
         }
     }
 
+    /// CPU 参照实现 for `VTable.gdnStepRowsSnap`: 与 `vGdnStepRowsChunk` 相同的
+    /// 逐行 `gdnStepRows`，外加每行结束后拷一份 state（槽 `r-1` = 第 r 行之后）。
+    /// 拷贝发生在**两行之间**，这正是设备内核必须复现的性质。
+    fn vGdnStepRowsSnap(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                        gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
+                        rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
+        if (heads == 0 or vd == 0 or nk == 0) return;
+        const per = heads * kd * vd;
+        for (0..rows) |t| {
+            vGdnStepRows(ctx,
+                state,
+                k.span(t * k_stride, nk * kd),
+                v.span(t * v_stride, heads * vd),
+                q.span(t * q_stride, nk * kd),
+                km.span(t * heads * vd, heads * vd),
+                delta.span(t * heads * vd, heads * vd),
+                out.span(t * heads * vd, heads * vd),
+                gamma.span(t * heads, heads),
+                beta.span(t * heads, heads),
+                heads, nk, kd, vd);
+            if (snap.len >= (t + 1) * per) {
+                @memcpy(snap.slice()[t * per ..][0..per], state.slice()[0..per]);
+            }
+        }
+    }
+
     /// CPU oracle for `VTable.attnChunk`: literally the per-row `attnDecode`
     /// calls the engine made before the chunk slot existed, in the same order.
     /// Keeping the naive loop here is what makes a device implementation's
@@ -1502,6 +1528,7 @@ pub const CpuBackend = struct {
         .gdnStep = vGdnStep,
         .gdnStepRows = vGdnStepRows,
         .gdnStepRowsChunk = vGdnStepRowsChunk,
+        .gdnStepRowsSnap = vGdnStepRowsSnap,
         .loadVecF32 = vLoadVecF32,
         .freeVec = vFreeVec,
         .allocBuf = vAllocBuf,

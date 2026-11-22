@@ -257,6 +257,7 @@ __global__ void q35_gdn_step_rows_chunk_kernel(
     float *__restrict__ d_out, int out_stride,
     const float *__restrict__ d_gamma, int gamma_stride,
     const float *__restrict__ d_beta, int beta_stride,
+    float *__restrict__ d_snap, int nsnap,
     int nk, int kd, int vd, int rows)
 {
     const int h = blockIdx.x;
@@ -266,6 +267,10 @@ __global__ void q35_gdn_step_rows_chunk_kernel(
     const int kh = h % nk;
     // Per-head bases that do NOT move with the token.
     float *__restrict__ state = d_state + (size_t)h * state_stride;
+    // 快照布局与 `d_state` 相同：`[heads][kd][vd]`，槽 t 是"跑完第 t+1 行之后"
+    // 的整份状态。 `d_snap` 为 null 或 `nsnap == 0` 时完全不写。
+    float *__restrict__ snap_h = d_snap ? (d_snap + (size_t)h * state_stride) : nullptr;
+    const int heads = gridDim.x;
     const float *__restrict__ k_h0 = d_k + (size_t)kh * kd;
     const float *__restrict__ q_h0 = d_q + (size_t)kh * kd;
 
@@ -301,6 +306,18 @@ __global__ void q35_gdn_step_rows_chunk_kernel(
             out = __fadd_rn(out, __fmul_rn(r, q_h[i]));
         }
         out_p[j] = out;
+
+        // 快照：这一行跑完后的整份状态写进槽 t。 `state` 在这一行已被
+        // Pass 2 全部写完（每个线程写自己那一列 j 的全部 kd 行），但其它
+        // 线程的列未必完成，所以拷之前要同步一次。
+        if (snap_h != nullptr && t < nsnap) {
+            __syncthreads();
+            float *__restrict__ slot = snap_h + (size_t)t * heads * state_stride;
+            for (int i = 0; i < kd; ++i) {
+                slot[(size_t)i * vd + j] = state[(size_t)i * vd + j];
+            }
+            __syncthreads();
+        }
     }
 }
 
@@ -326,7 +343,37 @@ extern "C" int q35_launch_gdn_step_rows_chunk(float *d_state, int state_stride,
     q35_gdn_step_rows_chunk_kernel<<<heads, Q35_GDN_THREADS, 0, (cudaStream_t)stream>>>(
         d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride,
         d_km, km_stride, d_delta, delta_stride, d_out, out_stride,
-        d_gamma, gamma_stride, d_beta, beta_stride, nk, kd, vd, rows);
+        d_gamma, gamma_stride, d_beta, beta_stride, nullptr, 0, nk, kd, vd, rows);
+    return (int)cudaGetLastError();
+}
+
+// 与上面同一个内核，额外把每行结束后的状态写进 `d_snap` 的第 t 个槽
+// （`d_snap` 是 `nsnap * heads * kd * vd`）。推测解码的回滚靠它把"重跑 rows
+// 行递推"换成"改一个索引"。`d_snap == nullptr` 或 `nsnap == 0` 时行为与上一个
+// launcher 完全一致。
+extern "C" int q35_launch_gdn_step_rows_snap(float *d_state, int state_stride,
+                                             const float *d_k, int k_stride,
+                                             const float *d_v, int v_stride,
+                                             const float *d_q, int q_stride,
+                                             float *d_km, int km_stride,
+                                             float *d_delta, int delta_stride,
+                                             float *d_out, int out_stride,
+                                             const float *d_gamma, int gamma_stride,
+                                             const float *d_beta, int beta_stride,
+                                             float *d_snap, int nsnap,
+                                             int heads, int nk, int kd, int vd,
+                                             int rows, void *stream)
+{
+    if (heads <= 0 || rows <= 0) return (int)cudaSuccess;
+    if (vd != 128 || kd != 128) return cudaErrorInvalidValue;
+    if (nk <= 0 || nk > heads) return cudaErrorInvalidValue;
+    q35_gdn_step_rows_chunk_kernel<<<heads, Q35_GDN_THREADS, 0, (cudaStream_t)stream>>>(
+        d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride,
+        d_km, km_stride, d_delta, delta_stride, d_out, out_stride,
+        d_gamma, gamma_stride, d_beta, beta_stride,
+        (d_snap != nullptr && nsnap > 0) ? d_snap : nullptr,
+        (d_snap != nullptr && nsnap > 0) ? nsnap : 0,
+        nk, kd, vd, rows);
     return (int)cudaGetLastError();
 }
 

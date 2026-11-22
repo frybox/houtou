@@ -343,6 +343,110 @@ test "gdnStepRowsChunk: one fused call == rows successive gdnStepRows calls" {
     try std.testing.expectEqualSlices(f32, dl_b, dl_a);
 }
 
+// 快照槽的语义就是回滚的全部依据：回滚把 state 视图指到槽 `r`，并假定它就是
+// "正好跑完 r 行之后"的状态。任何一个槽装错（装成行前状态、装成最终状态、
+// 或随 head/t 排布串位）都会静默污染每一个不是"全部接受"的前缀。
+// 这个测试把每个槽钉在显式的 r 行运行上。
+test "gdnStepRowsSnap: slot r == state after exactly r rows" {
+    const heads = 3;
+    const nk = 2; // nk < heads: exercises the kh = h % nk map
+    const kd = 16;
+    const vd = 16;
+    const rows = 5;
+    const kq_dim = nk * kd;
+    const value_dim = heads * vd;
+    const conv_dim = 2 * kq_dim + value_dim;
+    const per = heads * kd * vd;
+
+    const alloc = std.testing.allocator;
+    const qkv = try alloc.alloc(f32, rows * conv_dim);
+    defer alloc.free(qkv);
+    const gamma = try alloc.alloc(f32, rows * heads);
+    defer alloc.free(gamma);
+    const beta = try alloc.alloc(f32, rows * heads);
+    defer alloc.free(beta);
+    const km = try alloc.alloc(f32, rows * value_dim);
+    defer alloc.free(km);
+    const dl = try alloc.alloc(f32, rows * value_dim);
+    defer alloc.free(dl);
+    const out = try alloc.alloc(f32, rows * value_dim);
+    defer alloc.free(out);
+    const state = try alloc.alloc(f32, per);
+    defer alloc.free(state);
+    const init = try alloc.alloc(f32, per);
+    defer alloc.free(init);
+    // `rows` 个槽：槽 r (r >= 1) = 第 r 行之后。
+    const snap = try alloc.alloc(f32, rows * per);
+    defer alloc.free(snap);
+
+    var rng = std.Random.DefaultPrng.init(90210);
+    const r = rng.random();
+    for (qkv) |*x| x.* = r.float(f32) * 2.0 - 1.0;
+    for (gamma) |*x| x.* = 0.5 + 0.4 * r.float(f32);
+    for (beta) |*x| x.* = r.float(f32);
+    for (init) |*x| x.* = r.float(f32) * 2.0 - 1.0;
+
+    var ctx_holder: u8 = 0;
+    const vt = backend_cpu.CpuBackend.vtable;
+    const ctx: *anyopaque = @ptrCast(&ctx_holder);
+
+    @memcpy(state, init);
+    vt.gdnStepRowsSnap(ctx,
+        .{ .ptr = state.ptr, .len = state.len },
+        .{ .ptr = qkv.ptr + kq_dim, .len = rows * conv_dim - kq_dim },
+        .{ .ptr = qkv.ptr + 2 * kq_dim, .len = rows * conv_dim - 2 * kq_dim },
+        .{ .ptr = qkv.ptr, .len = rows * conv_dim },
+        .{ .ptr = km.ptr, .len = km.len },
+        .{ .ptr = dl.ptr, .len = dl.len },
+        .{ .ptr = out.ptr, .len = out.len },
+        .{ .ptr = gamma.ptr, .len = gamma.len },
+        .{ .ptr = beta.ptr, .len = beta.len },
+        .{ .ptr = snap.ptr, .len = snap.len },
+        heads, nk, kd, vd, rows, conv_dim, conv_dim, conv_dim);
+
+    // 槽 r-1 与"从初始状态独立跑 r 行"逐个比。同样的语句、同样的顺序，
+    // 所以要求逐位相等。
+    for (1..rows + 1) |r_rows| {
+        const want = try alloc.alloc(f32, per);
+        defer alloc.free(want);
+        @memcpy(want, init);
+        for (0..r_rows) |t| {
+            const qkv_t = qkv[t * conv_dim ..][0..conv_dim];
+            vt.gdnStepRows(ctx,
+                .{ .ptr = want.ptr, .len = want.len },
+                .{ .ptr = qkv_t.ptr + kq_dim, .len = kq_dim },
+                .{ .ptr = qkv_t.ptr + 2 * kq_dim, .len = value_dim },
+                .{ .ptr = qkv_t.ptr, .len = kq_dim },
+                .{ .ptr = km.ptr + t * value_dim, .len = value_dim },
+                .{ .ptr = dl.ptr + t * value_dim, .len = value_dim },
+                .{ .ptr = out.ptr + t * value_dim, .len = value_dim },
+                .{ .ptr = gamma.ptr + t * heads, .len = heads },
+                .{ .ptr = beta.ptr + t * heads, .len = heads },
+                heads, nk, kd, vd);
+        }
+        try std.testing.expectEqualSlices(f32, want, snap[(r_rows - 1) * per ..][0..per]);
+    }
+    // 活跃 state 等于跑完全部 rows 行的结果（不是某个槽）。
+    const last = try alloc.alloc(f32, per);
+    defer alloc.free(last);
+    @memcpy(last, init);
+    for (0..rows) |t| {
+        const qkv_t = qkv[t * conv_dim ..][0..conv_dim];
+        vt.gdnStepRows(ctx,
+            .{ .ptr = last.ptr, .len = last.len },
+            .{ .ptr = qkv_t.ptr + kq_dim, .len = kq_dim },
+            .{ .ptr = qkv_t.ptr + 2 * kq_dim, .len = value_dim },
+            .{ .ptr = qkv_t.ptr, .len = kq_dim },
+            .{ .ptr = km.ptr + t * value_dim, .len = value_dim },
+            .{ .ptr = dl.ptr + t * value_dim, .len = value_dim },
+            .{ .ptr = out.ptr + t * value_dim, .len = value_dim },
+            .{ .ptr = gamma.ptr + t * heads, .len = heads },
+            .{ .ptr = beta.ptr + t * heads, .len = heads },
+            heads, nk, kd, vd);
+    }
+    try std.testing.expectEqualSlices(f32, last, state);
+}
+
 test "gdnStepRowsChunk: rows are serialised, not independent" {
     // A fused kernel that ran the rows in parallel would still match the
     // sequential form on `state_a` above if it only touched the FIRST row's

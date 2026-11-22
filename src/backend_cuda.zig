@@ -172,6 +172,7 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_wy(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_step_rows_snap(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     // Prefill (batched) twins of conv_step / gdn_gamma / l2norm / scale_vec.
@@ -338,6 +339,7 @@ const Launch = if (cuda_linked) struct {
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_step_rows_chunk = Kernels.q35_launch_gdn_step_rows_chunk;
+    const gdn_step_rows_snap = Kernels.q35_launch_gdn_step_rows_snap;
     const gdn_step_wy = Kernels.q35_launch_gdn_step_wy;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
@@ -550,6 +552,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_step_rows_snap(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
     fn gdn_step_wy(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -8096,6 +8102,82 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.gdnStepRowsChunk(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
+    /// `VTable.gdnStepRowsSnap`：chunk 递推 + 每行一份状态快照。
+    ///
+    /// 永远走逐 token 内核，不用 WY：WY 按 C 个 token 分块求解，只有块尾才把
+    /// `state` 写回，块内"第 r 行之后的状态"不作为整块存在。要在那里发快照
+    /// 就得逐行重新导出状态——正是这里要避免的活。
+    ///
+    /// 代价：只有 decode 的 verify 会调（`rows <= spec_verify_rows`），prefill
+    /// 热路径完全不受影响。
+    fn dGdnStepRowsSnap_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                             q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                             gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
+                             heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+                             k_stride: usize, v_stride: usize, q_stride: usize) void {
+        const self = self_(ctx);
+        const per = heads * kd * vd;
+        if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and rows != 0 and
+            gamma.len >= rows * heads and beta.len >= rows * heads and
+            state.len >= per and snap.len >= rows * per and
+            out.len >= rows * heads * vd and
+            km.len >= rows * heads * vd and delta.len >= rows * heads * vd and
+            self.cu != null)
+        {
+            if (dBufPtr(state)) |pstate| {
+                if (dBufPtr(k)) |pk| {
+                    if (dBufPtr(v)) |pv| {
+                        if (dBufPtr(q)) |pq| {
+                            if (dBufPtr(km)) |pkm| {
+                                if (dBufPtr(delta)) |pdelta| {
+                                    if (dBufPtr(out)) |pout| {
+                                        if (dBufPtr(gamma)) |pgamma| {
+                                            if (dBufPtr(beta)) |pbeta| {
+                                                if (dBufPtr(snap)) |psnap| {
+                                                    const rc = Launch.gdn_step_rows_snap(
+                                                        pstate, @intCast(kd * vd),
+                                                        pk, @intCast(k_stride),
+                                                        pv, @intCast(v_stride),
+                                                        pq, @intCast(q_stride),
+                                                        pkm, @intCast(heads * vd),
+                                                        pdelta, @intCast(heads * vd),
+                                                        pout, @intCast(heads * vd),
+                                                        pgamma, @intCast(heads),
+                                                        pbeta, @intCast(heads),
+                                                        psnap, @intCast(rows),
+                                                        @intCast(heads), @intCast(nk),
+                                                        @intCast(kd), @intCast(vd), @intCast(rows),
+                                                        self.launchStream(),
+                                                    );
+                                                    if (rc == cudart.cudaSuccess) return;
+                                                    self.ewLaunchFail("gdn_step_rows_snap", rc);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 形状或驻留不满足：走 CPU oracle（逐行 + 逐行快照），只慢不错。
+        cpu_mod.CpuBackend.vtable.gdnStepRowsSnap(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+    }
+
+    fn dGdnStepRowsSnap(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                        q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                        gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
+                        heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+                        k_stride: usize, v_stride: usize, q_stride: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_step, t0);
+        if (self.ablated(.gdn_step)) return ;
+        dGdnStepRowsSnap_body(ctx, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+    }
+
     fn dGdnStepRowsChunk(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
@@ -8392,6 +8474,7 @@ pub const vtable = backend.Exec.VTable{
     .gdnStep = CudaBackend.dGdnStep,
     .gdnStepRows = CudaBackend.dGdnStepRows,
     .gdnStepRowsChunk = CudaBackend.dGdnStepRowsChunk,
+    .gdnStepRowsSnap = CudaBackend.dGdnStepRowsSnap,
     .loadVecF32 = CudaBackend.vLoadVecF32,
     .freeVec = CudaBackend.vFreeVec,
     .attnDecode = CudaBackend.dAttnDecode,

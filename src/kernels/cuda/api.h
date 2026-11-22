@@ -337,6 +337,37 @@ int q35_launch_gdn_step_wy(float *d_state, int state_stride,
                            int heads, int nk, int kd, int vd,
                            int rows, void *stream);
 
+// Same recurrence as `q35_launch_gdn_step_rows_chunk`, but it ALSO writes one
+// state snapshot per finished row into `d_snap`, so a caller that later needs
+// the state "as of after row r" does not have to re-run the recurrence.
+//
+// WHY (speculative decoding): a verify block pushes `k` rows through the state
+// update, but only the accepted `r <= k` of them should remain.  Without
+// snapshots the rollback re-runs the prelude and this kernel for `r` rows on
+// EVERY GDN layer -- measured at 73.9% of MTP's total time (`mv_batchk`
+// calls=18885 vs plain decode's 496 for 64 tokens).  With snapshots the
+// rollback is "point the state view at snapshot r", i.e. zero compute and zero
+// copy.  Same trade llama.cpp makes with `n_rs_seq`
+// (`src/models/delta-net-base.cpp`, `ggml_gated_delta_net(..., K)`).
+//
+//   d_snap   `nsnap * heads * kd * vd` floats, slot-major.  Slot `t` is the
+//            state after row t+1, i.e. slot 0 is "after one row".  The state
+//            BEFORE any row is the caller's own copy, so it is not written.
+//   nsnap    slots to write.  `nsnap == 0` or a null `d_snap` makes this
+//            behave exactly like the no-snapshot launcher.
+int q35_launch_gdn_step_rows_snap(float *d_state, int state_stride,
+                                  const float *d_k, int k_stride,
+                                  const float *d_v, int v_stride,
+                                  const float *d_q, int q_stride,
+                                  float *d_km, int km_stride,
+                                  float *d_delta, int delta_stride,
+                                  float *d_out, int out_stride,
+                                  const float *d_gamma, int gamma_stride,
+                                  const float *d_beta, int beta_stride,
+                                  float *d_snap, int nsnap,
+                                  int heads, int nk, int kd, int vd,
+                                  int rows, void *stream);
+
 // One token of the delta-rule state update, one launch per value head.
 // d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
 // updated in place; d_k/d_q are kd, d_v/d_km/d_delta/d_out are vd.  See

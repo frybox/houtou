@@ -645,6 +645,9 @@ pub const Engine = struct {
     /// prelude 推进，且无法从 conv 的**输出**反推，所以缓存 post-conv 会让
     /// 回滚退回"重跑整条链"。见 `specRollbackAndReplay`。
     gdn_in: []GdnIn = &.{},
+    /// 当前 chunk 是否是推测解码的 verify。只有 verify 需要 GDN 状态快照；
+    /// prefill 与普通 decode 恒为 false，走不带快照的 chunk 内核。
+    in_spec_verify: bool = false,
     /// `$QWEN35_SPEC_RBDBG` 用的常驻比对缓冲（两份 GDN `state` 的 HOST 副本）。
     /// 只在打开诊断时由 `allocSpecSnapshot` 分配一次。`copyOut` 的目标是
     /// HOST 内存，所以这两个是普通切片，不是 `Buf`（设备地址）。
@@ -827,7 +830,20 @@ pub const Engine = struct {
     const GdnState = struct {
         conv: backend.Buf,
         conv_len: u32,
+        /// 活跃的状态切片视图（`[nv, kd, vd]`）。它指向 `state_all` 的第
+        /// `rs_idx` 块：推测解码回滚时只改这个视图，不拷贝、不重算。
+        /// 普通解码时恒为第 0 块。
         state: backend.Buf,
+        /// `(1 + spec_rs_seq)` 份 `[nv, kd, vd]` 连续状态缓冲。第 0 块是常规
+        /// 状态，第 `t` 块（t>=1）是"跑完 verify 第 t 行之后"的快照。
+        ///
+        /// 这是 llama.cpp `n_rs_seq` 的同一布局（`src/llama-memory-recurrent.cpp`
+        /// 的 `n_rows = mem_size * (1 + n_rs_seq)`）：状态缓冲多开 K 份，
+        /// verify 时内核逐行写不同块，回滚只把 `rs_idx` 改到对应块。
+        /// 相比"回滚时重跑 rows 行递推"，这省掉 73.9% 的 MTP 时间（实测）。
+        state_all: backend.Buf,
+        /// 当前活跃块号。0 = 常规状态；1..K = verify 第 t 行之后的状态。
+        rs_idx: u32,
     };
 
     /// One layer's pre-verify state, for the speculative rollback
@@ -863,6 +879,12 @@ pub const Engine = struct {
     /// the 27B), so the verify buffer is `16 * vocab` f32 -- distinct from the
     /// prefill chunk `nbatch` (1024), which would make it 1 GB.
     pub const spec_verify_rows: usize = 16;
+
+    /// GDN 状态快照槽数 K。一次 verify 块最多 `spec_verify_rows` 行，接受
+    /// `rows <= verify_rows - 1` 行，而槽 `rows-1` 是"跑完第 rows 行之后"，
+    /// 所以需要 `spec_verify_rows - 1` 个 快照块。取 16 覆盖到 verify 的
+    /// 全部行数，与 llama.cpp 的 `n_rs_seq = draft.n_max` 同一个量级。
+    pub const spec_rs_seq: usize = spec_verify_rows;
 
     /// One decl per `backend.Kind`, holding the concrete backend type
     /// `selectBackend` picks for it.
@@ -1110,6 +1132,9 @@ pub const Engine = struct {
             return error.KvTypeNotSupported;
         }
         const gdn_kv: usize = @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim * cfg.gdn_head_dim;
+        // 状态块数：1 块常规 + `spec_rs_seq` 块 verify 快照。不开推测解码时
+        // 只有 1 块，与改动前完全一样（多出来的只有 `state_all` 这个字段）。
+        const spec_rs_slabs: usize = 1 + (if (spec) spec_rs_seq else 0);
         const gdn_conv_dim: usize =
             2 * @as(usize, cfg.gdn_num_k_heads) * cfg.gdn_head_dim +
             @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim;
@@ -1117,18 +1142,23 @@ pub const Engine = struct {
             if (cfg.isFullAttention(@intCast(li))) {
                 const region = try exec.allocKv(kv_dim, max_seq);
                 e.kv[li] = .{ .k = region.k, .v = region.v, .len = 0 };
-                e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
+                e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty, .state_all = backend.Buf.empty, .rs_idx = 0 };
             } else {
                 e.kv[li] = .{ .k = backend.Buf.empty, .v = backend.Buf.empty, .len = 0 };
                 e.gdn[li] = .{
                     .conv = try exec.allocBuf(gdn_conv_dim * (@as(usize, cfg.conv_kernel) - 1)),
                     .conv_len = 0,
-                    .state = try exec.allocBuf(gdn_kv),
+                    .state_all = try exec.allocBuf(gdn_kv * spec_rs_slabs),
+                    .state = backend.Buf.empty,
+                    .rs_idx = 0,
                 };
+                // 活跃视图 = 第 0 块。
+                e.gdn[li].state = e.gdn[li].state_all.span(0, gdn_kv);
                 // The delta-rule state must start at zero.  The region is
                 // backend memory (device under `--backend cuda`), so the reset
                 // goes through the backend: a host `@memset` cannot reach it.
-                exec.zeroBuf(e.gdn[li].state);
+                // 所有块一起清零：快照块在写入前也会被读（见 `rs_idx`）。
+                exec.zeroBuf(e.gdn[li].state_all);
             }
             inited += 1;
         }
@@ -1145,7 +1175,7 @@ pub const Engine = struct {
             const li = n_layers;
             const region = try exec.allocKv(kv_dim, max_seq);
             e.kv[li] = .{ .k = region.k, .v = region.v, .len = 0 };
-            e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
+            e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty, .state_all = backend.Buf.empty, .rs_idx = 0 };
             inited += 1;
         }
 
@@ -1416,7 +1446,7 @@ pub const Engine = struct {
         const nk = @min(n, self.kv.len);
         for (self.kv[0..nk]) |*c| c.* = .{ .k = backend.Buf.empty, .v = backend.Buf.empty, .len = 0 };
         const ng = @min(n, self.gdn.len);
-        for (self.gdn[0..ng]) |*s| s.* = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
+        for (self.gdn[0..ng]) |*s| s.* = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty, .state_all = backend.Buf.empty, .rs_idx = 0 };
     }
 
     /// Number of layer slots actually allocated: decoder layers plus the nextn
@@ -1820,6 +1850,9 @@ pub const Engine = struct {
 
         // Layers, exactly as `forwardChunk` runs them.  Row k-1 also gets its
         // lm_head there, which the batched projection below recomputes.
+        // 让 GDN 分支写每行的状态快照；`specRollbackAndReplay` 据此只改视图。
+        self.in_spec_verify = true;
+        defer self.in_spec_verify = false;
         _ = self.forwardChunk(tokens, pos0);
         if (k == 1) {
             self.exec.copyRange(self.logitsK.span(0, c.vocab), self.logits);
@@ -2249,6 +2282,33 @@ pub const Engine = struct {
         // Every argument is the CHUNK-RESIDENT buffer, not token 0's slice: the
         // backend strides it.  That is what makes this one launch instead of `k`.
         const beta_base: usize = k * nv; // the b half of abK follows the a half
+        // 推测解码的 verify 走带快照的版本：内核在每行结束后把整份 state 写进
+        // `state_all` 的第 t+1 块。回滚因此只需把 `state` 视图指过去。
+        // 其它情形（prefill、普通 decode）传空 snap，与改动前完全一致。
+        const want_snap = self.in_spec_verify and self.gdn[li].state_all.len >= (spec_rs_seq + 1) * nv * kd * vd;
+        if (want_snap) {
+            self.exec.gdnStepRowsSnap(
+                self.gdn[li].state,
+                self.qkvK.span(kq_dim, k * conv_dim - kq_dim),
+                self.qkvK.span(2 * kq_dim, k * conv_dim - 2 * kq_dim),
+                self.qkvK.span(0, k * conv_dim),
+                self.kv_mem,
+                self.delta,
+                self.goutK.span(0, k * value_dim),
+                self.gdn_prefill_gamma.span(0, k * nv),
+                self.abK.span(beta_base, k * nv),
+                self.gdn[li].state_all.span(nv * kd * vd, (spec_rs_seq) * nv * kd * vd),
+                nv,
+                nk,
+                kd,
+                vd,
+                k,
+                conv_dim,
+                conv_dim,
+                conv_dim,
+            );
+            return;
+        }
         self.exec.gdnStepRowsChunk(
             self.gdn[li].state,
             self.qkvK.span(kq_dim, k * conv_dim - kq_dim),
@@ -2708,10 +2768,24 @@ pub const Engine = struct {
             if (i >= self.gdn.len) continue;
             const g = &self.gdn[i];
             if (g.state.len == 0) continue;
-            // 先把承载状态的缓冲恢复到 verify 之前的内容。
+            var used_snap = false;
+            // 卷积历史必须从 verify 前恢复（它无法反推，见上面的注释）。
             if (g.conv.len > 0) self.exec.copyRange(g.conv, sn.conv);
             g.conv_len = sn.conv_len;
-            self.exec.copyRange(g.state, sn.state);
+            // state：verify 的内核已经在每行结束后把整份状态写进 `state_all`
+            // 的第 t+1 块，所以回滚**只是把视图指过去**——不拷贝、不重算。
+            // 这正是 llama.cpp `rs_idx` 的做法（`llama-memory-recurrent.cpp:825`
+            // 的 `cell_id = rs_idx_cur * size + i`）。`rows` 行的状态在槽 `rows`。
+            if (rows <= spec_rs_seq and g.state_all.len >= (rows + 1) * nv * kd * vd) {
+                g.rs_idx = @intCast(rows);
+                g.state = g.state_all.span(rows * nv * kd * vd, nv * kd * vd);
+                used_snap = true;
+            } else {
+                // 行数超出快照容量（不该发生，verify 块 <= spec_verify_rows）：
+                // 退回"恢复快照 + 重跑递推"，正确但慢。
+                self.exec.copyRange(g.state, sn.state);
+                used_snap = false;
+            }
             if (i >= self.gdn_in.len) continue;
             const gi = &self.gdn_in[i];
             if (gi.qkv.len < rows * conv_dim or gi.gamma.len < rows * 2 * nv) continue;
@@ -2743,7 +2817,9 @@ pub const Engine = struct {
                 c.conv_kernel,
                 1e-6,
             );
-            // 2. 然后对同样的行跑状态递推，用的就是 prelude 刚产出的行。
+            // 2. 状态递推只在快照分支没命中时才需要：那时 `g.state` 就是
+            //    verify 前的快照，要重新推进 `rows` 行。用了快照就不做。
+            if (used_snap) continue;
             self.exec.gdnStepRowsChunk(
                 g.state,
                 self.qkvK.span(kq_dim, rows * conv_dim - kq_dim),

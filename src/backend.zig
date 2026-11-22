@@ -399,6 +399,20 @@ pub const Exec = struct {
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
             k_stride: usize, v_stride: usize, q_stride: usize) void,
 
+        /// `gdnStepRowsChunk` 加"每行结束后写一份状态快照"。
+        ///
+        /// 目的（推测解码）：verify 块把 `k` 行推进状态，但只有被接受的
+        /// `r <= k` 行该留下。没有快照时回滚要在每一层重跑 `r` 行递推
+        /// （实测占 MTP 总时间 73.9%）；有快照时回滚只是把 state 视图指到
+        /// 第 `r` 个槽——零计算、零拷贝。与 llama.cpp 的 `n_rs_seq` 同一交易。
+        ///
+        ///   * `snap` 是 `nsnap * heads * kd * vd`，槽 `t` = 跑完第 t+1 行之后
+        ///     的状态。第 0 行**之前**的状态不写（调用方自己有）。
+        ///   * 空 `snap` 表示不要快照；被拒绝的形状同样退化为普通 chunk 递推。
+        gdnStepRowsSnap: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+            gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+            k_stride: usize, v_stride: usize, q_stride: usize) void,
+
         /// Full-attention decode for one token: scores against the KV rows,
         /// softmax, PV accumulation into `gout`, then the sigmoid gate.  `kcache`
         /// / `vcache` are this layer's WHOLE KV regions (`kv_dim` elements per
@@ -734,6 +748,13 @@ pub const Exec = struct {
                             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                             rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         self.vtable.gdnStepRowsChunk(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+    }
+    /// `gdnStepRowsChunk` 加每行的状态快照，见 `VTable.gdnStepRowsSnap`。
+    pub fn gdnStepRowsSnap(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                           gamma: Buf, beta: Buf, snap: Buf,
+                           heads: usize, nk: usize, kd: usize, vd: usize,
+                           rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
+        self.vtable.gdnStepRowsSnap(self.ptr, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
     pub fn attnDecode(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
