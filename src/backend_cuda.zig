@@ -151,6 +151,9 @@ const Kernels = struct {
     /// Index of the largest logit; first index wins on ties.
     extern fn q35_launch_argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_argmax_batch(d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// `argmax` plus the winner's logit and the row's `sum(exp(x - max))`, for
+    /// the MTP drafter's confidence early stop (see api.h).
+    extern fn q35_launch_argmax_conf(d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     // Device sampler (sample.cu).  The per-token parameters -- temperature,
     // top_k, top_p, PRNG state -- travel through `d_ctl`, a RESIDENT device
@@ -318,6 +321,7 @@ const Launch = if (cuda_linked) struct {
     const conv_step = Kernels.q35_launch_conv_step;
     const argmax = Kernels.q35_launch_argmax;
     const argmax_batch = Kernels.q35_launch_argmax_batch;
+    const argmax_conf = Kernels.q35_launch_argmax_conf;
     const sample = Kernels.q35_launch_sample;
     const sample_init = Kernels.q35_launch_sample_init;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
@@ -467,6 +471,10 @@ const Launch = if (cuda_linked) struct {
         return stubNoCudaKernels();
     }
     fn argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, n, d_out, stream };
+        return stubNoCudaKernels();
+    }
+    fn argmax_conf(d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
     }
@@ -1324,6 +1332,11 @@ pub const CudaBackend = struct {
     /// per-token download the greedy path makes: 4 bytes.
     d_idx: ?*anyopaque = null,
     d_idx_bytes: usize = 0,
+    /// 3 f32-or-int cells `[index, best_logit_bits, exp_sum_bits]` for
+    /// `q35_launch_argmax_conf`.  Separate from `d_idx` because that one is
+    /// exactly 4 bytes and pre-allocated in `allocScratch`.
+    d_conf: ?*anyopaque = null,
+    d_conf_bytes: usize = 0,
 
     // ---- device sampler (src/kernels/cuda/sample.cu) ------------------------
     //
@@ -5413,6 +5426,63 @@ const attn_score_arity: usize = 11;
         for (0..rows) |r| out[r] = @intCast(host[r]);
     }
 
+    /// `Exec.argmaxConf`: argmax plus the top-1 softmax probability.
+    ///
+    /// One launch and one 12-byte read-back, i.e. the same cost as `argmax`
+    /// itself.  The probability feeds the MTP drafter's early stop, which is
+    /// llama.cpp's `p_min` (`common/speculative.cpp:1789`): a drafted token
+    /// costs a full verify row whether or not it is accepted, so a low-confidence
+    /// draft is worth abandoning before it is ever proposed.
+    pub fn argmaxConf(self: *CudaBackend, logits: backend.Buf, out_p: *f32) u32 {
+        out_p.* = 1.0;
+        if (self.cu == null or logits.len == 0) {
+            return cpuConfFallback(self, logits, out_p);
+        }
+        const px = dBufPtr(logits) orelse return cpuConfFallback(self, logits, out_p);
+        const cu = &self.cu.?;
+        ensureBuf(&cu.lib, &self.d_conf, &self.d_conf_bytes, 3 * @sizeOf(c_int)) catch return 0;
+        const rc = Launch.argmax_conf(px, @intCast(logits.len), @ptrCast(@alignCast(self.d_conf)), null);
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("argmax_conf", rc);
+            return cpuConfFallback(self, logits, out_p);
+        }
+        var host: [3]c_int = undefined;
+        if (cu.lib.Memcpy(&host, self.d_conf, 3 * @sizeOf(c_int), cudart.MemcpyDeviceToHost) != cudart.cudaSuccess) {
+            return cpuConfFallback(self, logits, out_p);
+        }
+        const sum: f32 = @bitCast(host[2]);
+        // `sum` is already `exp(x - max)` summed, so the probability IS `1/sum`
+        // -- the numerator is `exp(max - max) = 1`.
+        if (sum > 0 and std.math.isFinite(sum)) out_p.* = 1.0 / sum;
+        return @intCast(host[0]);
+    }
+
+    fn cpuConfFallback(self: *CudaBackend, logits: backend.Buf, out_p: *f32) u32 {
+        _ = self;
+        // Host logits (or a device failure): compute both on the host, where the
+        // reference already lives.
+        const row = logits.slice();
+        if (row.len == 0) return 0;
+        var best: f32 = -std.math.inf(f32);
+        var bi: u32 = 0;
+        for (row, 0..) |v, i| {
+            if (v > best) {
+                best = v;
+                bi = @intCast(i);
+            }
+        }
+        var sum: f64 = 0;
+        for (row) |v| sum += @exp(@as(f64, v - best));
+        out_p.* = if (sum > 0) @floatCast(1.0 / sum) else 1.0;
+        return bi;
+    }
+
+    fn dArgmaxConf(ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
+        const self = self_(ctx);
+        if (self.g_state == .live) p.* = 1.0; // the graph already ran it
+        return self.argmaxConf(logits, p);
+    }
+
     fn dArgmax_body(ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
@@ -8330,6 +8400,7 @@ pub const vtable = backend.Exec.VTable{
     .gdnPrefillCore = CudaBackend.dGdnPrefillCore,
     .copyFromHost = CudaBackend.dCopyFromHost,
     .argmax = CudaBackend.dArgmax,
+    .argmaxConf = CudaBackend.dArgmaxConf,
     .argmaxRows = CudaBackend.dArgmaxRows,
     .sample = CudaBackend.dSample,
     .sampledToken = CudaBackend.dSampledToken,

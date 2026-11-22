@@ -365,6 +365,63 @@ extern "C" int q35_launch_argmax_batch(const float *d_x, int n, int rows,
     return (int)cudaGetLastError();
 }
 
+// `q35_launch_argmax` plus the top-1 softmax probability.  One block, two
+// reductions: the (value, index) argmax exactly as `k_argmax` does it, then a
+// sum of `exp(x - best)` over the same row.  The shift keeps the sum finite for
+// any logit range, and it is accumulated in `double` so a 248k-element row does
+// not lose the tail to f32 rounding.
+__global__ void k_argmax_conf(const float *__restrict__ d_x, int n, int *d_out) {
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    __shared__ double s_sum[256];
+    const int tid = threadIdx.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = d_x[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_val[tid + stride] > s_val[tid] ||
+                (s_val[tid + stride] == s_val[tid] && s_idx[tid + stride] < s_idx[tid])) {
+                s_val[tid] = s_val[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    const float top = s_val[0];
+    // Second pass: sum of exp(x - top).  Same striding, so every element is
+    // visited exactly once.
+    double acc = 0.0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        acc += (double)__expf(d_x[i] - top);
+    }
+    s_sum[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        d_out[0] = s_idx[0];
+        d_out[1] = __float_as_int(top);
+        const float sum = (float)s_sum[0];
+        d_out[2] = __float_as_int(sum);
+    }
+}
+
+extern "C" int q35_launch_argmax_conf(const float *d_x, int n, int *d_out, void *stream_v) {
+    if (n <= 0) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_argmax_conf<<<1, 256, 0, stream>>>(d_x, n, d_out);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;

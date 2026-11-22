@@ -206,6 +206,19 @@ int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream);
 // blocking wait per 9 us kernel at five rows per round).
 int q35_launch_argmax_batch(const float *d_x, int n, int rows, int *d_out, void *stream);
 
+// `q35_launch_argmax` plus the winner's VALUE, and the sum of exp over the whole
+// row, so the host can form the top-1 softmax probability
+// (`exp(best - max) / sum`) without a second pass.
+//
+// WHY: llama.cpp's MTP drafter stops a chain once the draft token's probability
+// falls below `p_min` (`common/speculative.cpp:1789`), because a drafted token
+// costs a full verify row whether or not it is accepted.  Reproducing that needs
+// one probability per drafted token, and this is the cheapest way to get it: the
+// same single launch, two extra scalars, no vocabulary read-back.
+// `d_out` is `[index, value_bits, sum_bits]` (3 ints); `sum` is exp-shifted by
+// `value` (the standard max-subtraction) and accumulated in double on device.
+int q35_launch_argmax_conf(const float *d_x, int n, int *d_out, void *stream);
+
 // --- rotary embedding (src/kernels/cuda/rope.cu) ---------------------------
 //
 // `d_x` is `heads * hd` contiguous f32; the FIRST 64 floats of every `hd`-wide

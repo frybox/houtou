@@ -2624,6 +2624,16 @@ pub const Engine = struct {
         return self.exec.argmax(self.logits);
     }
 
+    /// Argmax of the current logits plus the top-1 softmax probability.
+    ///
+    /// `p` is what the MTP drafter's early stop keys on (llama.cpp's `p_min`,
+    /// `common/speculative.cpp:1789`).  Only the CUDA backend can produce it
+    /// cheaply; every other backend reports 1.0, which disables the stop rather
+    /// than changing behaviour.
+    pub fn argmaxConfLogits(self: *Engine, p: *f32) u32 {
+        return self.exec.argmaxConf(self.logits, p);
+    }
+
     /// Copy a host f32 row into `dst` (debug/verification helper).  See
     /// `allocHiddenRow` for the CPU-only restriction.
     pub fn copyHiddenRowIn(self: *Engine, dst: backend.Buf, row: []const f32) void {

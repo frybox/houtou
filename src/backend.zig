@@ -510,6 +510,11 @@ pub const Exec = struct {
         /// Greedy argmax over logits.  On a device backend this runs on the
         /// device and the token id is the only thing that comes back.
         argmax: *const fn (ctx: *anyopaque, logits: Buf) u32,
+        /// `argmax` plus the top-1 softmax probability, for the speculative
+        /// drafter's confidence early stop.  `p` receives a value in (0, 1];
+        /// a backend that cannot produce it cheaply reports 1.0, which makes
+        /// the stop a no-op rather than changing any output.
+        argmaxConf: *const fn (ctx: *anyopaque, logits: Buf, p: *f32) u32,
         /// `rows` independent argmaxes over `rows * vocab` contiguous logits
         /// (the batched speculative verify's output), written to `out[0..rows)`.
         ///
@@ -798,6 +803,10 @@ pub const Exec = struct {
     }
     pub fn argmax(self: Exec, logits: Buf) u32 {
         return self.vtable.argmax(self.ptr, logits);
+    }
+    /// See `VTable.argmaxConf`.
+    pub fn argmaxConf(self: Exec, logits: Buf, p: *f32) u32 {
+        return self.vtable.argmaxConf(self.ptr, logits, p);
     }
     /// `rows` argmaxes over `rows * vocab` logits, one launch and one
     /// read-back on a device backend.  See `VTable.argmaxRows`.

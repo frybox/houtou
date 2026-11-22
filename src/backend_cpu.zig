@@ -1390,6 +1390,30 @@ pub const CpuBackend = struct {
         return ew.bufArgmax(logits);
     }
 
+    /// Host logits are free to read, so the probability costs one extra pass and
+    /// the CPU is a genuine reference for it rather than a "1.0, disabled"
+    /// placeholder.
+    fn vArgmaxConf(ctx: *anyopaque, logits: Buf, p: *f32) u32 {
+        _ = ctx;
+        const row = logits.slice();
+        if (row.len == 0) {
+            p.* = 1.0;
+            return 0;
+        }
+        var best: f32 = -std.math.inf(f32);
+        var bi: u32 = 0;
+        for (row, 0..) |v, i| {
+            if (v > best) {
+                best = v;
+                bi = @intCast(i);
+            }
+        }
+        var sum: f64 = 0;
+        for (row) |v| sum += @exp(@as(f64, v - best));
+        p.* = if (sum > 0) @floatCast(1.0 / sum) else 1.0;
+        return bi;
+    }
+
     /// CPU oracle for `VTable.argmaxRows`: the same `bufArgmax` per row.  Host
     /// memory has no read-back cost, so this is literally the loop the device
     /// slot replaces -- which is what makes the comparison meaningful.
@@ -1496,6 +1520,7 @@ pub const CpuBackend = struct {
         .copyOut = vCopyOut,
         .zeroBuf = vZeroBuf,
         .argmax = vArgmax,
+        .argmaxConf = vArgmaxConf,
         .argmaxRows = vArgmaxRows,
         .sample = vSample,
         .sampledToken = vSampledToken,

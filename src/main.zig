@@ -73,6 +73,11 @@ const MtpRunner = struct {
     h: houtou.backend.Buf,
     /// How many tokens one block may propose.
     max_draft: usize,
+    /// Stop drafting once the head's top-1 probability drops below this
+    /// (`$QWEN35_SPEC_PMIN`, default 0.5; 0 disables the stop).  Only the first
+    /// drafted token is exempt, so a chain never ends up empty merely because
+    /// the head is unsure about the anchor.
+    p_min: f32 = 0.5,
     rounds: usize = 0,
 
     fn draft(ctx: *anyopaque, context: []const u32, anchor: u32, block_pos: u32, out: []u32) usize {
@@ -93,9 +98,22 @@ const MtpRunner = struct {
             // `h` in == `h` out: the head reads the previous row's hidden state
             // and leaves this row's, which is what makes the chain work.
             e.nextnPredict(self.h, tok, block_pos + @as(u32, @intCast(produced)), self.h) catch return produced;
-            // `argmaxLogits` goes through the backend, so on CUDA the vocab
-            // never crosses PCIe -- only the 4-byte index comes back.
-            tok = e.argmaxLogits();
+            // `argmaxConfLogits` goes through the backend, so on CUDA the vocab
+            // never crosses PCIe -- only the index and one probability come back.
+            var p: f32 = 1.0;
+            tok = e.argmaxConfLogits(&p);
+            // CONFIDENCE EARLY STOP (llama.cpp's `p_min`,
+            // `common/speculative.cpp:1789`).  A drafted token costs a full
+            // verify row whether or not it is accepted, so once the head is no
+            // longer confident the rest of the chain is pure waste.  Measured on
+            // 27B IQ3_XXS: the accept rate falls 79% -> 39% between the 2nd and
+            // 3rd draft, and capping the chain at 2 already recovers 21% of
+            // throughput; this stops even earlier when the head itself says so.
+            //
+            // `p < p_min` leaves `produced` unchanged, i.e. the token that was
+            // just sampled is NOT added.  A round that drafts nothing is not a
+            // loss: `generateSpec` falls back to one ordinary decode step.
+            if (produced > 0 and p < self.p_min) return produced;
             out[produced] = tok;
         }
         self.rounds += 1;
@@ -1834,11 +1852,24 @@ fn runInference(
             try out.print("\n[spec-mtp: tap enable failed; falling back to plain decode]\n", .{});
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
-        // Chain length per round.  Measured acceptance length on 27B IQ3_XXS
-        // (24 tokens, "机器学习是什么？"): draft=1 -> 1.64, 2 -> 2.00, 3 -> 2.67,
-        // 4 -> 3.00, 6 -> 3.00.  Four is the plateau, so it is the default;
+        // Chain length per round.
+        //
+        // MEASURED, and the previous default of 4 was wrong: it was chosen by
+        // maximising ACCEPTANCE LENGTH (2.82 tokens/round at draft=4), but that
+        // is not the quantity that matters -- every drafted token costs a full
+        // verify row whether or not it is accepted, so a long chain with a low
+        // hit rate is pure waste.  Throughput on 27B IQ3_XXS:
+        //
+        //   draft   tok/s   accept rate   tokens/round
+        //     1      26.3      82.4 %          1.82
+        //     2      26.4      79.2 %          2.58
+        //     3      20.8      39.1 %          2.13
+        //     4      20.8      42.6 %          2.67
+        //   (64-token run: draft=2 25.65 vs draft=4 20.84, i.e. 23 % faster.)
+        //
+        // Past the second draft the hit rate collapses, so 2 is the default.
         // `QWEN35_SPEC_MTP_DRAFT` overrides it for a sweep.
-        var max_draft: usize = 4;
+        var max_draft: usize = 2;
         if (houtou.cudart.environ_map) |em| {
             if (em.get("QWEN35_SPEC_MTP_DRAFT")) |raw| {
                 if (std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10)) |v| {
@@ -1851,13 +1882,22 @@ fn runInference(
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
         e.spec_trace_dbg = spec_trace;
+        var p_min: f32 = 0.5;
+        if (houtou.cudart.environ_map) |em| {
+            if (em.get("QWEN35_SPEC_PMIN")) |raw| {
+                if (std.fmt.parseFloat(f32, std.mem.trim(u8, raw, " \t\r\n"))) |v| {
+                    p_min = v;
+                } else |_| {}
+            }
+        }
         var runner = MtpRunner{
             .e = &e,
             .tap_index = 0,
             .h = hbuf,
             .max_draft = max_draft,
+            .p_min = p_min,
         };
-        try out.print("\n[spec-mtp: draft={d} tokens/round]\n", .{max_draft});
+        try out.print("\n[spec-mtp: draft={d} tokens/round p_min={d:.2}]\n", .{ max_draft, p_min });
         try out.flush();
         break :blk try e.generateSpec(
             arena,
