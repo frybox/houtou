@@ -645,6 +645,12 @@ pub const Engine = struct {
     /// prelude 推进，且无法从 conv 的**输出**反推，所以缓存 post-conv 会让
     /// 回滚退回"重跑整条链"。见 `specRollbackAndReplay`。
     gdn_in: []GdnIn = &.{},
+    /// `$QWEN35_SPEC_RBDBG` 用的常驻比对缓冲（两份 GDN `state` 的 HOST 副本）。
+    /// 只在打开诊断时由 `allocSpecSnapshot` 分配一次。`copyOut` 的目标是
+    /// HOST 内存，所以这两个是普通切片，不是 `Buf`（设备地址）。
+    /// 每轮现场 `alloc` 3 MB 既没必要，也会让分配点混进热路径。
+    spec_dbg_a: []f32 = &.{},
+    spec_dbg_b: []f32 = &.{},
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
@@ -1440,6 +1446,8 @@ pub const Engine = struct {
         // 已经连带释放。
         if (self.gdn_in.len > 0) a.free(self.gdn_in);
         if (self.spec_snap.len > 0) a.free(self.spec_snap);
+        if (self.spec_dbg_a.len > 0) a.free(self.spec_dbg_a);
+        if (self.spec_dbg_b.len > 0) a.free(self.spec_dbg_b);
         // `tap_layers` is a host allocation made by `specTapEnable` (the
         // `tap_hidden` region itself is backend scratch and goes with
         // `freeScratch()` above).
@@ -2567,6 +2575,15 @@ pub const Engine = struct {
             }
         }
         self.spec_snap = snaps;
+
+        // `$QWEN35_SPEC_RBDBG` 的比对缓冲：一份第一层 GDN 的 `state`，HOST 侧
+        // （`copyOut` 的目标），一次分配、每轮复用。
+        if (cudart_debug_rollback and self.gdn.len > 0 and self.gdn[0].state.len > 0) {
+            const len = self.gdn[0].state.len;
+            self.spec_dbg_a = try alloc.alloc(f32, len);
+            errdefer alloc.free(self.spec_dbg_a);
+            self.spec_dbg_b = try alloc.alloc(f32, len);
+        }
     }
 
     /// Copy the live per-token state into the snapshot.
@@ -2618,24 +2635,30 @@ pub const Engine = struct {
             // 先恢复到快照、跑 `specRollbackFast`（prelude + 状态内核），再恢复
             // 快照、用参照重放算同一件事；两者不一致就指名是重建的问题，
             // 因为重放自己会恢复每一个承载状态的缓冲。最终以重放的结果继续。
+            //
+            // 这里的 D2H 缓冲是 `allocSpecSnapshot` 在加载时一次性分配的：
+            // 每次现场 `alloc` 3 MB 会把分配点混进热路径，而且失败时若
+            // `return` 就会静默跳过真正的回滚。
+            if (self.spec_dbg_a.len == 0 or self.spec_dbg_b.len == 0) {
+                self.specRollbackFast(rows);
+                return;
+            }
             self.specRestoreSnapshot();
             self.specRollbackFast(rows);
-            const a = self.alloc.alloc(f32, self.gdn[0].state.len) catch return;
-            defer self.alloc.free(a);
-            self.exec.copyOut(a, self.gdn[0].state);
+            self.exec.copyOut(self.spec_dbg_a, self.gdn[0].state);
             self.specRestoreSnapshot();
             for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
-            const b = self.alloc.alloc(f32, self.gdn[0].state.len) catch return;
-            defer self.alloc.free(b);
-            self.exec.copyOut(b, self.gdn[0].state);
+            self.exec.copyOut(self.spec_dbg_b, self.gdn[0].state);
             var nd: usize = 0;
             var w: f32 = 0;
-            for (a, b) |x, y| {
+            for (self.spec_dbg_a, self.spec_dbg_b) |x, y| {
                 const d = @abs(x - y);
                 if (d > 1e-6) nd += 1;
                 if (d > w) w = d;
             }
-            std.debug.print("[rbfast] rows={d} L0 state fast-vs-replay ndiff={d}/{d} w={e}\n", .{ rows, nd, a.len, w });
+            std.debug.print("[rbfast] rows={d} L0 state fast-vs-replay ndiff={d}/{d} w={e}\n", .{
+                rows, nd, self.spec_dbg_a.len, w,
+            });
             return;
         }
         self.specRollbackFast(rows);
