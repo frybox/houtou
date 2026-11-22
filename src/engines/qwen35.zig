@@ -3801,6 +3801,159 @@ test "gdn prelude: chunk(rows=r) == r single-token steps, conv history included"
     for (gam_ref, gam_c) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
 }
 
+test "gdn rollback: chunk prelude output + state kernel over rows<k == serial" {
+    // THE GAP the two kernel tests left.  "gdn chunk state" pins the state
+    // kernel and "gdn prelude" pins the prelude, but the rollback consumes one's
+    // OUTPUT through the other, and THAT composition is what was wrong: on a
+    // device run, the rebuilt state differed from the replayed state on ~92% of
+    // elements while the conv history matched on 100% -- i.e. the prelude was
+    // right and the state kernel was being fed the wrong slices.
+    //
+    // This test reproduces the exact engine call shape: one prelude over
+    // `k` tokens into a buffer laid out `[q | k | v]` per row, then the state
+    // kernel over the FIRST `rows` rows with `stride = conv_dim`, compared
+    // against `rows` serial single-token steps that used the same prelude rows.
+    const alloc = std.testing.allocator;
+    const nv = 3;
+    const nk = 2;
+    // vd must be a multiple of the GDN kernel's vector width (16).
+    const kd = 16;
+    const vd = 16;
+    const conv_k = 4;
+    const conv_dim = 2 * nk * kd + nv * vd;
+    const kq_dim = nk * kd;
+    const k = 5;
+    const rows = 3;
+
+    const raw = try alloc.alloc(f32, k * conv_dim);
+    defer alloc.free(raw);
+    const ab = try alloc.alloc(f32, k * 2 * nv);
+    defer alloc.free(ab);
+    const wconv = try alloc.alloc(f32, conv_dim * conv_k);
+    defer alloc.free(wconv);
+    const ssm_a = try alloc.alloc(f32, nv);
+    defer alloc.free(ssm_a);
+    const dt_bias = try alloc.alloc(f32, nv);
+    defer alloc.free(dt_bias);
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234);
+    const rnd = prng.random();
+    for (raw) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (ab) |*x| x.* = rnd.float(f32) * 2 - 1;
+    for (wconv) |*x| x.* = (rnd.float(f32) - 0.5) * 0.25;
+    for (ssm_a) |*x| x.* = -0.5 - rnd.float(f32);
+    for (dt_bias) |*x| x.* = rnd.float(f32) * 0.1;
+
+    var g: gguf.File = undefined;
+    var cpu = backend_cpu.CpuBackend.init(alloc, &g);
+    const ex = cpu.exec();
+
+    // Shared prelude over all `k` rows, from a zero conv history.  This is the
+    // chunk path the engine uses; its output buffer is REUSED by the state call.
+    const qkv_chunk = try alloc.alloc(f32, k * conv_dim);
+    defer alloc.free(qkv_chunk);
+    @memcpy(qkv_chunk, raw);
+    const ab_chunk = try alloc.alloc(f32, k * 2 * nv);
+    defer alloc.free(ab_chunk);
+    @memcpy(ab_chunk, ab);
+    const gam_chunk = try alloc.alloc(f32, k * nv);
+    defer alloc.free(gam_chunk);
+    const conv_ref = try alloc.alloc(f32, conv_dim * (conv_k - 1));
+    defer alloc.free(conv_ref);
+    @memset(conv_ref, 0);
+    ex.gdnPrefillCore(
+        Buf.wrap(qkv_chunk),
+        Buf.wrap(conv_ref),
+        Buf.wrap(wconv),
+        Buf.wrap(ab_chunk),
+        Buf.wrap(ssm_a),
+        Buf.wrap(dt_bias),
+        Buf.wrap(gam_chunk),
+        k,
+        conv_dim,
+        0,
+        k * nv,
+        nv,
+        nv,
+        kq_dim,
+        nv,
+        nk,
+        kd,
+        conv_k,
+        1e-6,
+    );
+
+    const st0 = try alloc.alloc(f32, nv * kd * vd);
+    defer alloc.free(st0);
+    for (st0) |*x| x.* = (rnd.float(f32) - 0.5) * 0.1;
+
+    // A: the state kernel over the FIRST `rows` rows of that buffer, using the
+    // engine's slices and `stride = conv_dim` (what `specRebuildAccepted` does).
+    const st_a = try alloc.alloc(f32, st0.len);
+    defer alloc.free(st_a);
+    @memcpy(st_a, st0);
+    const km = try alloc.alloc(f32, rows * nv * vd);
+    defer alloc.free(km);
+    const dl = try alloc.alloc(f32, rows * nv * vd);
+    defer alloc.free(dl);
+    const out = try alloc.alloc(f32, rows * nv * vd);
+    defer alloc.free(out);
+    const qkv_view = Buf.wrap(qkv_chunk);
+    ex.gdnStepRowsChunk(
+        Buf.wrap(st_a),
+        qkv_view.span(kq_dim, rows * conv_dim - kq_dim),
+        qkv_view.span(2 * kq_dim, rows * conv_dim - 2 * kq_dim),
+        qkv_view.span(0, rows * conv_dim),
+        Buf.wrap(km),
+        Buf.wrap(dl),
+        Buf.wrap(out),
+        Buf.wrap(gam_chunk[0 .. rows * nv]),
+        Buf.wrap(ab_chunk[k * nv ..][0 .. rows * nv]),
+        nv,
+        nk,
+        kd,
+        vd,
+        rows,
+        conv_dim,
+        conv_dim,
+        conv_dim,
+    );
+
+    // B: `rows` serial steps over the SAME prelude rows.
+    const st_b = try alloc.alloc(f32, st0.len);
+    defer alloc.free(st_b);
+    @memcpy(st_b, st0);
+    const km1 = try alloc.alloc(f32, nv * vd);
+    defer alloc.free(km1);
+    const dl1 = try alloc.alloc(f32, nv * vd);
+    defer alloc.free(dl1);
+    const o1 = try alloc.alloc(f32, nv * vd);
+    defer alloc.free(o1);
+    for (0..rows) |t| {
+        const row = qkv_chunk[t * conv_dim ..][0..conv_dim];
+        for (0..nv) |h| {
+            // head h reads its q/k from `h % nk` (GQA-style repeat), v from h.
+            const kq = h % nk;
+            gdnFused(
+                st_b[h * kd * vd ..][0 .. kd * vd],
+                row[kq_dim + kq * kd ..][0..kd], // k lives after the q half
+                row[2 * kq_dim + h * vd ..][0..vd],
+                row[kq * kd ..][0..kd], // q is the first half
+                
+                km1[h * vd ..][0..vd],
+                dl1[h * vd ..][0..vd],
+                o1[h * vd ..][0..vd],
+                gam_chunk[t * nv + h],
+                ab_chunk[k * nv + t * nv + h],
+                vd,
+            );
+        }
+    }
+
+    for (st_a[0 .. nv * kd * vd], st_b[0 .. nv * kd * vd]) |x, y| {
+        try std.testing.expectApproxEqAbs(y, x, 1e-6);
+    }
+}
+
 test "maxQ8Cols: widest matvec INPUT is n_ff, not conv_dim / 2*q_dim" {
     // 27B (read from the GGUF metadata): n_ff=17408 > conv_dim=10240 >
     // q_dim=value_dim=6144 > hidden=5120
