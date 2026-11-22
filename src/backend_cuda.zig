@@ -5956,11 +5956,21 @@ const attn_score_arity: usize = 11;
                                             self.ewLaunchFail("gdn_gamma_rows", rc);
                                             return;
                                         }
-                                        // 3. the q/k norm + q scale passes, `nk_reps`
-                                        //    times in the order the per-head loop made
-                                        //    them: l2norm(q), l2norm(k), q *= qscale.
-                                        var rep: usize = 0;
-                                        while (rep < nk_reps) : (rep += 1) {
+                                        // 3. the q/k norm + q scale pass, ONCE.
+                                        //
+                                        // The `nk_reps` repetition this used to do
+                                        // is wrong, and the CPU path
+                                        // (`backend_cpu.vGdnPrefillCore`) never had
+                                        // it: `l2norm` is NOT idempotent (a second
+                                        // pass divides by `sqrt(1 + eps)` again), so
+                                        // repeating it `nv/nk` times (3 on the 27B)
+                                        // silently rescales q/k on every GDN layer.
+                                        // The reference normalises a
+                                        // `(kd, nk)` view ONCE and only then
+                                        // broadcasts q/k up to `nv` heads
+                                        // (llama.cpp `qwen3next.cpp:503-528`), which
+                                        // is what the CPU oracle models.
+                                        {
                                             rc = Launch.l2norm_strided(
                                                 pq, 0, @intCast(nk), @intCast(kd), eps,
                                                 @intCast(tokens), @intCast(conv_dim), stream);
