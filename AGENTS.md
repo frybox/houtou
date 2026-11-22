@@ -676,6 +676,93 @@ prompt "天空为什么是蓝色的？"）。这是**调试判据，不是验收
 > 症状是"状态错 98.6%"而所有代码看起来都对。
 > **`@min` / `@max` 的结果一定要显式标注回 `usize`**，或者别在后续乘法里用它。
 
+### 5.aa decode 与 llama.cpp 的 1.27× 差距：ncu 定位过程与三个已验证的否证
+
+**实测基准**（27B IQ3_XXS，GPU 4，128 token，多轮取稳）：
+
+| | tok/s | 有效权重带宽 | 峰值利用率 |
+|---|---|---|---|
+| llama.cpp `llama-bench tg128` | **68.25** | 745 GB/s | 74% |
+| houtou | **53.6** | 585 GB/s | 58% |
+| 4090D 理论 | — | ~1008 GB/s | — |
+
+**差距不在周边算子**（`$QWEN35_ABLATE` 逐项关，128 token）：
+
+| 关掉 | tok/s | 增量 |
+|---|---|---|
+| 基线 | 53.6 | — |
+| `rmsnorm` | 55.4 | +1.8 |
+| `gdn_prelude,gdn_step,conv_step,gdn_gamma` | 56.4 | +2.8 |
+| `rope64_rows` / `copy_range` / `attn_decode` / `dequant_row` | 53.6~53.8 | ≈0 |
+
+**把非 matvec 全关掉上限也只有约 57**。差距确实在 matvec。
+
+**split 参数空间已打满**。逐类型开关（`$QWEN35_CUDA_NOSPLIT` /
+`$QWEN35_CUDA_SPLIT_TT`）实测：
+
+- split 的收益是真实的：关掉后 IQ3_XXS 53.7→45.5、IQ3_S 53.7→45.3、IQ4_XS 53.7→47.9
+- 按类型扫 split 值：**8 最优**，2/4 都更差
+- warp × split 全矩阵：`warps=2, split=16` 的 53.8 是峰值，`warps=4` 反而 51.8
+- **`SPLIT=1`（每 lane 读整块）只有 32.6** —— 切分的并行度收益远大于合并损失
+
+**ncu 的关键读数**（`sudo ncu`，17408×5120 IQ3_XXS 单 kernel）：
+
+```
+dram__bytes_read                          34.17 MB   (= 理论权重，多读 0 字节)
+gpu__time_duration                        55.8 us    (llama.cpp 同形状 36.3 us)
+l1tex__t_sectors_mem_global_op_ld         68.88 M    (理想值 1.07 M，64.6 倍)
+sass_average_data_bytes_per_sector        9.44 %     (每 sector 只有 9.44% 有用)
+smsp__inst_executed.avg.per_cycle_active  0.58       (峰值 4)
+stalled_long_scoreboard                   3.97       <-- 压倒性主导
+```
+
+**三个已验证的否证（都有实测数字，不要再走）**：
+
+1. **"每 lane 读整块会提高 sector 利用率"——错**。新写
+   `q35_k_mul_mat_vec_q_block_t`（lane 读完整 98 B 块，跨 warp shared 归约）：
+   sector 数 68.9M → 53.1M（**−23%**，方向对了），但
+   sector 有效率 9.44% → **7.26%（更差）**，寄存器 55 → **100**，
+   `warps_active` 68% → **31.6%**，端到端 53.8 → **31.9 tok/s**。
+   结论：9.44% 不是 lane 切分造成的，是 **IQ3_XXS 格式本身**
+   （符号位与索引分散在 `q3[64]` + `gas[32]` 里，任何读法都是窄访问）。
+   llama.cpp 读同一格式，所以这不是差异来源。
+
+2. **"DP4A 串行依赖链是瓶颈"——错**。把 `sumi` 拆成两个独立累加器
+   （整数域，可结合，token 流逐位不变 `857b78f3`）：**53.77 vs 53.8，持平**。
+   `long_scoreboard` 才是大头，那是内存延迟，不是算力依赖。
+
+3. **"逐指令对照 dot 实现能找到差异"——没有差异**。
+   `q35_vec_dot_iq3_xxs_q8_k_acc` 与 llama.cpp 的
+   `vec_dot_iq3_xxs_q8_1` 逐表达式一致：同样的 `unpack_ksigns`
+   （`(v ^ (popc(v)&1)<<7) * 0x01010101`）、同样的
+   `__vcmpne4` + `__vsub4` 符号处理、同样的 8 次 dp4a、同样的
+   `iq3xxs_grid[...]` 查表。**唯一差异是激活格式**（我们 `q8_K` 292 B/256
+   元素，它 `q8_1` 36 B/32 元素），而换 q8_1 已在 §5.x 实测否决（+0.29%）。
+
+**llama.cpp 在同一 kernel 上的对照**（`mul_mat_vec_q<ggml_type 18>`）：
+
+| | 我们 | llama.cpp |
+|---|---|---|
+| `long_scoreboard` | 3.97 | **2.12** |
+| `inst/cycle` | 0.58 | 0.47 |
+| 寄存器 | 55 | **86** |
+| block | 32×2 warp | 32×4 warp |
+
+**它用更多的寄存器（86 vs 55）换来了更低的 long_scoreboard**——
+即更多的在途 load 把延迟掩盖住了。这是唯一还没试过的方向：
+**用寄存器做软件流水（预取下一批块的地址与数据）**，而不是"少用寄存器保
+占用率"。注意 §7 记录过：单纯把 `vpart[rounds]` 全量缓存会溢到 local memory
+（实测 417792 sector/launch，53.7 → 50.3），必须**小步**（2~3 个在途）地做。
+
+**调试方法学（这轮踩到的）**：
+- `ncu` 抓 decode 极易混入 prefill。`--launch-skip N` 不可靠，
+  因为 prefill 长度随 prompt 变。可靠做法是 **`$QWEN35_NO_BATCH=1`**
+  强制单 token 路径，那次得到干净构成：`split 79.6% / coop 20.4%`。
+- 之前用 `--launch-skip 400` 得到"decode 74% 是 `mmq_mma_iq`"是**假的**，
+  那是 prefill 的 tile kernel。
+- `ncu` 需要 `RmProfilingAdminOnly=0` 或 `sudo`。本机已配置 sudo 免密，
+  直接 `sudo -n ncu ...`。
+
 ## 6. 手动运行与性能对比（模型与 target）
 > 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
 > 提交前必跑的步骤。以下 target 只用于手动调试与性能对比。
