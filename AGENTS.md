@@ -593,32 +593,54 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 
 ### 5.y 推测解码（MTP）的实测结论：不要重走这些弯路
 
-**现状：MTP 在 27B IQ3_XXS 上约 21 tok/s，plain 解码 53+ tok/s。MTP 目前是净负。**
+**现状：MTP 在 27B IQ3_XXS 上 46.4 tok/s，plain 解码 53.4 tok/s（78%）。**
+免重放回滚落地后从 25.6 提到 46.4（+81%），且 token 流与回滚参照逐位一致（§5.z）。
 
 逐项都是实测，不是推断：
 
 - **接受长度 2.82 tokens/轮（47.6% 接受率）**，草稿头本身有效。理论上限约 85 tok/s。
-- **差距 100% 在提交侧**（每轮 11926 次 `cudaLaunchKernel`，设备在两次提交之间空转），
-  但两条消除它的路都试过且失败：
+- **差距主要在提交侧**，消除它的两条路里**第二条成功了**：
   - **给 draft 头单独的可捕获图**（llama.cpp 的 `LLAMA_CONTEXT_TYPE_MTP` 做法，
     `common/speculative.cpp:2659`）。已完整实现（`VTable.specStep` + 独立 capture），
     但**实测净亏**：重放会重跑整段录下的 chunk，而主机侧未被吸收的 op 照常执行，
     批量 matvec 调用从 3478 翻倍到 7454，tok/s 从 21 掉到 12。接受率同时从
     47.6% 崩到 11.9%（`dequantRow` 在主机侧按 `next_token` 选行，指针在捕获时固化）。
-  - **免重放回滚**（缓存每层 prelude 输入，回滚时只重算 `accepted` 行）。
-    实现了 4 个版本，全部失败。下面 §5.z 记录了为什么。
-- **`mv_batchk` 占一轮的 91%**（`$QWEN35_PROF`，16 token：`mv_batchk calls=199 pct=91.4%`），
-  不是草稿链。回滚即使优化到零也只省其中约 37%。
+    **这条路仍然关闭。**
+  - **免重放回滚**（缓存每层 prelude 的**原始投影**，回滚时只重算 `accepted` 行）。
+    **已实现并生效**（`specRollbackFast`，`$QWEN35_SPEC_FASTROLLBACK=0` 退回参照路径）。
+    见 §5.z。
+- **每轮的固定开销从 `rows` 次完整 65 层 forward 降到每层一次 prelude + 一次状态内核。**
+  这才是吞吐提升的来源；`mv_batchk` 本身没变。
+- **参数最优值随回滚变便宜而移动了**，旧默认值（draft=4 → 后改 draft=2、p_min=0.5）
+  是按慢回滚调出来的。重新扫（64 token，p_min=0.9）：
+
+  | draft | 重放回滚 | 免重放回滚 |
+  |---|---|---|
+  | 1 | 26.3 | **46.5** |
+  | 2 | 25.7 | 43.0 |
+  | 3 | 20.8 | 36.6 |
+  | 4 | 20.8 | 36.0 |
+
+  现在默认 **draft=1, p_min=0.9**。**改回滚成本后必须重扫这两个参数**，
+  否则会继续用旧最优点。
 
 **判别正确的唯一可靠手段**：`QWEN35_SPEC_MTP=1 QWEN35_DUMP_IDS=1 ... -n 16` 的
 `IDS:` 行 md5 必须等于 `857b78f30003c6f3417265269845c4d7`（27B IQ3_XXS，
 prompt "天空为什么是蓝色的？"）。这是**调试判据，不是验收标准**（§4）。
 推测解码的接受路径按定义必须与 greedy 逐位一致，所以这个 md5 是合法的等价性探针。
+32 token 时用 `27d9b020413d0eaea1338842f71de479`，两种回滚路径必须相同。
 
-### 5.z 免重放回滚：五个已验证的前提，和一个仍未解释的失败
+### 5.z 免重放回滚：五个已验证的前提，和踩过的四个坑
 
-想用"缓存 prelude 输入 + 重跑 accepted 行"代替"重放整个 65 层 forward"。
-每一步单独验证都通过，整体结果仍错。已固定的测试（都是可敏感验证的）：
+用"缓存 prelude 输入 + 重跑 accepted 行"代替"重放整个 65 层 forward"。
+`specRollbackFast` 的做法：
+
+1. `specRestoreSnapshot()`：把 KV 长度、`conv`、`state` 恢复到 verify 之前。
+2. 逐 GDN 层：从 `gdn_in[li]` 取回该层的**原始投影**，重跑 prelude（只 `rows` 行，
+   推进 conv 恰好 `rows` 步），再跑 `gdnStepRowsChunk`（只 `rows` 行）。
+3. KV 长度设为 `kv_len + rows`（见下面坑 3）。
+
+已固定的测试（都是可敏感验证的）：
 
 | 测试 | commit | 敏感性验证 |
 |---|---|---|
@@ -626,32 +648,33 @@ prompt "天空为什么是蓝色的？"）。这是**调试判据，不是验收
 | chunk prelude == `r` 次单 token（含 conv 历史） | `b9d1cd4` | `conv_k-1` 即失败 |
 | prelude 输出 → 状态内核（`rows<k`）的组合 | `53a64d0` | 参照里 k 段偏移改回 `kq*kd` 即失败 |
 
-逐项探针（`$QWEN35_SPEC_ROLLBACK_DIAG`，一轮内 A/B 重建 vs 重放）：
-
-```
-prelude 输入的原始 qkv   ndiff=0/10240     ✓
-prelude 输出（卷积后）   ndiff=0/10240     ✓
-卷积历史                ndiff=0/30720     ✓
-快照恢复后的起始 state   ndiff=0/37748736  ✓
-最终 state              ndiff≈92%         ✗  ← 仍未解释
-```
+**验证结果**（`$QWEN35_SPEC_RBDBG=1`，一轮内 A/B 重建 vs 重放）：
+第 2 轮起 `ndiff` = 13–70 / 786432（worst 4e-6），即纯粹的浮点重结合噪声。
+**第一轮**的 `ndiff` 是 92%，但那是因为探针在首轮缓存尚未写入时比较了一个
+未重建的状态——不是产品缺陷（16/32 token 的 md5 与参照完全相同）。
+参照路径上 token 流逐位一致。
 
 **已经确认并修掉的真实缺陷（都会重犯）**：
 
-1. **`ab` 的布局是 `[a: k*nv][b: k*nv]`**（`k` = verify 块行数）。按 `rows`
+650→1. **`ab` 的布局是 `[a: k*nv][b: k*nv]`**（`k` = verify 块行数）。按 `rows`
    压缩成 `[a: rows*nv][b: rows*nv]` 会让第 r 行读到别行的 alpha 当 beta。
 2. **CUDA 的 `gdnPrefillCore` 曾把 l2norm 重复 `nv/nk` 次（27B 上 3 次）**，
    CPU 只做一次。`l2norm` **不幂等**（每多一次除以 `sqrt(1+eps)`）。已在
    `d79d79f` 修正。**这条意味着 2026-11-22 之前所有 CPU/CUDA 的 GDN A/B 都不可信**。
 3. **KV 回滚是"截断到 `kv_len + rows`"**，不是恢复到 `kv_len`：verify 已写入全部
    `k` 行，被接受前缀是它们的前缀。恢复成 `kv_len` 会丢掉下一轮要 attend 的行。
-4. **`tap_hidden` 第 0 行必须是被接受 token 的隐藏态**（`rows-1` 行搬过来）。
-   重放原本靠"每 token 覆盖一次"得到它，重建不会自然产生。
+4. **缓存的必须是 pre-conv 的原始投影，不能是 prelude 之后的字节**：conv 历史
+   无法从它自己的输出反推，缓存 post-prelude 会让 `conv` 停在 `k` 深而 state 退到 `rows`。
+   （实测：缓存 post-prelude 时 md5 `d2e9b8fb…`，第 3 个 token 就分叉。）
 
-**仍未解决的**：上述四项全对，最终 GDN 状态仍然错约 92%。这说明还存在一个
-未被定位的耦合。**下次继续时不要再用单点比对**——需要给整条 GDN 路径加
-指令级追踪（每个 kernel 调用前后记录输入输出哈希），否则会像本轮一样反复
-在"每一环都对但整体错"里打转。
+**还有一个 Zig 的静默陷阱（本轮花掉最多时间）**：
+
+> `const rows = @min(spec_verify_rows, self.nbatch);` 的结果类型是 **`u5`**，
+> 不是 `usize`。`@min` 会把类型窄化到整数常量的位宽，16 只需要 5 bit。
+> 于是 `rows * 2 * nv`（16×2×48）在 ReleaseFast 下**静默回绕成 0**，
+> `allocBuf(0)` 返回空 Buf，缓存写入条件永远为假，缓存从未写入。
+> 症状是"状态错 98.6%"而所有代码看起来都对。
+> **`@min` / `@max` 的结果一定要显式标注回 `usize`**，或者别在后续乘法里用它。
 
 ## 6. 手动运行与性能对比（模型与 target）
 > 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
