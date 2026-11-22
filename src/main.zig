@@ -407,6 +407,12 @@ pub fn main(init: std.process.Init) !void {
     spec_taps = init.environ_map.get("QWEN35_SPEC_TAPS") != null;
     spec_nextn = init.environ_map.get("QWEN35_SPEC_NEXTN") != null;
     spec_mtp = init.environ_map.get("QWEN35_SPEC_MTP") != null;
+    houtou.engines.qwen35.cudart_debug_rollback =
+        init.environ_map.get("QWEN35_SPEC_RBDBG") != null;
+    if (init.environ_map.get("QWEN35_SPEC_FASTROLLBACK")) |v| {
+        houtou.engines.qwen35.spec_fast_rollback =
+            !std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "0");
+    }
     houtou.engines.qwen35.spec_dummy_alloc =
         init.environ_map.get("QWEN35_SPEC_DUMMYALLOC") != null;
     spec_nextn_seq = init.environ_map.get("QWEN35_SPEC_NEXTN_SEQ") != null;
@@ -1852,24 +1858,25 @@ fn runInference(
             try out.print("\n[spec-mtp: tap enable failed; falling back to plain decode]\n", .{});
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
-        // Chain length per round.
+        // 每轮的草稿链长度。
         //
-        // MEASURED, and the previous default of 4 was wrong: it was chosen by
-        // maximising ACCEPTANCE LENGTH (2.82 tokens/round at draft=4), but that
-        // is not the quantity that matters -- every drafted token costs a full
-        // verify row whether or not it is accepted, so a long chain with a low
-        // hit rate is pure waste.  Throughput on 27B IQ3_XXS:
+        // 实测，且之前默认的 4 是错的：它按"最大化**接受长度**"选的，但那不是
+        // 关键量——每个草稿 token 无论是否被接受都要付一整行 verify 的代价，
+        // 所以命中率低的长链纯属浪费。
         //
-        //   draft   tok/s   accept rate   tokens/round
-        //     1      26.3      82.4 %          1.82
-        //     2      26.4      79.2 %          2.58
-        //     3      20.8      39.1 %          2.13
-        //     4      20.8      42.6 %          2.67
-        //   (64-token run: draft=2 25.65 vs draft=4 20.84, i.e. 23 % faster.)
+        // 回滚不再重放整个 forward（`specRollbackFast`，2026-11）之后，**最优值
+        // 变了**：一轮的固定开销从"`rows` 次完整 65 层 forward"降到"每层一次
+        // prelude + 一次状态内核"，短轮变便宜了，于是长链多出的 verify 行占了
+        // 主导。27B IQ3_XXS，64 token，`p_min` 0.9（单位 tok/s）：
         //
-        // Past the second draft the hit rate collapses, so 2 is the default.
-        // `QWEN35_SPEC_MTP_DRAFT` overrides it for a sweep.
-        var max_draft: usize = 2;
+        //   draft   重放回滚   免重放回滚
+        //     1       26.3       46.5
+        //     2       25.7       43.0
+        //     3       20.8       36.6
+        //     4       20.8       36.0
+        //
+        // 所以默认 1。`QWEN35_SPEC_MTP_DRAFT` 可覆盖，用于扫参。
+        var max_draft: usize = 1;
         if (houtou.cudart.environ_map) |em| {
             if (em.get("QWEN35_SPEC_MTP_DRAFT")) |raw| {
                 if (std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10)) |v| {
@@ -1882,7 +1889,9 @@ fn runInference(
             break :blk try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
         };
         e.spec_trace_dbg = spec_trace;
-        var p_min: f32 = 0.5;
+        // 草稿头的置信度早停阈值（llama.cpp 的 `p_min`）。实测 0.9 最好：
+        // p_min 0/0.3/0.5/0.7/0.9 → 37.7/39.1/40.9/43.0/43.0 tok/s（draft=2）。
+        var p_min: f32 = 0.9;
         if (houtou.cudart.environ_map) |em| {
             if (em.get("QWEN35_SPEC_PMIN")) |raw| {
                 if (std.fmt.parseFloat(f32, std.mem.trim(u8, raw, " \t\r\n"))) |v| {
