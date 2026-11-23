@@ -361,7 +361,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream);
     }
-    const attn_chunk_dyn = Kernels.q35_launch_attn_chunk_dyn;
+    fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_chunk_dyn(d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
+    }
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
@@ -407,13 +410,31 @@ const Launch = if (cuda_linked) struct {
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
-    const attn_decode = Kernels.q35_launch_attn_decode;
-    const attn_chunk = Kernels.q35_launch_attn_chunk;
+    fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_decode(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
+    }
+    fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_chunk(d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
+    }
     const attn_chunk_max_rows = Kernels.q35_attn_chunk_max_rows;
-    const attn_decode_dyn = Kernels.q35_launch_attn_decode_dyn;
-    const attn_decode_coal = Kernels.q35_launch_attn_decode_coal;
-    const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
-    const attn_decode_split_dyn = Kernels.q35_launch_attn_decode_split_dyn;
+    fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_decode_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
+    }
+    fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_decode_coal(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
+    }
+    fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_decode_split2(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
+    }
+    fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_attn_decode_split_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
+    }
     const set_int1 = Kernels.q35_launch_set_int1;
     const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
@@ -533,7 +554,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, d_out, nblocks, kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_chunk_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
@@ -626,11 +648,13 @@ const Launch = if (cuda_linked) struct {
     fn sample_ctl_ints() callconv(.c) c_int {
         return 0;
     }
-    fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
@@ -651,19 +675,23 @@ const Launch = if (cuda_linked) struct {
     // added later breaks `zig build` (no -Dcuda) with `no member named ...` --
     // which is exactly how `set_int1` and the three `attn_decode_*` variants got
     // away: they were aliased and called long after this struct was last read.
-    fn attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
     }
@@ -6380,7 +6408,6 @@ const attn_score_arity: usize = 11;
     fn dAttnDecode_body(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.attn_decode)) return;
         // `kcache`/`vcache` are the first `slot+1` rows of the layer's cache, so
@@ -6448,7 +6475,7 @@ const attn_score_arity: usize = 11;
                                                 if (self.d_att_part) |ppart| {
                                                     const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
                                                     const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
-                                                    const rcs = Launch.attn_decode_split_dyn(pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
+                                                    const rcs = Launch.attn_decode_split_dyn(g, pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                                     if (rcs == cudart.cudaSuccess) {
                                                         // FOUR nodes (score, softmax,
                                                         // PV, reduce+gate), all
@@ -6462,7 +6489,7 @@ const attn_score_arity: usize = 11;
                                                     self.ewLaunchFail("attn_decode_split_dyn", rcs);
                                                 }
                                             }
-                                            const rc = Launch.attn_decode_dyn(pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
+                                            const rc = Launch.attn_decode_dyn(g, pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                             if (rc == cudart.cudaSuccess) {
                                                 // Counted, not recorded: the node is
                                                 // classified `.attn_dyn` and never
@@ -6492,12 +6519,12 @@ const attn_score_arity: usize = 11;
                                             const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
                                             // `d_att_prob`, NOT `patt`: see the field note.
                                             const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
-                                            const rc2 = Launch.attn_decode_split2(pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
+                                            const rc2 = Launch.attn_decode_split2(g, pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                             if (rc2 == cudart.cudaSuccess) return;
                                             self.ewLaunchFail("attn_decode split", rc2);
                                         }
                                     }
-                                    const rc = Launch.attn_decode(pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
+                                    const rc = Launch.attn_decode(g, pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                     if (rc == cudart.cudaSuccess) {
                                         if (self.capturing()) self.graphNoteAttn(slot);
                                         return;
@@ -8504,6 +8531,7 @@ const attn_score_arity: usize = 11;
                             if (dBufPtr(vcache)) |pv| {
                                 if (dBufPtr(gout)) |pgout| {
                                     const rc = Launch.attn_chunk_dyn(
+                                        g,
                                         pq, pgate, pk, pv, pgout,
                                         @ptrCast(@alignCast(self.gs().d_attn_slot.?)),
                                         @intCast(rows), @intCast(heads), @intCast(gqa),
@@ -8530,7 +8558,7 @@ const attn_score_arity: usize = 11;
                                     const m2 = Launch.attn_chunk_max_rows(@intCast(slot0 + done), @intCast(hd), self.kvKind());
                                     if (m2 <= 0) break;
                                     const take = @min(rows - done, @as(usize, @intCast(m2)));
-                                    const rc = Launch.attn_chunk(
+                                    const rc = Launch.attn_chunk(g, 
                                         pq + done * row_len, pgate + done * row_len,
                                         pk, pv,
                                         pgout + done * row_len,
