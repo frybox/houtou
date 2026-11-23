@@ -270,7 +270,7 @@ pub const Exec = struct {
         // ---- dequantization -------------------------------------------------
         /// Expand one row of a packed weight into `dst` (f32, `cols` wide).
         /// Used by the embedding lookup, which needs values rather than dots.
-        dequantRow: *const fn (ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void,
+        dequantRow: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void,
 
         // ---- matvec ---------------------------------------------------------
         /// `out = W * x` with `W` packed, `x` `w.cols()` f32 values.  Both
@@ -689,8 +689,8 @@ pub const Exec = struct {
     pub fn kvAppend(self: Exec, g: Graph, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
         self.vtable.kvAppend(g, self.ptr, dst, src, slot, kv_dim, rows);
     }
-    pub fn dequantRow(self: Exec, dst: Buf, w: QuantRow, row: usize) void {
-        self.vtable.dequantRow(self.ptr, dst, w, row);
+    pub fn dequantRow(self: Exec, g: Graph, dst: Buf, w: QuantRow, row: usize) void {
+        self.vtable.dequantRow(g, self.ptr, dst, w, row);
     }
     pub fn matvec(self: Exec, g: Graph, out: Buf, w: LinearW, x: Buf) void {
         self.vtable.matvec(g, self.ptr, out, w, x);

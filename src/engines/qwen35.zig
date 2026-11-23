@@ -1699,7 +1699,7 @@ pub const Engine = struct {
         // there rather than special-cased here.
         switch (self.token_embd) {
             .f32 => |m| self.exec.copyRange(self.graph, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
-            .quant => |qrow| self.exec.dequantRow(dst, qrow, token),
+            .quant => |qrow| self.exec.dequantRow(self.graph, dst, qrow, token),
         }
     }
 

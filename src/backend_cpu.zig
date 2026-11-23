@@ -882,7 +882,8 @@ pub const CpuBackend = struct {
         self.freeScratch();
     }
 
-    fn vDequantRow(ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
+    fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
+        _ = g;
         _ = ctx;
         dequantRowInto(dst.slice(), w, row);
     }

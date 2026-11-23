@@ -313,8 +313,14 @@ const Launch = if (cuda_linked) struct {
     const quantize_q8_k_mmq = Kernels.q35_launch_quantize_q8_K_mmq;
     const mmq_dp4a_wants = Kernels.q35_mmq_dp4a_wants;
     const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
-    const dequantize = Kernels.q35_launch_dequantize;
-    const dequantize_row = Kernels.q35_launch_dequantize_row;
+    fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_dequantize(ttype, d_src, d_dst, nblocks, stream);
+    }
+    fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
+    }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_mul_mat_vec(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
@@ -347,8 +353,14 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
-    const kv_quant = Kernels.q35_launch_kv_quant;
-    const kv_quant_dslot = Kernels.q35_launch_kv_quant_dslot;
+    fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
+    }
+    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream);
+    }
     const attn_chunk_dyn = Kernels.q35_launch_attn_chunk_dyn;
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
@@ -466,11 +478,13 @@ const Launch = if (cuda_linked) struct {
     fn mmq_act_block_bytes() c_int {
         return 288;
     }
-    fn dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ ttype, d_src, d_dst, nblocks, stream };
         return stubNoCudaKernels();
     }
-    fn dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ ttype, d_src_row, d_dst, cols, stream };
         return stubNoCudaKernels();
     }
@@ -514,7 +528,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
-    fn kv_quant(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, d_out, nblocks, kind, stream };
         return stubNoCudaKernels();
     }
@@ -526,7 +541,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ hd, kv_kind };
         return 0;
     }
-    fn kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream };
         return stubNoCudaKernels();
     }
@@ -4045,7 +4061,7 @@ const attn_score_arity: usize = 11;
     ///
     /// The engine calls this once per row (token embedding, lm_head), so it is a
     /// latency path rather than a throughput one.
-    fn vDequantRow_body(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow_body(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: dequantRow: {s}\n", .{self.needHelp()});
@@ -4086,7 +4102,7 @@ const attn_score_arity: usize = 11;
         const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
         const d_row = src + row * row_bytes;
-        const rc = kern.dequantize_row(
+        const rc = kern.dequantize_row(g,
             @intCast(@backingInt(w.ttype)),
             d_row,
             d_out,
@@ -5040,7 +5056,7 @@ const attn_score_arity: usize = 11;
             // The row comes from the shared per-step block; `graphReplay` does
             // not touch it, `graphBegin` already published it for this step.
             const nbp = @as(c_int, @intCast(kv_dim / 32));
-            const rc0 = Launch.kv_quant_dslot(src.ptr, @ptrCast(dst_bytes),
+            const rc0 = Launch.kv_quant_dslot(g, src.ptr, @ptrCast(dst_bytes),
                 @ptrCast(@alignCast(self.ctl_dev.?)), nbp, 1,
                 @intCast(row_bytes), self.launchStream());
             if (rc0 == cudart.cudaSuccess) return;
@@ -5050,7 +5066,7 @@ const attn_score_arity: usize = 11;
         if (self.capturing() and rows == 1) {
             self.graphNoteKvDst(@ptrCast(out_ptr), row_bytes);
         }
-        const rc = Launch.kv_quant(src.ptr, @ptrCast(out_ptr), @intCast(nblocks), kind, self.launchStream());
+        const rc = Launch.kv_quant(g, src.ptr, @ptrCast(out_ptr), @intCast(nblocks), kind, self.launchStream());
         if (rc == cudart.cudaSuccess) return;
         if (self.capturing()) self.graphAbandon("kv_quant launch failed");
         self.ewLaunchFail("kv_quant", rc);
@@ -7842,11 +7858,11 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `dequantRow` slot, timed (`$QWEN35_PROF`).
-    fn vDequantRow(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.dequant_row, t0);
-        vDequantRow_body(ctx, dstBuf, w, row);
+        vDequantRow_body(g, ctx, dstBuf, w, row);
     }
 
     /// The `matvec` slot, timed (`$QWEN35_PROF`).

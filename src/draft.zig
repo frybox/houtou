@@ -582,7 +582,7 @@ pub const Draft = struct {
             backend_cpu.dequantRowInto(buf[0..hidden], self.embed_rows, token);
             self.fromHost(self.resid.span(0, hidden), buf[0..hidden]);
         } else {
-            self.exec.dequantRow(self.resid.span(0, hidden), self.embed_rows, token);
+            self.exec.dequantRow(self.graph, self.resid.span(0, hidden), self.embed_rows, token);
         }
         // The block's first id IS the anchor: it conditions the code bridge
         // (`normalize_codes`' anchor row) and the serial table's sender for row
@@ -755,7 +755,7 @@ pub const Draft = struct {
     /// Dequantise `token`'s codebook row into `codebook_row`.
     fn dequantCodebookRow(self: *Draft, token: u32) void {
         switch (self.codebook) {
-            .quant => |q| self.exec.dequantRow(self.codebook_row, q, token),
+            .quant => |q| self.exec.dequantRow(self.graph, self.codebook_row, q, token),
             .f32 => |w| {
                 const c = self.cfg.code_len;
                 const off = @as(usize, token) * c;
