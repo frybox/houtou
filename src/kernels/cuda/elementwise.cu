@@ -47,7 +47,7 @@
 
 namespace {
 
-__global__ void k_scale_vec(float *__restrict__ x, float s, int n) {
+extern "C" __global__ void k_scale_vec(float *__restrict__ x, float s, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = __fmul_rn(x[i], s);
 }
@@ -61,12 +61,12 @@ __global__ void k_scale_vec_strided(float *__restrict__ x, float s, int n, int s
     *xp = __fmul_rn(*xp, s);
 }
 
-__global__ void k_add_resid(float *__restrict__ dst, const float *__restrict__ src, int n) {
+extern "C" __global__ void k_add_resid(float *__restrict__ dst, const float *__restrict__ src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __fadd_rn(dst[i], src[i]);
 }
 
-__global__ void k_copy_range(float *__restrict__ dst, const float *__restrict__ src, int n) {
+extern "C" __global__ void k_copy_range(float *__restrict__ dst, const float *__restrict__ src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
@@ -82,7 +82,7 @@ __global__ void k_copy_range(float *__restrict__ dst, const float *__restrict__ 
 //
 // EXACTNESS: a pure move, no arithmetic, so it is bit-identical to
 // `elementwise.bufDeinterleaveQG` by construction.
-__global__ void k_deinterleave_qg(float *__restrict__ q, float *__restrict__ gate,
+extern "C" __global__ void k_deinterleave_qg(float *__restrict__ q, float *__restrict__ gate,
                                  const float *__restrict__ src, int hd) {
     const int h = blockIdx.x;
     const float *s = src + (size_t)h * 2 * hd;
@@ -109,7 +109,7 @@ __global__ void k_deinterleave_qg_strided(float *__restrict__ q, float *__restri
     }
 }
 
-__global__ void k_zero_buf(float *__restrict__ buf, int n) {
+extern "C" __global__ void k_zero_buf(float *__restrict__ buf, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) buf[i] = 0.0f;
 }
@@ -199,7 +199,7 @@ extern "C" int q35_launch_deinterleave_qg_strided(float *d_q, float *d_gate, con
 // (rope.cu:182), generalised so any kernel can take a per-token int this way.
 // Measured motivation: the per-layer, per-token SetParams on the attn_decode
 // node was costing 14.3 ms/token of the 27B's 33.8 ms decode.
-__global__ void k_set_int1(int *d, int v) { *d = v; }
+extern "C" __global__ void k_set_int1(int *d, int v) { *d = v; }
 
 extern "C" int q35_launch_set_int1(int *d, int v, void *stream_v) {
     if (d == nullptr) return (int)cudaErrorInvalidValue;
@@ -229,7 +229,7 @@ extern "C" int q35_launch_zero_buf(float *d_buf, int n, void *stream_v) {
 
 // Block reduction over (value, index).  Each thread scans a strided slice, then
 // the block folds 256 candidates down in shared memory.
-__global__ void k_argmax(const float *__restrict__ d_x, int n, int *d_out) {
+extern "C" __global__ void k_argmax(const float *__restrict__ d_x, int n, int *d_out) {
     __shared__ float s_val[256];
     __shared__ int s_idx[256];
     const int tid = threadIdx.x;
@@ -334,7 +334,7 @@ __global__ void k_argmax_final(const float *__restrict__ d_pv, const int *__rest
 // floats and reduces in shared memory.  A single block per row is enough here
 // because the caller is the spec VERIFY (a handful of vocab scans) rather than
 // per-token decode, and it keeps the whole call to one launch + one D2H.
-__global__ void k_argmax_batch(const float *__restrict__ d_x, int n, int *__restrict__ d_out) {
+extern "C" __global__ void k_argmax_batch(const float *__restrict__ d_x, int n, int *__restrict__ d_out) {
     __shared__ float s_val[kArgmaxThreads];
     __shared__ int s_idx[kArgmaxThreads];
     const int tid = threadIdx.x;

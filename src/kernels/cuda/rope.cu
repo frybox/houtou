@@ -188,7 +188,7 @@ __global__ void k_rope_rows_dim(float *__restrict__ x, int rows, int heads, int 
 // a token costs one tiny H2D of the position and no per-node retargeting at all.
 // The arithmetic is copied expression for expression from `k_rope64` above, so a
 // node running this kernel produces bit-identical output for the same `pos`.
-__global__ void k_rope64_dpos(float *__restrict__ x, int heads, int hd, const void *dyn_p) {
+extern "C" __global__ void k_rope64_dpos(float *__restrict__ x, int heads, int hd, const void *dyn_p) {
     // `dyn_p` points at TWO device int32: {pos, float-bits(base)}.  `base` moves
     // too -- the engine derives it from the position (it switches once a token
     // passes the model's rope-scaling threshold) -- so freezing only `pos` would

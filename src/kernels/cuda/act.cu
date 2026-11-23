@@ -86,7 +86,7 @@ __device__ __forceinline__ float silu_dev(float g) {
     return __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
 }
 
-__global__ void k_silu(float *__restrict__ x, int n) {
+extern "C" __global__ void k_silu(float *__restrict__ x, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = silu_dev(x[i]);
 }
@@ -109,7 +109,7 @@ __global__ void k_mul_sigmoid(float *__restrict__ out, const float *__restrict__
 
 // `gate = silu(gate) * up` -- elementwise.zig `bufSwiglu`, which multiplies the
 // two AFTER the silu, not as `gate * up` then reduce.
-__global__ void k_swiglu(float *__restrict__ gate, const float *__restrict__ up, int n) {
+extern "C" __global__ void k_swiglu(float *__restrict__ gate, const float *__restrict__ up, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) gate[i] = __fmul_rn(silu_dev(gate[i]), up[i]);
 }

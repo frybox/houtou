@@ -110,7 +110,7 @@ __global__ void q35_gdn_step_kernel(
 // `heads` blocks in parallel are race-free -- which is exactly why km/delta had
 // to stop being single shared vd-float buffers (heads blocks writing one slice
 // would be a silent wrong answer, not a crash).
-__global__ void q35_gdn_step_rows_kernel(
+extern "C" __global__ void q35_gdn_step_rows_kernel(
     float *__restrict__ d_state, int state_stride,
     const float *__restrict__ d_k, int k_stride,
     const float *__restrict__ d_v, int v_stride,
@@ -171,7 +171,7 @@ __device__ __forceinline__ float q35_softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
 
-__global__ void q35_gdn_gamma_kernel(
+extern "C" __global__ void q35_gdn_gamma_kernel(
     const float *__restrict__ d_a_raw,
     float *__restrict__ d_b_raw,
     const float *__restrict__ d_ssm_a,

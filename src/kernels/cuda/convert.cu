@@ -772,7 +772,7 @@ extern "C" void *q35_func_kv_quant(void) { return (void *)&q35_k_kv_quant; }
 //
 // 只实现 `kind == 0`（f16，本仓库 decode 的默认 KV 类型）。其它类型由调用方
 // 回退到 host-slot 的 `q35_launch_kv_quant`，那条路本来就带 graph 重定向。
-__global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
+extern "C" __global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
                                      unsigned char *__restrict__ out_base,
                                      const int *__restrict__ d_slot,
                                      int nblocks_per_row, int rows_this,

@@ -100,7 +100,7 @@ __device__ __forceinline__ float block_reduce(float v) {
 // The elementwise tail of rmsnorm: out = x * scale * w.
 // `__fmul_rn` twice, left to right, exactly as elementwise.zig `rmsNorm`
 // spells `x * scale * w`.
-__global__ void k_rmsnorm(float *__restrict__ out, const float *__restrict__ x,
+extern "C" __global__ void k_rmsnorm(float *__restrict__ out, const float *__restrict__ x,
                           const float *__restrict__ w, int n, float eps) {
     const int row = blockIdx.x;
     const int stride = blockDim.x;
