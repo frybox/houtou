@@ -72,6 +72,28 @@ extern "C" __global__ void k_copy_range(float *__restrict__ dst, const float *__
     if (i < n) dst[i] = src[i];
 }
 
+// `k_copy_range` with the destination row chosen on the DEVICE: `dst_base` is
+// the region base, `stride` the byte offset from an f32 base to the next row,
+// and the row index comes from the per-step control block (XD_CTL_KV_SLOT).
+//
+// This is the f32-KV append inside a captured graph.  The captured node holds
+// only `dst_base` (a constant) and the control-block pointer, so a replay needs
+// no `SetParams` even though the destination moves one row per token -- the same
+// argument `q35_k_kv_quant_dslot` is built on for the quantized formats.
+extern "C" __global__ void k_copy_range_dslot(float *__restrict__ dst_base,
+                                              int dst_stride_floats,
+                                              const float *__restrict__ src,
+                                              int rows, int n,
+                                              const int *__restrict__ ctl) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int r = i / dst_stride_floats;
+    const int j = i - r * dst_stride_floats;
+    if (r >= rows) return;
+    const int slot = ctl[XD_CTL_KV_SLOT] + r;
+    dst_base[(size_t)slot * (size_t)dst_stride_floats + (size_t)j] = src[i];
+}
+
 // Split `[h][q_head | gate_head]` into two dense head-major arrays.
 //
 // One block per head, `hd` elements in, `2*hd` out: the source block for head
@@ -205,6 +227,17 @@ extern "C" __global__ void k_set_int1(int *d, int v) { *d = v; }
 extern "C" int q35_launch_set_int1(int *d, int v, void *stream_v) {
     if (d == nullptr) return (int)cudaErrorInvalidValue;
     k_set_int1<<<1, 1, 0, (cudaStream_t)stream_v>>>(d, v);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int q35_launch_copy_range_dslot(float *d_dst_base, int dst_stride_floats,
+                                          const float *d_src, int rows, int n,
+                                          const int *d_ctl, void *stream_v) {
+    if (rows <= 0 || n <= 0 || dst_stride_floats <= 0) return (int)cudaSuccess;
+    if (d_ctl == nullptr) return (int)cudaErrorInvalidValue;
+    if (n != rows * dst_stride_floats) return (int)cudaErrorInvalidValue;
+    k_copy_range_dslot<<<gridFor(n), kThreads, 0, (cudaStream_t)stream_v>>>(
+        d_dst_base, dst_stride_floats, d_src, rows, n, d_ctl);
     return (int)cudaGetLastError();
 }
 

@@ -199,6 +199,7 @@ const Kernels = struct {
     extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Write one int32 from a 1-thread kernel (graph-safe per-token scalar).
     extern fn q35_launch_set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_copy_range_dslot(dst_base: ?[*]f32, stride: c_int, src: ?[*]const f32, rows: c_int, n: c_int, ctl: ?[*]const c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_xd_ctl_publish(d_ctl: ?*anyopaque, pos: c_int, base_bits: c_int, kv_slot: c_int, attn_slot: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
@@ -345,6 +346,7 @@ const Launch = if (cuda_linked) struct {
     const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
     const attn_decode_split_dyn = Kernels.q35_launch_attn_decode_split_dyn;
     const set_int1 = Kernels.q35_launch_set_int1;
+    const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
@@ -565,6 +567,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d, v, stream };
+        return stubNoCudaKernels();
+    }
+    fn copy_range_dslot(dst_base: ?[*]f32, stride: c_int, src: ?[*]const f32, rows: c_int, n: c_int, ctl: ?[*]const c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ dst_base, stride, src, rows, n, ctl, stream };
         return stubNoCudaKernels();
     }
     fn xd_ctl_publish(d_ctl: ?*anyopaque, pos: c_int, base_bits: c_int, kv_slot: c_int, attn_slot: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -4895,8 +4901,23 @@ const attn_score_arity: usize = 11;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.kv_append)) return;
         if (rows == 0) return;
-        // f32: the historical path, unchanged (and graph-identical).
+        // f32: the historical path, unchanged (and graph-identical) -- except
+        // that a replayed/recorded step takes its ROW from the control block so
+        // the captured destination pointer stays a constant region base.
         if (self.kv_type == .f32) {
+            if ((self.capturing() or self.gs().state == .live) and self.ctl_dev != null) {
+                if (dBufPtr(dst)) |pd| {
+                    if (dBufPtr(src)) |ps| {
+                        const n = rows * kv_dim;
+                        const rc0 = Launch.copy_range_dslot(pd, @intCast(kv_dim), ps,
+                            @intCast(rows), @intCast(n),
+                            @ptrCast(@alignCast(self.ctl_dev.?)), self.launchStream());
+                        if (rc0 == cudart.cudaSuccess) return;
+                        if (self.capturing()) self.graphAbandon("copy_range_dslot launch failed");
+                        self.ewLaunchFail("copy_range_dslot", rc0);
+                    }
+                }
+            }
             if (rows == 1) {
                 CudaBackend.dCopyRangeSlot_body(g, ctx, dst.span(slot * kv_dim, kv_dim), src, slot);
             } else {
