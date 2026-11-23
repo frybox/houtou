@@ -340,7 +340,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
     }
-    const l2norm_qk_scale = Kernels.q35_launch_l2norm_qk_scale;
+    fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_l2norm_qk_scale(d_x, nk, kd, k_offset, eps, qscale, stream);
+    }
     /// Forwarders, not aliases.  `g` decides whether the launch is recorded,
     /// replayed or executed directly (see `graphDispatch`); the remaining
     /// parameters are the kernel's own, so `Launch.x(a, b, c)` at a call site
@@ -367,8 +370,14 @@ const Launch = if (cuda_linked) struct {
     }
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
-    const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
-    const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
+    fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
+    }
+    fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_deinterleave_qg_strided(d_q, d_gate, d_src, heads, hd, tokens, stream);
+    }
     fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_zero_buf(d_buf, n, stream);
@@ -405,10 +414,22 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
-    const argmax = Kernels.q35_launch_argmax;
-    const argmax_batch = Kernels.q35_launch_argmax_batch;
-    const argmax_conf = Kernels.q35_launch_argmax_conf;
-    const sample = Kernels.q35_launch_sample;
+    fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
+    }
+    fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
+    }
+    fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_argmax_conf(d_x, n, d_out, stream);
+    }
+    fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
+    }
     const sample_init = Kernels.q35_launch_sample_init;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
@@ -479,8 +500,14 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_gdn_gamma_rows(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream);
     }
-    const l2norm_strided = Kernels.q35_launch_l2norm_strided;
-    const scale_vec_strided = Kernels.q35_launch_scale_vec_strided;
+    fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_l2norm_strided(d_x, row_offset, rows, n, eps, tokens, row_stride, stream);
+    }
+    fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_scale_vec_strided(d_x, offset, s, n, tokens, stride, stream);
+    }
     fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_rope64(d_x, heads, hd, pos, base, stream);
@@ -598,7 +625,8 @@ const Launch = if (cuda_linked) struct {
     fn func_kv_quant_dslot() callconv(.c) ?*anyopaque {
         return null;
     }
-    fn deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_src, heads, hd, stream };
         return stubNoCudaKernels();
     }
@@ -647,19 +675,23 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_conv, d_y, d_wconv, n, stream };
         return stubNoCudaKernels();
     }
-    fn argmax_batch(d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, n, rows, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn argmax_conf(d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
+    fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_logits, n, d_ctl, d_scratch, stream };
         return stubNoCudaKernels();
     }
@@ -694,7 +726,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ slot0, hd, kv_kind };
         return 0;
     }
-    fn deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_q, d_gate, d_src, heads, hd, tokens, stream };
         return stubNoCudaKernels();
     }
@@ -777,11 +810,13 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, row_offset, rows, n, eps, tokens, row_stride, stream };
         return stubNoCudaKernels();
     }
-    fn scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, offset, s, n, tokens, stride, stream };
         return stubNoCudaKernels();
     }
@@ -814,7 +849,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, rows, heads, hd, d_ctl, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+    fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, nk, kd, k_offset, eps, qscale, stream };
         return stubNoCudaKernels();
     }
@@ -5251,7 +5287,6 @@ const attn_score_arity: usize = 11;
     const gdn_l2_eps: f32 = 1e-6;
 
     fn dL2normQkScale_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
-        _ = g;
         const self = self_(ctx);
         const nb = nk * kd;
         if (nk != 0 and kd != 0 and k_offset >= nb and x.len >= k_offset + nb) {
@@ -5272,7 +5307,7 @@ const attn_score_arity: usize = 11;
                             }
                         }
                     }
-                    const rc = Launch.l2norm_qk_scale(px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, self.launchStream());
+                    const rc = Launch.l2norm_qk_scale(g, px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, self.launchStream());
                     if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("l2norm_qk_scale", rc);
                 } else return;
@@ -5300,7 +5335,8 @@ const attn_score_arity: usize = 11;
         const cpu_buf = backend.Buf{ .ptr = @ptrCast(dev.ptr), .len = total };
         cpu_mod.CpuBackend.vtable.l2normQkScale(.{}, @ptrCast(&l2qk_cpu), cpu_buf, nk, kd, k_offset, qscale);
         // Device side: run the kernel on `px` itself, then read it back.
-        _ = Launch.l2norm_qk_scale(px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
+        // `$QWEN35_L2QK_CHECK` 是同步的逐元素对拍，永远不参与图，所以传直通图。
+        _ = Launch.l2norm_qk_scale(backend.Graph.direct, px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
         _ = lib.DeviceSynchronize();
         _ = lib.Memcpy(host.ptr, px, bytes, cudart.MemcpyDeviceToHost);
         var worst: f32 = 0;
@@ -5747,7 +5783,6 @@ const attn_score_arity: usize = 11;
     /// each one waited on the whole preceding round's launches, so paying that
     /// wait five times per round was pure loss.
     fn dArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
-        _ = g;
         const self = self_(ctx);
         std.debug.assert(out.len >= rows and rows > 0);
         if (self.cu == null or logits.len == 0 or logits.len % rows != 0) {
@@ -5767,7 +5802,7 @@ const attn_score_arity: usize = 11;
             cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         };
-        const rc = Launch.argmax_batch(px, @intCast(vocab), @intCast(rows), @ptrCast(@alignCast(self.d_idx)), null);
+        const rc = Launch.argmax_batch(g, px, @intCast(vocab), @intCast(rows), @ptrCast(@alignCast(self.d_idx)), null);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("argmax_batch", rc);
             cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
@@ -5799,7 +5834,8 @@ const attn_score_arity: usize = 11;
         const px = dBufPtr(logits) orelse return cpuConfFallback(self, logits, out_p);
         const cu = &self.cu.?;
         ensureBuf(&cu.lib, &self.d_conf, &self.d_conf_bytes, 3 * @sizeOf(c_int)) catch return 0;
-        const rc = Launch.argmax_conf(px, @intCast(logits.len), @ptrCast(@alignCast(self.d_conf)), null);
+        // 直通图：本函数紧跟一次阻塞 D2H（读回 12 字节），不可能被捕获。
+        const rc = Launch.argmax_conf(backend.Graph.direct, px, @intCast(logits.len), @ptrCast(@alignCast(self.d_conf)), null);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("argmax_conf", rc);
             return cpuConfFallback(self, logits, out_p);
@@ -5843,7 +5879,6 @@ const attn_score_arity: usize = 11;
     }
 
     fn dArgmax_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
-        _ = g;
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
             if (dBufPtr(logits)) |px| {
@@ -5873,7 +5908,7 @@ const attn_score_arity: usize = 11;
                         }
                     }
                 }
-                const rc = Launch.argmax(px, @intCast(logits.len), @ptrCast(@alignCast(self.d_idx)), null);
+                const rc = Launch.argmax(g, px, @intCast(logits.len), @ptrCast(@alignCast(self.d_idx)), null);
                 if (rc != cudart.cudaSuccess) {
                     self.ewLaunchFail("argmax", rc);
                     return 0;
@@ -6073,7 +6108,6 @@ const attn_score_arity: usize = 11;
     ///     `sampledToken` hands the value to the engine.  On the direct path the
     ///     download happens immediately and `sampledToken` is the identity.
     fn dSample_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
-        _ = g;
         const self = self_(ctx);
         // A/B switch: run the CPU reference sampler on the GPU's own logits.
         //
@@ -6152,7 +6186,7 @@ const attn_score_arity: usize = 11;
         if (!self.publishSampleCtl(logits.len, sp, stream)) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        const rc = Launch.sample(
+        const rc = Launch.sample(g, 
             px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,
         );
         if (rc != cudart.cudaSuccess) {
@@ -6387,21 +6421,21 @@ const attn_score_arity: usize = 11;
                                         // (llama.cpp `qwen3next.cpp:503-528`), which
                                         // is what the CPU oracle models.
                                         {
-                                            rc = Launch.l2norm_strided(
+                                            rc = Launch.l2norm_strided(g, 
                                                 pq, 0, @intCast(nk), @intCast(kd), eps,
                                                 @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
                                                 self.ewLaunchFail("l2norm_strided_q", rc);
                                                 return;
                                             }
-                                            rc = Launch.l2norm_strided(
+                                            rc = Launch.l2norm_strided(g, 
                                                 pq, @intCast(kq_dim), @intCast(nk), @intCast(kd),
                                                 eps, @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
                                                 self.ewLaunchFail("l2norm_strided_k", rc);
                                                 return;
                                             }
-                                            rc = Launch.scale_vec_strided(
+                                            rc = Launch.scale_vec_strided(g, 
                                                 pq, 0, qscale, @intCast(kq_dim),
                                                 @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
@@ -8049,7 +8083,6 @@ const attn_score_arity: usize = 11;
     /// head are interleaved with the *other* half, so no single linear copy
     /// can produce the dense layout -- hence the kernel.
     fn dDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
-        _ = g;
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
@@ -8058,7 +8091,7 @@ const attn_score_arity: usize = 11;
             if (dBufPtr(dst_q)) |pq| {
                 if (dBufPtr(dst_gate)) |pg| {
                     if (dBufPtr(src)) |ps| {
-                        const rc = Launch.deinterleave_qg(pq, pg, ps, @intCast(heads), @intCast(hd), self.launchStream());
+                        const rc = Launch.deinterleave_qg(g, pq, pg, ps, @intCast(heads), @intCast(hd), self.launchStream());
                         if (rc == cudart.cudaSuccess) return;
                         self.ewLaunchFail("deinterleave_qg", rc);
                     }
@@ -8075,7 +8108,6 @@ const attn_score_arity: usize = 11;
     /// cost 940 launches per 525-token prefill (1.2% of device time at 6 us).
     fn dDeinterleaveQGStrided(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
                               src: backend.Buf, heads: usize, hd: usize, tokens: usize) void {
-        _ = g;
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
@@ -8088,7 +8120,7 @@ const attn_score_arity: usize = 11;
             if (dBufPtr(dst_q)) |pq| {
                 if (dBufPtr(dst_gate)) |pg| {
                     if (dBufPtr(src)) |ps| {
-                        const rc = Launch.deinterleave_qg_strided(pq, pg, ps,
+                        const rc = Launch.deinterleave_qg_strided(g, pq, pg, ps,
                             @intCast(heads), @intCast(hd), @intCast(tokens), self.launchStream());
                         if (rc == cudart.cudaSuccess) return;
                         self.ewLaunchFail("deinterleave_qg_strided", rc);
