@@ -55,10 +55,19 @@ fn members(body: []const u8, kind: enum { alias, stub }, alloc: std.mem.Allocato
         const line = std.mem.trim(u8, raw, " \t\r");
         switch (kind) {
             .alias => {
-                if (!std.mem.startsWith(u8, line, "const ")) continue;
-                const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-                if (!std.mem.startsWith(u8, std.mem.trimStart(u8, line[eq + 1 ..], " "), "Kernels.")) continue;
-                try out.append(alloc, std.mem.trim(u8, line["const ".len..eq], " "));
+                // Two legal shapes since S3c threads `g` through the seam:
+                //   const <name> = Kernels.<...>;                  (plain alias)
+                //   fn <name>(g: backend.Graph, ...) { ... Kernels... }  (forwarder)
+                // The forwarder is still ONE place per kernel: it is what lets a
+                // launch consult the graph state before reaching the extern.
+                if (std.mem.startsWith(u8, line, "const ")) {
+                    const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+                    if (!std.mem.startsWith(u8, std.mem.trimStart(u8, line[eq + 1 ..], " "), "Kernels.")) continue;
+                    try out.append(alloc, std.mem.trim(u8, line["const ".len..eq], " "));
+                } else if (std.mem.startsWith(u8, line, "fn ") and std.mem.indexOf(u8, line, "g: backend.Graph") != null) {
+                    const op = std.mem.indexOfScalar(u8, line, '(') orelse continue;
+                    try out.append(alloc, std.mem.trim(u8, line["fn ".len..op], " "));
+                }
             },
             .stub => {
                 if (!std.mem.startsWith(u8, line, "fn ")) continue;
@@ -133,6 +142,9 @@ test "Launch: every CUDA alias has a fallback stub, and vice versa" {
 /// Requires an `=` and the statement to end at the `;`, so a call expression
 /// stored in a local (`const m = Kernels.q35_X(...)`) is NOT matched.
 fn isAlias(line: []const u8) bool {
+    // A forwarder (`fn <name>(g: backend.Graph, ...)`) is the seam too: its body
+    // is where the extern is reached, and it exists in BOTH branches.
+    if (std.mem.startsWith(u8, line, "fn ") and std.mem.indexOf(u8, line, "g: backend.Graph") != null) return true;
     if (!std.mem.startsWith(u8, line, "const ")) return false;
     const eq = std.mem.indexOfScalar(u8, line, '=') orelse return false;
     const rhs = std.mem.trim(u8, line[eq + 1 ..], " \t");
@@ -157,6 +169,9 @@ test "Launch: no call site bypasses the seam with Kernels.q35_*" {
     // `undefined symbol: q35_attn_chunk_max_rows` even though this test passed.
     var it = std.mem.splitScalar(u8, src_text, '\n');
     var line_no: usize = 0;
+    // True while inside a `fn <name>(g: backend.Graph, ...)` body.  Forwarders
+    // are one-liners (`{`, body, `}`), so tracking the brace depth is enough.
+    var in_forwarder = false;
     var bad: [32]usize = undefined;
     var nbad: usize = 0;
     while (it.next()) |raw| {
@@ -166,12 +181,27 @@ test "Launch: no call site bypasses the seam with Kernels.q35_*" {
         // call site.
         const code = raw[0 .. std.mem.indexOf(u8, raw, "//") orelse raw.len];
         const line = std.mem.trim(u8, code, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "fn ") and std.mem.indexOf(u8, line, "g: backend.Graph") != null) {
+            in_forwarder = true;
+            if (std.mem.indexOfScalar(u8, line, '}') != null) in_forwarder = false;
+            continue;
+        }
+        if (in_forwarder) {
+            if (std.mem.indexOfScalar(u8, line, '}') != null) in_forwarder = false;
+            continue;
+        }
         if (std.mem.indexOf(u8, line, "Kernels.q35_") == null) continue;
         // An ALIAS is `const <name> = Kernels.<...>;` and nothing else.  Testing
         // merely for a leading `const ` also swallowed ordinary
         // `const m = Kernels.q35_X(...)` call sites -- which is exactly how the
         // `q35_attn_chunk_max_rows` bypass below stayed invisible for a release.
         if (isAlias(line)) continue; // that IS the seam
+        // The BODY of a forwarder: `return Kernels.q35_launch_X(...)` inside the
+        // `fn <name>(g: backend.Graph, ...)` that the branch declares.  That line
+        // is the seam's implementation, not a bypass -- but only while it sits
+        // inside a forwarder, which `inForwarder` tracks.
+        if (in_forwarder) continue;
         // `q35_func_*` returns a raw function pointer and is only ever used from
         // inside `if (cuda_linked)`, so the CPU branch never analyses those lines
         // (see `resolve()` in the graph-capture section).  They are a different

@@ -314,7 +314,7 @@ pub const Exec = struct {
         // CPU path is bit-identical to the historical engine.
 
         /// out = x * rsqrt(mean(x^2) + eps) * w, all `n` wide.
-        rmsnorm: *const fn (ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void,
+        rmsnorm: *const fn (g: Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void,
         /// `rows` consecutive `rmsnorm` calls on `out.span(r*h, h)` / `x.span(r*h, h)`.
         ///
         /// The ROW-BATCHED form: `out` and `x` are `rows * w.len` long and pack
@@ -328,7 +328,7 @@ pub const Exec = struct {
         /// embedding rows through this vtable: a host-only `Buf` of length
         /// `rows * n` must NOT silently become a device launch.  A batch caller
         /// has to ask for the batch reading explicitly.
-        rmsnormRows: *const fn (ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void,
+        rmsnormRows: *const fn (g: Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void,
         /// `rows` consecutive `l2norm` calls on `x.span(r*n, n)`.  Same
         /// "explicit, never inferred" rule as `rmsnormRows`; each row's eps is
         /// inside its own sum, so the rows are fully independent.
@@ -369,7 +369,7 @@ pub const Exec = struct {
         /// had both landed; see docs in norm.cu.
         l2normQkScale: *const fn (ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
         /// x = silu(x) in place
-        siluInPlace: *const fn (ctx: *anyopaque, x: Buf) void,
+        siluInPlace: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
         /// out[i] *= silu(gate[i])
         mulSilu: *const fn (ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// out[i] *= sigmoid(gate[i])
@@ -704,13 +704,13 @@ pub const Exec = struct {
     pub fn matvecBatchK(self: Exec, out: Buf, w: LinearW, xK: Buf, k: usize) void {
         self.vtable.matvecBatchK(self.ptr, out, w, xK, k);
     }
-    pub fn rmsnorm(self: Exec, out: Buf, x: Buf, w: Buf, eps: f32) void {
-        self.vtable.rmsnorm(self.ptr, out, x, w, eps);
+    pub fn rmsnorm(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, eps: f32) void {
+        self.vtable.rmsnorm(g, self.ptr, out, x, w, eps);
     }
     /// See `VTable.rmsnormRows`: `out` / `x` are `rows * w.len` long, `w` is one
     /// row.  Equivalent to `rows` calls of `rmsnorm` on consecutive sub-rows.
-    pub fn rmsnormRows(self: Exec, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
-        self.vtable.rmsnormRows(self.ptr, out, x, w, rows, eps);
+    pub fn rmsnormRows(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+        self.vtable.rmsnormRows(g, self.ptr, out, x, w, rows, eps);
     }
     pub fn rope64(self: Exec, x: Buf, pos: u32, base: f32) void {
         self.vtable.rope64(self.ptr, x, pos, base);
@@ -743,8 +743,8 @@ pub const Exec = struct {
     pub fn l2normQkScale(self: Exec, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         self.vtable.l2normQkScale(self.ptr, x, nk, kd, k_offset, qscale);
     }
-    pub fn siluInPlace(self: Exec, x: Buf) void {
-        self.vtable.siluInPlace(self.ptr, x);
+    pub fn siluInPlace(self: Exec, g: Graph, x: Buf) void {
+        self.vtable.siluInPlace(g, self.ptr, x);
     }
     pub fn mulSilu(self: Exec, out: Buf, gate: Buf) void {
         self.vtable.mulSilu(self.ptr, out, gate);

@@ -1646,7 +1646,7 @@ pub const Engine = struct {
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
-        self.exec.rmsnorm(self.x1, self.x, self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, self.x, self.output_norm, c.rms_eps);
         // lm_head: untied `output.weight` when present, else tied token_embd.
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
@@ -1757,7 +1757,7 @@ pub const Engine = struct {
             // is bit-identical to the per-token loop it replaces.  The
             // per-token loop issued `k` launches of a 5 us kernel per layer per
             // norm, which was 5.6% of prefill device time on 27B IQ3_XXS.
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
                 self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
@@ -1824,7 +1824,7 @@ pub const Engine = struct {
 
             // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
             // batched down, residual ----
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
             self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
             self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             // SwiGLU over the whole chunk: `gate[i] = silu(gate[i]) * up[i]` is
@@ -1859,7 +1859,7 @@ pub const Engine = struct {
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
         // path, so the first sampled logits are bit-identical) ----
-        self.exec.rmsnorm(self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
                 .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
@@ -1898,7 +1898,7 @@ pub const Engine = struct {
             return self.logitsK.span(0, c.vocab);
         }
         // Normalise every row and project them all through lm_head.
-        self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
         const w = self.output_weight orelse self.token_embd;
         self.exec.matvecBatchK(self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
         return self.logitsK.span(0, k * c.vocab);
@@ -1924,7 +1924,7 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
         const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
-        self.exec.rmsnorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
@@ -2071,7 +2071,7 @@ pub const Engine = struct {
         //
         // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
         // shared `ssm_norm` row, so this is the three-condition batch.
-        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
         // `mulSilu` is elementwise with no reduction and no per-row state, so the
         // `nv` heads collapse into this one call over the same `nv * vd` run --
         // unlike the norm merges above, there is no repeat-count subtlety here.
@@ -2202,9 +2202,9 @@ pub const Engine = struct {
         // `kvAppend`'s explicit `slot`/`rows` serve the same purpose: the
         // DECODE graph retargets a captured KV append row by row
         // (`g_op_seen.kv_append`), and prefill does not go through the graph.
-        self.exec.rmsnormRows(self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
+        self.exec.rmsnormRows(self.graph, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
             lw.attn_q_norm, k * heads, c.rms_eps);
-        self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
+        self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
             lw.attn_k_norm, k * kv_heads, c.rms_eps);
         self.exec.rope64Rows(self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
         self.exec.rope64Rows(self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
@@ -2391,7 +2391,7 @@ pub const Engine = struct {
         // The `nv` norm rows of a token are consecutive (`gout` is `nv * vd`
         // wide) with one shared `ssm_norm` row, so `k * nv` rows is the same
         // three-condition batch case, `k` tokens deep.
-        self.exec.rmsnormRows(self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
         self.exec.mulSilu(self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
     }
 
@@ -2405,7 +2405,7 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd; // 512
         const gqa: usize = heads / kv_heads; // 4
 
-        self.exec.rmsnorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv.span(0, 2 * q_dim);
@@ -2433,8 +2433,8 @@ pub const Engine = struct {
         // a device buffer so its nodes need no retargeting, but `rope64_rows`
         // launches a different kernel with no host-stub identity for the graph
         // to match.  See `dRope64Rows_body`'s capture guard.
-        self.exec.rmsnormRows(q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
-        self.exec.rmsnormRows(self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
         // RoPE on first 64 dims of each q/k head -- ONE call per tensor, not
         // one per head.  `rope64Rows(x, 1, heads, hd)` is literally the
         // per-head loop it replaces (`k_rope64_rows` rotates row r at `pos+r`,
@@ -2535,9 +2535,9 @@ pub const Engine = struct {
         // and `pre_fc_norm_embedding` / `pre_fc_norm_hidden` are two distinct
         // modules in the reference.
         self.embedTo(next_token, self.x1.span(0, hidden));
-        self.exec.rmsnorm(self.x1.span(0, hidden), self.x1.span(0, hidden), nn.enorm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x1.span(0, hidden), nn.enorm, c.rms_eps);
         self.exec.copyRange(self.graph, nn.input.span(0, hidden), self.x1.span(0, hidden));
-        self.exec.rmsnorm(self.x1.span(0, hidden), hidden_buf.span(0, hidden), nn.hnorm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), hidden_buf.span(0, hidden), nn.hnorm, c.rms_eps);
         self.exec.copyRange(self.graph, nn.input.span(hidden, hidden), self.x1.span(0, hidden));
 
         // The projected value becomes the residual stream for the block.
@@ -2556,7 +2556,7 @@ pub const Engine = struct {
         // model's lm_head on that normed value.  `output_norm` belongs to the
         // main stack and is already applied once for the target logits, so the
         // drafter's equivalent is `shared_head_norm` alone.
-        self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), nn.shared_head_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), nn.shared_head_norm, c.rms_eps);
         // Hand the normed output back for the next chained step BEFORE it gets
         // overwritten by anything else in this function (nothing does, but the
         // copy makes the contract explicit and costs one `hidden` memcpy).
@@ -2578,7 +2578,7 @@ pub const Engine = struct {
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        self.exec.rmsnorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.post_attention_norm, c.rms_eps);
         self.exec.matvec(self.mlp_h, lw.ffn_gate, self.x1);
         self.exec.matvec(self.mlp_h1, lw.ffn_up, self.x1);
         self.exec.swiglu(self.graph, self.mlp_h, self.mlp_h1);
@@ -3019,7 +3019,7 @@ pub const Engine = struct {
     /// the final layer's output and not some other layer's.
     pub fn logitsFromHidden(self: *Engine, h: backend.Buf) void {
         const c = self.cfg;
-        self.exec.rmsnorm(self.x1, h, self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1, h, self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
                 .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
@@ -3233,7 +3233,7 @@ pub const Engine = struct {
         // Row `row` of plane `i`: the plane is `nbatch` rows, so the offset is
         // `row * hidden` inside it.
         const src = self.specTapPlane(i, self.nbatch).span(row * hidden, hidden);
-        self.exec.rmsnorm(dst.span(0, hidden), src, self.output_norm, self.cfg.rms_eps);
+        self.exec.rmsnorm(self.graph, dst.span(0, hidden), src, self.output_norm, self.cfg.rms_eps);
     }
 
     pub const GenResult = struct {

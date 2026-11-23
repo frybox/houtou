@@ -47,6 +47,7 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
+const graph_registry = @import("graph_registry.zig");
 const cpu_mod = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
 const cudart = @import("cudart.zig");
@@ -293,6 +294,16 @@ fn stubNoCudaKernels() c_int {
     return 98;
 }
 
+/// The one place that decides what a `Launch.*` call does inside a graph span.
+///
+/// S3c step 1: always false.  `g` is threaded through every launch so step 2 can
+/// make this decision in ONE place instead of in 26 op bodies, but nothing is
+/// recorded or suppressed yet -- behaviour is exactly the pre-S3c one.
+fn graphGate(g: backend.Graph) bool {
+    _ = g;
+    return false;
+}
+
 /// Compile-time-resolved launcher table.  `cuda_linked` is comptime-known, so
 /// each field collapses to either the extern or the stub -- no indirection at
 /// run time.
@@ -312,7 +323,14 @@ const Launch = if (cuda_linked) struct {
     const tables_bytes = Kernels.q35_iq_tables_bytes;
     const scale_vec = Kernels.q35_launch_scale_vec;
     const l2norm_qk_scale = Kernels.q35_launch_l2norm_qk_scale;
-    const add_resid = Kernels.q35_launch_add_resid;
+    /// Forwarders, not aliases.  `g` decides whether the launch is recorded,
+    /// replayed or executed directly (see `graphDispatch`); the remaining
+    /// parameters are the kernel's own, so `Launch.x(a, b, c)` at a call site
+    /// reads exactly like the launcher it wraps.
+    fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_add_resid(dst, src, n, stream);
+    }
     const copy_range = Kernels.q35_launch_copy_range;
     const kv_quant = Kernels.q35_launch_kv_quant;
     const kv_quant_dslot = Kernels.q35_launch_kv_quant_dslot;
@@ -322,9 +340,15 @@ const Launch = if (cuda_linked) struct {
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
     const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
     const zero_buf = Kernels.q35_launch_zero_buf;
-    const rmsnorm = Kernels.q35_launch_rmsnorm;
+    fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
+    }
     const l2norm = Kernels.q35_launch_l2norm;
-    const silu = Kernels.q35_launch_silu;
+    fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_silu(d_x, n, stream);
+    }
     const mul_silu = Kernels.q35_launch_mul_silu;
     const mul_sigmoid = Kernels.q35_launch_mul_sigmoid;
     const swiglu = Kernels.q35_launch_swiglu;
@@ -428,7 +452,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, s, n, stream };
         return stubNoCudaKernels();
     }
-    fn add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn add_resid(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
@@ -463,7 +488,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_buf, n, stream };
         return stubNoCudaKernels();
     }
-    fn rmsnorm(d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int {
+    fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_out, d_x, d_w, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
@@ -471,7 +497,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
-    fn silu(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
@@ -5161,7 +5188,6 @@ const attn_score_arity: usize = 11;
     }
 
     fn dAddResid_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.add_resid)) return;
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
@@ -5175,7 +5201,7 @@ const attn_score_arity: usize = 11;
         if (self.cu != null) {
             if (dBufPtr(dst)) |pd| {
                 if (dBufPtr(src)) |ps| {
-                    const rc = Launch.add_resid(pd, ps, @intCast(dst.len), self.launchStream());
+                    const rc = Launch.add_resid(g, pd, ps, @intCast(dst.len), self.launchStream());
                     if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("add_resid", rc);
                 } else return;
@@ -5386,7 +5412,7 @@ const attn_score_arity: usize = 11;
     //     uploaded exactly once at load time (`loadVecF32`); each call just reads
     //     the resident device pointer -- no per-token upload.
 
-    fn dRmsnorm_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+    fn dRmsnorm_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.rmsnorm)) return;
         // The CPU reference asserts out.len == x.len == w.len (one row).  The
@@ -5398,14 +5424,14 @@ const attn_score_arity: usize = 11;
                 if (dBufPtr(out)) |po| {
                     if (dBufPtr(w)) |pw| {
                         const rows: c_int = @intCast(x.len / w.len);
-                        const rc = Launch.rmsnorm(po, px, pw, rows, @intCast(w.len), eps, self.launchStream());
+                        const rc = Launch.rmsnorm(g, po, px, pw, rows, @intCast(w.len), eps, self.launchStream());
                         if (rc == cudart.cudaSuccess) return;
                         self.ewLaunchFail("rmsnorm", rc);
                     } else return;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.rmsnorm(@ptrCast(&self.cpu), out, x, w, eps);
+        cpu_mod.CpuBackend.vtable.rmsnorm(.{}, @ptrCast(&self.cpu), out, x, w, eps);
     }
 
     /// Row-batched `rmsnorm`: one launch, `rows` blocks, `w` reused per row.
@@ -5416,7 +5442,7 @@ const attn_score_arity: usize = 11;
     ///
     /// Falls back to the per-row loop (`rmsnormRows` semantics) whenever the
     /// geometry does not hold, which is what the CPU side does anyway.
-    fn dRmsnormRows_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+    fn dRmsnormRows_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.rmsnorm_rows)) return;
         const n = w.len;
@@ -5424,7 +5450,7 @@ const attn_score_arity: usize = 11;
             if (dBufPtr(x)) |px| {
                 if (dBufPtr(out)) |po| {
                     if (dBufPtr(w)) |pw| {
-                        const rc = Launch.rmsnorm(po, px, pw, @intCast(rows_in), @intCast(n), eps, self.launchStream());
+                        const rc = Launch.rmsnorm(g, po, px, pw, @intCast(rows_in), @intCast(n), eps, self.launchStream());
                         if (rc == cudart.cudaSuccess) {
                             return;
                         }
@@ -5433,7 +5459,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.rmsnormRows(@ptrCast(&self.cpu), out, x, w, rows_in, eps);
+        cpu_mod.CpuBackend.vtable.rmsnormRows(.{}, @ptrCast(&self.cpu), out, x, w, rows_in, eps);
     }
 
     fn dL2norm_body(ctx: *anyopaque, x: backend.Buf) void {
@@ -5470,17 +5496,17 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.l2normRows(@ptrCast(&self.cpu), x, n);
     }
 
-    fn dSiluInPlace_body(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSiluInPlace_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.silu_in_place)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
-                const rc = Launch.silu(px, @intCast(x.len), self.launchStream());
+                const rc = Launch.silu(g, px, @intCast(x.len), self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("silu", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.siluInPlace(@ptrCast(&self.cpu), x);
+        cpu_mod.CpuBackend.vtable.siluInPlace(.{}, @ptrCast(&self.cpu), x);
     }
 
     fn dMulSilu_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
@@ -7966,23 +7992,23 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `rmsnorm` slot, timed (`$QWEN35_PROF`).
-    fn dRmsnorm(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+    fn dRmsnorm(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
         if (self.ablated(.rmsnorm)) return ;
-        dRmsnorm_body(ctx, out, x, w, eps);
+        dRmsnorm_body(g, ctx, out, x, w, eps);
     }
 
     /// Row-batched twin of `dRmsnorm`.  Charged to the `rmsnorm` slot so the
     /// `PROF-SLOT` total for rmsnorm stays comparable across the change (only
     /// its `calls` count moves, which is the point of the merge).
-    fn dRmsnormRows(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+    fn dRmsnormRows(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
         if (self.ablated(.rmsnorm)) return ;
-        dRmsnormRows_body(ctx, out, x, w, rows_in, eps);
+        dRmsnormRows_body(g, ctx, out, x, w, rows_in, eps);
     }
 
     /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
@@ -8003,12 +8029,12 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
-    fn dSiluInPlace(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.silu, t0);
         if (self.ablated(.silu)) return ;
-        dSiluInPlace_body(ctx, x);
+        dSiluInPlace_body(g, ctx, x);
     }
 
     /// The `mulSilu` slot, timed (`$QWEN35_PROF`).

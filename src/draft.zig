@@ -470,7 +470,7 @@ pub const Draft = struct {
         }
         // hidden_norm over each row
         if (rows > 0) {
-            self.exec.rmsnormRows(
+            self.exec.rmsnormRows(self.graph, 
                 self.ctx.span(0, rows * hidden),
                 self.ctx.span(0, rows * hidden),
                 self.hidden_norm,
@@ -545,7 +545,7 @@ pub const Draft = struct {
                 const vrow = cache.v.span(r * kv_dim, kv_dim);
                 self.exec.matvec(krow, l.attn_k, self.ctx.span(r * hidden, hidden));
                 self.exec.matvec(vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
-                self.exec.rmsnormRows(krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
+                self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
                 // Context rows sit at absolute positions pos0..pos0+rows-1.
                 self.exec.rope64Rows(krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
             }
@@ -600,7 +600,7 @@ pub const Draft = struct {
         // last `packed` leak in as its `prev` sender.
         if (row == 0) self.prev_packed_valid = false;
         // layer 0 gets its own input_layernorm; later ones are fed by the bridge
-        self.exec.rmsnorm(self.xin.span(0, hidden), self.resid.span(0, hidden), self.layers[0].attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.xin.span(0, hidden), self.resid.span(0, hidden), self.layers[0].attn_norm, c.rms_eps);
 
         const last = self.layers.len - 1;
         for (self.layers, 0..) |*l, il| {
@@ -667,8 +667,8 @@ pub const Draft = struct {
 
         // q_norm/k_norm are per-head RMSNorms over `hd` (=128), unlike the
         // target's 256-wide ones.
-        self.exec.rmsnormRows(self.q.span(0, q_dim), self.q.span(0, q_dim), l.attn_q_norm, c.heads, c.rms_eps);
-        self.exec.rmsnormRows(krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, self.q.span(0, q_dim), self.q.span(0, q_dim), l.attn_q_norm, c.heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
 
         self.exec.rope64Rows(self.q.span(0, q_dim), pos, c.rope_freq_base, 1, c.heads, c.hd);
         self.exec.rope64Rows(krow, pos, c.rope_freq_base, 1, c.kv_heads, c.hd);
@@ -710,7 +710,7 @@ pub const Draft = struct {
         if (self.hostDebug()) self.emit("h", il, self.dump_row, self.resid.slice()[0..hidden]);
 
         // ---- MLP ----
-        self.exec.rmsnorm(self.xin.span(0, hidden), self.resid.span(0, hidden), l.ffn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.xin.span(0, hidden), self.resid.span(0, hidden), l.ffn_norm, c.rms_eps);
         self.exec.matvec(self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
         self.exec.matvec(self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
         if (self.hostDebug()) self.debug_gate = maxAbs(self.mlp_h.slice()[0..c.ffn]);

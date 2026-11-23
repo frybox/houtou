@@ -1036,7 +1036,8 @@ pub const CpuBackend = struct {
     // kernels need no backend state, which is why a composing backend (the CUDA
     // trampoline) can hand out these same targets unchanged.
 
-    fn vRmsnorm(ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void {
+    fn vRmsnorm(g: backend.Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void {
+        _ = g;
         _ = ctx;
         ew.bufRmsnorm(out, x, w, eps);
     }
@@ -1045,7 +1046,8 @@ pub const CpuBackend = struct {
     /// loop over consecutive spans, i.e. literally the per-row calls the engine
     /// used to make, so the CPU path stays bit-identical to it and this slot
     /// cannot diverge from `vRmsnorm` on any single row.
-    fn vRmsnormRows(ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+    fn vRmsnormRows(g: backend.Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+        _ = g;
         _ = ctx;
         const n = w.len;
         std.debug.assert(out.len == rows * n and x.len == rows * n);
@@ -1141,7 +1143,8 @@ pub const CpuBackend = struct {
         vScaleVec(ctx, x.span(0, nb), qscale);
     }
 
-    fn vSiluInPlace(ctx: *anyopaque, x: Buf) void {
+    fn vSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
+        _ = g;
         _ = ctx;
         ew.bufSiluInPlace(x);
     }

@@ -620,7 +620,7 @@ pub const Engine = struct {
         const gqa: usize = heads / kv_heads;
 
         // ---- attention ----
-        self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), lw.attn_norm, c.rms_eps);
 
         // Qwen3's `attn_q` is a plain [q_dim, hidden] projection: there is no
         // per-head [q|gate] interleave and no output gate (unlike Qwen3.5).
@@ -631,8 +631,8 @@ pub const Engine = struct {
 
         // Per-head RMSNorm over `head_dim` (=128 here, not the 256-wide kind
         // Qwen3.5 uses), then RoPE over the FULL head.
-        self.exec.rmsnormRows(q, q, lw.attn_q_norm, heads, c.rms_eps);
-        self.exec.rmsnormRows(self.k.span(0, kv_dim), self.k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, q, q, lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(self.graph, self.k.span(0, kv_dim), self.k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
         self.exec.ropeRows(q, pos, c.rope_freq_base, 1, heads, hd, c.rotary_dim);
         self.exec.ropeRows(self.k.span(0, kv_dim), pos, c.rope_freq_base, 1, kv_heads, hd, c.rotary_dim);
 
@@ -655,7 +655,7 @@ pub const Engine = struct {
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // ---- MLP ----
-        self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
         const n_ff: usize = c.n_ff;
         self.exec.matvec(self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
         self.exec.matvec(self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
@@ -686,7 +686,7 @@ pub const Engine = struct {
         self.embedTo(token, self.x.span(0, hidden));
         self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .kv_slot = pos, .attn_slot = pos, .rows = 1 });
         for (self.layers, 0..) |*lw, li| self.layerForward(lw, li, pos);
-        self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             self.exec.matvec(self.logits, ow, self.x1.span(0, hidden));
         } else {
@@ -766,7 +766,7 @@ pub const Engine = struct {
             // One norm for the whole chunk; `rmsnormRows` is `k` consecutive
             // single-row blocks and reduces each row in the same order, so it
             // is bit-identical to the per-token call.
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             // Plain [q_dim, hidden] projection: no `[q|gate]` interleave, so
             // `qK` is filled directly (Qwen3.5 has to deinterleave first, which
@@ -778,8 +778,8 @@ pub const Engine = struct {
             // Per-head norm over `head_dim`, then RoPE over the FULL head.
             // Order matters: norm -> rope, as in `layerForward`; rotating first
             // and normalising after would renormalise the rotation away.
-            self.exec.rmsnormRows(self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
-            self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
             self.exec.ropeRows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
             self.exec.ropeRows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
 
@@ -805,7 +805,7 @@ pub const Engine = struct {
             self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP ----
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
             self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
             self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
@@ -833,7 +833,7 @@ pub const Engine = struct {
         // (`rmsNorm` asserts all three lengths match); use a prefix view of it,
         // which is exactly `hidden` floats.
         const normed = self.x1.span(0, hidden);
-        self.exec.rmsnorm(normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.graph, normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             self.exec.matvec(self.logits, ow, normed);
         } else {
