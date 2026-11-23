@@ -899,6 +899,24 @@ pub const Engine = struct {
     /// 全部行数，与 llama.cpp 的 `n_rs_seq = draft.n_max` 同一个量级。
     pub const spec_rs_seq: usize = spec_verify_rows;
 
+    /// Slabs in `gdn[i].state_all`, in order:
+    ///
+    ///   [0]                  the live state every forward pass reads and writes
+    ///   [1 .. 1+spec_rs_seq] the per-row verify snapshots (slot t)
+    ///
+    /// The live state ALWAYS lives in slab 0.  A rollback used to re-point
+    /// `gdn[i].state` at slab `rows` and leave it there; the next verify then
+    /// handed that slab both as the running state AND as the base of the
+    /// snapshot region (which starts at slab 1), so the CPU fallback's
+    /// `@memcpy(snap[..], state[..])` aliased and panicked (`@memcpy arguments
+    /// alias`, measured on 27B IQ3_XXS + MTP).  Keeping the snapshot region
+    /// disjoint from slab 0 is what makes the two views independent.
+    ///
+    /// The cost of the fix is one slab copy per rollback (`copyRange`), i.e. a
+    /// 3 MB D2D on the 27B -- the rollback path already copies the conv history
+    /// and the prelude inputs, so this does not change its order of magnitude.
+    pub const snap_slab_base: usize = 1;
+
     /// One decl per `backend.Kind`, holding the concrete backend type
     /// `selectBackend` picks for it.
     ///
@@ -2318,7 +2336,7 @@ pub const Engine = struct {
                 self.goutK.span(0, k * value_dim),
                 self.gdn_prefill_gamma.span(0, k * nv),
                 self.abK.span(beta_base, k * nv),
-                self.gdn[li].state_all.span(nv * kd * vd, (spec_rs_seq) * nv * kd * vd),
+                self.gdn[li].state_all.span(snap_slab_base * nv * kd * vd, (spec_rs_seq) * nv * kd * vd),
                 nv,
                 nk,
                 kd,
@@ -2793,13 +2811,24 @@ pub const Engine = struct {
             // 卷积历史必须从 verify 前恢复（它无法反推，见上面的注释）。
             if (g.conv.len > 0) self.exec.copyRange(self.graph, g.conv, sn.conv);
             g.conv_len = sn.conv_len;
-            // state：verify 的内核已经在每行结束后把整份状态写进 `state_all`
-            // 的第 t+1 块，所以回滚**只是把视图指过去**——不拷贝、不重算。
-            // 这正是 llama.cpp `rs_idx` 的做法（`llama-memory-recurrent.cpp:825`
-            // 的 `cell_id = rs_idx_cur * size + i`）。`rows` 行的状态在槽 `rows`。
-            if (rows <= spec_rs_seq and g.state_all.len >= (rows + 1) * nv * kd * vd) {
+            // state：verify 的内核在**每行跑完后**把整份状态写进快照槽 `t`
+            // （0 基，见 `q35_gdn_step_rows_chunk_kernel` 的 `slot t` 注释与
+            // `vGdnStepRowsSnap` 的 `@memcpy`）。所以「跑完 `rows` 行之后」的
+            // 状态在**槽 `rows-1`**，不是槽 `rows`。
+            //
+            // 两个已知的坑（都实测过）：
+            //   1. 槽号差一。读槽 `rows` 拿到的是 kernel 根本没写过的那一格
+            //      （它只写到 `nsnap-1 = rows-1`），内容是上一轮的残留。
+            //   2. 快照区与活状态块重叠。`state` 必须始终是第 0 块；用「把
+            //      state 指到快照块」代替拷贝，会让下一轮 verify 把同一格既
+            //      当活状态又当快照基址，CPU 回退的 `@memcpy` 直接 panic。
+            if (rows >= 1 and rows <= spec_rs_seq and
+                g.state_all.len >= (snap_slab_base + rows) * nv * kd * vd)
+            {
                 g.rs_idx = @intCast(rows);
-                g.state = g.state_all.span(rows * nv * kd * vd, nv * kd * vd);
+                const src = g.state_all.span((snap_slab_base + rows - 1) * nv * kd * vd, nv * kd * vd);
+                g.state = g.state_all.span(0, nv * kd * vd);
+                self.exec.copyRange(self.graph, g.state, src);
                 used_snap = true;
             } else {
                 // 行数超出快照容量（不该发生，verify 块 <= spec_verify_rows）：

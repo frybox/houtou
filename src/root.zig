@@ -53,6 +53,12 @@ test {
     _ = @import("graph_tests.zig");
 }
 
+// 推测解码回滚的块布局不变量：活状态块永不与快照区重叠。这条抓到的是
+// 27B CUDA + MTP 上 `@memcpy arguments alias` 的根因（见文件头）。
+test {
+    _ = @import("spec_snap_tests.zig");
+}
+
 // C-kernel parity coverage (restored after `33e2bb8` unmounted them).
 // Each file compares the C kernels (`simd_c.zig`, extern symbols from
 // src/kernels/x86/) against the Zig scalar oracle (`simd_ref.zig`), and against

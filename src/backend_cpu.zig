@@ -1290,12 +1290,28 @@ pub const CpuBackend = struct {
                 beta.span(t * heads, heads),
                 heads, nk, kd, vd);
             if (snap.len >= (t + 1) * per) {
+                // The fallback is a plain host copy, so the two regions MUST be
+                // disjoint: `snap` is the snapshot area, `state` is the running
+                // state.  A caller that hands the same memory for both (which a
+                // re-pointed `state` view used to do) hits a debug-build panic
+                // here and silently corrupts ONE region in a release build.
+                std.debug.assert(!bufsOverlap(snap, state));
                 @memcpy(snap.slice()[t * per ..][0..per], state.slice()[0..per]);
             }
         }
     }
 
-    /// CPU oracle for `VTable.attnChunk`: literally the per-row `attnDecode`
+    /// Whether two backend regions share any byte.  Used by the snapshot oracle to
+/// turn "the caller handed overlapping views" into a named failure instead of an
+/// `@memcpy arguments alias` panic (or a silent in-place memmove in release).
+fn bufsOverlap(a: Buf, b: Buf) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const ab = @intFromPtr(a.ptr);
+    const bb = @intFromPtr(b.ptr);
+    return ab < bb + b.len * @sizeOf(f32) and bb < ab + a.len * @sizeOf(f32);
+}
+
+/// CPU oracle for `VTable.attnChunk`: literally the per-row `attnDecode`
     /// calls the engine made before the chunk slot existed, in the same order.
     /// Keeping the naive loop here is what makes a device implementation's
     /// comparison meaningful instead of a copy checked against a copy.
