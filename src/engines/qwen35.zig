@@ -2019,7 +2019,7 @@ pub const Engine = struct {
             // scaleVec q).  Same arithmetic in the same order -- the CPU
             // backend's `l2normQkScale` literally calls those three, and the
             // device kernel reproduces them per row.  See `backend.Exec`.
-            self.exec.l2normQkScale(qkv, nk, kd, kq_dim, qscale);
+            self.exec.l2normQkScale(self.graph, qkv, nk, kd, kq_dim, qscale);
         }
         // Fallback for a layout the batched passes above/below cannot express
         // (`nv` not a multiple of `nk`): the per-head form this function has
@@ -2030,10 +2030,10 @@ pub const Engine = struct {
                 const kh = h % nk;
                 const q_h = qkv.span(kh * kd, kd);
                 const k_h = qkv.span(kq_dim + kh * kd, kd);
-                self.exec.l2norm(q_h);
-                self.exec.l2norm(k_h);
+                self.exec.l2norm(self.graph, q_h);
+                self.exec.l2norm(self.graph, k_h);
                 const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-                self.exec.scaleVec(q_h, qscale);
+                self.exec.scaleVec(self.graph, q_h, qscale);
             }
         }
 
@@ -2075,7 +2075,7 @@ pub const Engine = struct {
         // `mulSilu` is elementwise with no reduction and no per-row state, so the
         // `nv` heads collapse into this one call over the same `nv * vd` run --
         // unlike the norm merges above, there is no repeat-count subtlety here.
-        self.exec.mulSilu(gout.span(0, value_dim), z.span(0, value_dim));
+        self.exec.mulSilu(self.graph, gout.span(0, value_dim), z.span(0, value_dim));
 
         // out projection [2048 -> 1024]
         self.exec.matvec(self.x2.span(0, hidden), lw.ssm_out.?, gout);
@@ -2392,7 +2392,7 @@ pub const Engine = struct {
         // wide) with one shared `ssm_norm` row, so `k * nv` rows is the same
         // three-condition batch case, `k` tokens deep.
         self.exec.rmsnormRows(self.graph, self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
-        self.exec.mulSilu(self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
+        self.exec.mulSilu(self.graph, self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
     }
 
     fn forwardFull(self: *Engine, lw: *LayerWeights, li: usize, pos: u32) void {

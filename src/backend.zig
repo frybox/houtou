@@ -332,7 +332,7 @@ pub const Exec = struct {
         /// `rows` consecutive `l2norm` calls on `x.span(r*n, n)`.  Same
         /// "explicit, never inferred" rule as `rmsnormRows`; each row's eps is
         /// inside its own sum, so the rows are fully independent.
-        l2normRows: *const fn (ctx: *anyopaque, x: Buf, n: usize) void,
+        l2normRows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, n: usize) void,
         /// Rotate the 64-dim rotary block of a row in place (cross-half pairing).
         rope64: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
         /// `rows` consecutive `rope64` calls on `x.span(r * heads * hd, heads * hd)`
@@ -355,9 +355,9 @@ pub const Exec = struct {
         /// that do not implement this may fall back to their CPU twin.
         ropeRows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
-        l2norm: *const fn (ctx: *anyopaque, x: Buf) void,
+        l2norm: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
         /// x *= s
-        scaleVec: *const fn (ctx: *anyopaque, x: Buf, s: f32) void,
+        scaleVec: *const fn (g: Graph, ctx: *anyopaque, x: Buf, s: f32) void,
         /// The GDN q/k normalisation as ONE launch: `nk` q rows at `x[0..]` and
         /// `nk` k rows at `x[k_offset..]`, each an independent l2norm of `kd`
         /// floats (eps inside the sum), then the q rows scaled by `qscale`.
@@ -367,11 +367,11 @@ pub const Exec = struct {
         /// kernels, so the 48 recurrent layers' 96 saved launches are 1.8% of
         /// the token.  Added after decode RoPE batching and the GDN l2norm fix
         /// had both landed; see docs in norm.cu.
-        l2normQkScale: *const fn (ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
+        l2normQkScale: *const fn (g: Graph, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
         /// x = silu(x) in place
         siluInPlace: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
         /// out[i] *= silu(gate[i])
-        mulSilu: *const fn (ctx: *anyopaque, out: Buf, gate: Buf) void,
+        mulSilu: *const fn (g: Graph, ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// out[i] *= sigmoid(gate[i])
         mulSigmoid: *const fn (g: Graph, ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// softmax over the whole slice
@@ -725,29 +725,29 @@ pub const Exec = struct {
     pub fn ropeRows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         self.vtable.ropeRows(self.ptr, x, pos, base, rows, heads, hd, rotary_dim);
     }
-    pub fn l2norm(self: Exec, x: Buf) void {
-        self.vtable.l2norm(self.ptr, x);
+    pub fn l2norm(self: Exec, g: Graph, x: Buf) void {
+        self.vtable.l2norm(g, self.ptr, x);
     }
     /// See `VTable.l2normRows`: `x` is `rows * n` long.  Equivalent to `rows`
     /// calls of `l2norm` on `x.span(r*n, n)`.
-    pub fn l2normRows(self: Exec, x: Buf, n: usize) void {
-        self.vtable.l2normRows(self.ptr, x, n);
+    pub fn l2normRows(self: Exec, g: Graph, x: Buf, n: usize) void {
+        self.vtable.l2normRows(g, self.ptr, x, n);
     }
-    pub fn scaleVec(self: Exec, x: Buf, s: f32) void {
-        self.vtable.scaleVec(self.ptr, x, s);
+    pub fn scaleVec(self: Exec, g: Graph, x: Buf, s: f32) void {
+        self.vtable.scaleVec(g, self.ptr, x, s);
     }
     /// One-launch form of `l2normRows(x[0..nk*kd], kd)`,
     /// `l2normRows(x[k_offset..k_offset+nk*kd], kd)` and
     /// `scaleVec(x[0..nk*kd], qscale)`.  The eps is the GDN one (1e-6), which
     /// the three-call form also uses via `l2normRows`.
-    pub fn l2normQkScale(self: Exec, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
-        self.vtable.l2normQkScale(self.ptr, x, nk, kd, k_offset, qscale);
+    pub fn l2normQkScale(self: Exec, g: Graph, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        self.vtable.l2normQkScale(g, self.ptr, x, nk, kd, k_offset, qscale);
     }
     pub fn siluInPlace(self: Exec, g: Graph, x: Buf) void {
         self.vtable.siluInPlace(g, self.ptr, x);
     }
-    pub fn mulSilu(self: Exec, out: Buf, gate: Buf) void {
-        self.vtable.mulSilu(self.ptr, out, gate);
+    pub fn mulSilu(self: Exec, g: Graph, out: Buf, gate: Buf) void {
+        self.vtable.mulSilu(g, self.ptr, out, gate);
     }
     pub fn mulSigmoid(self: Exec, g: Graph, out: Buf, gate: Buf) void {
         self.vtable.mulSigmoid(g, self.ptr, out, gate);

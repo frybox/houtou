@@ -1100,7 +1100,8 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vL2norm(ctx: *anyopaque, x: Buf) void {
+    fn vL2norm(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
+        _ = g;
         _ = ctx;
         ew.bufL2norm(x);
     }
@@ -1108,7 +1109,8 @@ pub const CpuBackend = struct {
     /// Row-batched l2norm: `rows` independent rows of `n`.  Loop over the same
     /// per-row calls as `vL2norm` (see `vRmsnormRows` for why the loop shape of
     /// this slot is load-bearing on the CPU path).
-    fn vL2normRows(ctx: *anyopaque, x: Buf, n: usize) void {
+    fn vL2normRows(g: backend.Graph, ctx: *anyopaque, x: Buf, n: usize) void {
+        _ = g;
         _ = ctx;
         std.debug.assert(n != 0 and x.len % n == 0);
         var r: usize = 0;
@@ -1124,7 +1126,8 @@ pub const CpuBackend = struct {
         vMatvec(ctx, out.span(r, r), b, x);
     }
 
-    fn vScaleVec(ctx: *anyopaque, x: Buf, s: f32) void {
+    fn vScaleVec(g: backend.Graph, ctx: *anyopaque, x: Buf, s: f32) void {
+        _ = g;
         _ = ctx;
         ew.bufScaleVec(x, s);
     }
@@ -1134,13 +1137,13 @@ pub const CpuBackend = struct {
     /// scalar loop) is the point -- the test asserts the device kernel agrees
     /// with the un-fused semantics, so writing the oracle any other way would
     /// hide a drift in either of them.
-    fn vL2normQkScale(ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    fn vL2normQkScale(g: backend.Graph, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         const nb = nk * kd;
         std.debug.assert(nk != 0 and kd != 0);
         std.debug.assert(k_offset >= nb and x.len >= k_offset + nb);
-        vL2normRows(ctx, x.span(0, nb), kd);
-        vL2normRows(ctx, x.span(k_offset, nb), kd);
-        vScaleVec(ctx, x.span(0, nb), qscale);
+        vL2normRows(g, ctx, x.span(0, nb), kd);
+        vL2normRows(g, ctx, x.span(k_offset, nb), kd);
+        vScaleVec(g, ctx, x.span(0, nb), qscale);
     }
 
     fn vSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
@@ -1149,7 +1152,8 @@ pub const CpuBackend = struct {
         ew.bufSiluInPlace(x);
     }
 
-    fn vMulSilu(ctx: *anyopaque, out: Buf, gate: Buf) void {
+    fn vMulSilu(g: backend.Graph, ctx: *anyopaque, out: Buf, gate: Buf) void {
+        _ = g;
         _ = ctx;
         ew.bufMulSilu(out, gate);
     }

@@ -321,7 +321,10 @@ const Launch = if (cuda_linked) struct {
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
-    const scale_vec = Kernels.q35_launch_scale_vec;
+    fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
+    }
     const l2norm_qk_scale = Kernels.q35_launch_l2norm_qk_scale;
     /// Forwarders, not aliases.  `g` decides whether the launch is recorded,
     /// replayed or executed directly (see `graphDispatch`); the remaining
@@ -331,7 +334,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_add_resid(dst, src, n, stream);
     }
-    const copy_range = Kernels.q35_launch_copy_range;
+    fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
+    }
     const kv_quant = Kernels.q35_launch_kv_quant;
     const kv_quant_dslot = Kernels.q35_launch_kv_quant_dslot;
     const attn_chunk_dyn = Kernels.q35_launch_attn_chunk_dyn;
@@ -339,20 +345,38 @@ const Launch = if (cuda_linked) struct {
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
     const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
-    const zero_buf = Kernels.q35_launch_zero_buf;
+    fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_zero_buf(d_buf, n, stream);
+    }
     fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
     }
-    const l2norm = Kernels.q35_launch_l2norm;
+    fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_l2norm(d_x, rows, n, eps, stream);
+    }
     fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_silu(d_x, n, stream);
     }
-    const mul_silu = Kernels.q35_launch_mul_silu;
-    const mul_sigmoid = Kernels.q35_launch_mul_sigmoid;
-    const swiglu = Kernels.q35_launch_swiglu;
-    const softmax = Kernels.q35_launch_softmax;
+    fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_mul_silu(d_out, d_gate, n, stream);
+    }
+    fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_mul_sigmoid(d_out, d_gate, n, stream);
+    }
+    fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
+    }
+    fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_softmax(d_x, n, stream);
+    }
     const conv_step = Kernels.q35_launch_conv_step;
     const argmax = Kernels.q35_launch_argmax;
     const argmax_batch = Kernels.q35_launch_argmax_batch;
@@ -448,7 +472,8 @@ const Launch = if (cuda_linked) struct {
     fn tables_bytes() callconv(.c) c_ulonglong {
         return 0;
     }
-    fn scale_vec(d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, s, n, stream };
         return stubNoCudaKernels();
     }
@@ -457,7 +482,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
-    fn copy_range(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
@@ -484,7 +510,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_q, d_gate, d_src, heads, hd, stream };
         return stubNoCudaKernels();
     }
-    fn zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_buf, n, stream };
         return stubNoCudaKernels();
     }
@@ -493,7 +520,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_out, d_x, d_w, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm(d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int {
+    fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
@@ -502,19 +530,23 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
-    fn mul_silu(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_out, d_gate, n, stream };
         return stubNoCudaKernels();
     }
-    fn mul_sigmoid(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_out, d_gate, n, stream };
         return stubNoCudaKernels();
     }
-    fn swiglu(d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_gate, d_up, n, stream };
         return stubNoCudaKernels();
     }
-    fn softmax(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
@@ -5106,7 +5138,8 @@ const attn_score_arity: usize = 11;
     /// kernel is claimed to be bit-identical to that three-call sequence.
     const gdn_l2_eps: f32 = 1e-6;
 
-    fn dL2normQkScale_body(ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    fn dL2normQkScale_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        _ = g;
         const self = self_(ctx);
         const nb = nk * kd;
         if (nk != 0 and kd != 0 and k_offset >= nb and x.len >= k_offset + nb) {
@@ -5133,7 +5166,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             }
         }
-        cpu_mod.CpuBackend.vtable.l2normQkScale(@ptrCast(&self.cpu), x, nk, kd, k_offset, qscale);
+        cpu_mod.CpuBackend.vtable.l2normQkScale(.{}, @ptrCast(&self.cpu), x, nk, kd, k_offset, qscale);
     }
 
     /// `$QWEN35_L2QK_CHECK` support: copy the device input, run the fused
@@ -5153,7 +5186,7 @@ const attn_score_arity: usize = 11;
         _ = lib.Memcpy(host.ptr, px, bytes, cudart.MemcpyDeviceToHost);
         @memcpy(dev, host);
         const cpu_buf = backend.Buf{ .ptr = @ptrCast(dev.ptr), .len = total };
-        cpu_mod.CpuBackend.vtable.l2normQkScale(@ptrCast(&l2qk_cpu), cpu_buf, nk, kd, k_offset, qscale);
+        cpu_mod.CpuBackend.vtable.l2normQkScale(.{}, @ptrCast(&l2qk_cpu), cpu_buf, nk, kd, k_offset, qscale);
         // Device side: run the kernel on `px` itself, then read it back.
         _ = Launch.l2norm_qk_scale(px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
         _ = lib.DeviceSynchronize();
@@ -5174,17 +5207,17 @@ const attn_score_arity: usize = 11;
         std.debug.print("L2QKCHECK nk={d} kd={d} k_off={d} total={d} worst={e:.3} at {d} (>1e-6: {d})\n", .{ nk, kd, k_offset, total, worst, worst_i, bad });
     }
 
-    fn dScaleVec_body(ctx: *anyopaque, x: backend.Buf, s: f32) void {
+    fn dScaleVec_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.scale_vec)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
-                const rc = Launch.scale_vec(px, s, @intCast(x.len), self.launchStream());
+                const rc = Launch.scale_vec(g, px, s, @intCast(x.len), self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("scale_vec", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.scaleVec(@ptrCast(&self.cpu), x, s);
+        cpu_mod.CpuBackend.vtable.scaleVec(.{}, @ptrCast(&self.cpu), x, s);
     }
 
     fn dAddResid_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
@@ -5266,7 +5299,6 @@ const attn_score_arity: usize = 11;
     }
 
     fn dCopyRange_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         // Same contract as `addResid`: `elementwise.bufCopyRange` is a plain
         // `@memcpy`, which requires equal lengths.  Mismatch = engine bug ->
@@ -5281,7 +5313,7 @@ const attn_score_arity: usize = 11;
                 if (self.isDevBuf(src)) {
                     if (dBufPtr(src)) |ps| {
                         // Both device-resident: a pure device-to-device move.
-                        const rc = Launch.copy_range(pd, ps, @intCast(dst.len), self.launchStream());
+                        const rc = Launch.copy_range(g, pd, ps, @intCast(dst.len), self.launchStream());
                         if (rc == cudart.cudaSuccess) return;
                         self.ewLaunchFail("copy_range", rc);
                     } else return;
@@ -5297,12 +5329,11 @@ const attn_score_arity: usize = 11;
     }
 
     fn dZeroBuf_body(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.zero_buf)) return;
         if (self.cu != null) {
             if (dBufPtr(buf)) |p| {
-                const rc = Launch.zero_buf(p, @intCast(buf.len), self.launchStream());
+                const rc = Launch.zero_buf(g, p, @intCast(buf.len), self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("zero_buf", rc);
             } else return;
@@ -5462,38 +5493,38 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.rmsnormRows(.{}, @ptrCast(&self.cpu), out, x, w, rows_in, eps);
     }
 
-    fn dL2norm_body(ctx: *anyopaque, x: backend.Buf) void {
+    fn dL2norm_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 // eps 1e-6 is elementwise.zig `l2norm`'s constant; it is passed
                 // explicitly so the CPU reference stays the single definition.
-                const rc = Launch.l2norm(px, 1, @intCast(x.len), 1e-6, self.launchStream());
+                const rc = Launch.l2norm(g, px, 1, @intCast(x.len), 1e-6, self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("l2norm", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.l2norm(@ptrCast(&self.cpu), x);
+        cpu_mod.CpuBackend.vtable.l2norm(.{}, @ptrCast(&self.cpu), x);
     }
 
     /// Row-batched `l2norm`: one launch, `rows = x.len / n` blocks, each
     /// normalising its own `n`-element row with its own eps-inside-the-sum
     /// reduction.  `k_l2norm` already strides by `blockIdx.x * n`, so this is
     /// the same arithmetic as `x.len / n` single-row launches.
-    fn dL2normRows_body(ctx: *anyopaque, x: backend.Buf, n_in: usize) void {
+    fn dL2normRows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, n_in: usize) void {
         const self = self_(ctx);
         const n = n_in;
         if (n != 0 and x.len % n == 0 and self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rows: c_int = @intCast(x.len / n);
-                const rc = Launch.l2norm(px, rows, @intCast(n), 1e-6, self.launchStream());
+                const rc = Launch.l2norm(g, px, rows, @intCast(n), 1e-6, self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("l2norm_rows", rc);
             } else return;
         }
         // No batching possible (unknown row width): the whole-slice reading is
         // the single-row one, which is what `dL2norm_body` means.
-        cpu_mod.CpuBackend.vtable.l2normRows(@ptrCast(&self.cpu), x, n);
+        cpu_mod.CpuBackend.vtable.l2normRows(.{}, @ptrCast(&self.cpu), x, n);
     }
 
     fn dSiluInPlace_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
@@ -5509,28 +5540,27 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.siluInPlace(.{}, @ptrCast(&self.cpu), x);
     }
 
-    fn dMulSilu_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSilu_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.mul_silu)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
-            cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
+            cpu_mod.CpuBackend.vtable.mulSilu(.{}, @ptrCast(&self.cpu), out, gate);
             return;
         }
         if (self.cu != null) {
             if (dBufPtr(out)) |po| {
                 if (dBufPtr(gate)) |pg| {
-                    const rc = Launch.mul_silu(po, pg, @intCast(out.len), self.launchStream());
+                    const rc = Launch.mul_silu(g, po, pg, @intCast(out.len), self.launchStream());
                     if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("mul_silu", rc);
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
+        cpu_mod.CpuBackend.vtable.mulSilu(.{}, @ptrCast(&self.cpu), out, gate);
     }
 
     fn dMulSigmoid_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.mul_sigmoid)) return;
         if (gate.len != out.len) {
@@ -5541,7 +5571,7 @@ const attn_score_arity: usize = 11;
         if (self.cu != null) {
             if (dBufPtr(out)) |po| {
                 if (dBufPtr(gate)) |pg| {
-                    const rc = Launch.mul_sigmoid(po, pg, @intCast(out.len), self.launchStream());
+                    const rc = Launch.mul_sigmoid(g, po, pg, @intCast(out.len), self.launchStream());
                     if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("mul_sigmoid", rc);
                 } else return;
@@ -5551,7 +5581,6 @@ const attn_score_arity: usize = 11;
     }
 
     fn dSwiglu_body(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.swiglu)) return;
         if (up.len != gate.len) {
@@ -5562,7 +5591,7 @@ const attn_score_arity: usize = 11;
         if (self.cu != null) {
             if (dBufPtr(gate)) |pg| {
                 if (dBufPtr(up)) |pu| {
-                    const rc = Launch.swiglu(pg, pu, @intCast(gate.len), self.launchStream());
+                    const rc = Launch.swiglu(g, pg, pu, @intCast(gate.len), self.launchStream());
                     if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("swiglu", rc);
                 } else return;
@@ -5572,12 +5601,11 @@ const attn_score_arity: usize = 11;
     }
 
     fn dSoftmax_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.softmax)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
-                const rc = Launch.softmax(px, @intCast(x.len), self.launchStream());
+                const rc = Launch.softmax(g, px, @intCast(x.len), self.launchStream());
                 if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("softmax", rc);
             } else return;
@@ -7844,17 +7872,17 @@ const attn_score_arity: usize = 11;
     /// The GDN q/k normalisation as one launch (see `backend.Exec`).
     /// Not a timed slot of its own: it replaces `l2norm_rows` x2 + `scale_vec`,
     /// whose slots it would otherwise have to charge in fractions.
-    fn dL2normQkScale(ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
-        dL2normQkScale_body(ctx, x, nk, kd, k_offset, qscale);
+    fn dL2normQkScale(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        dL2normQkScale_body(g, ctx, x, nk, kd, k_offset, qscale);
     }
 
     /// The `scaleVec` slot, timed (`$QWEN35_PROF`).
-    fn dScaleVec(ctx: *anyopaque, x: backend.Buf, s: f32) void {
+    fn dScaleVec(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.scale_vec, t0);
         if (self.ablated(.scale_vec)) return ;
-        dScaleVec_body(ctx, x, s);
+        dScaleVec_body(g, ctx, x, s);
     }
 
     /// The `addResid` slot, timed (`$QWEN35_PROF`).
@@ -8012,20 +8040,20 @@ const attn_score_arity: usize = 11;
     }
 
     /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
-    fn dL2norm(ctx: *anyopaque, x: backend.Buf) void {
+    fn dL2norm(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
         if (self.ablated(.l2norm)) return;
-        dL2norm_body(ctx, x);
+        dL2norm_body(g, ctx, x);
     }
 
     /// Row-batched twin of `dL2norm`; charged to the `l2norm` slot.
-    fn dL2normRows(ctx: *anyopaque, x: backend.Buf, n: usize) void {
+    fn dL2normRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, n: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
-        dL2normRows_body(ctx, x, n);
+        dL2normRows_body(g, ctx, x, n);
     }
 
     /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
@@ -8038,12 +8066,12 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `mulSilu` slot, timed (`$QWEN35_PROF`).
-    fn dMulSilu(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSilu(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_silu, t0);
         if (self.ablated(.mul_silu)) return ;
-        dMulSilu_body(ctx, out, gate);
+        dMulSilu_body(g, ctx, out, gate);
     }
 
     /// The `mulSigmoid` slot, timed (`$QWEN35_PROF`).
