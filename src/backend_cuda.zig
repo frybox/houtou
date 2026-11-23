@@ -401,7 +401,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_softmax(d_x, n, stream);
     }
-    const conv_step = Kernels.q35_launch_conv_step;
+    fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
+    }
     const argmax = Kernels.q35_launch_argmax;
     const argmax_batch = Kernels.q35_launch_argmax_batch;
     const argmax_conf = Kernels.q35_launch_argmax_conf;
@@ -438,20 +441,44 @@ const Launch = if (cuda_linked) struct {
     const set_int1 = Kernels.q35_launch_set_int1;
     const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
-    const gdn_step = Kernels.q35_launch_gdn_step;
-    const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
-    const gdn_step_rows_chunk = Kernels.q35_launch_gdn_step_rows_chunk;
-    const gdn_step_rows_snap = Kernels.q35_launch_gdn_step_rows_snap;
-    const gdn_step_wy = Kernels.q35_launch_gdn_step_wy;
-    const gdn_gamma = Kernels.q35_launch_gdn_gamma;
+    fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_step(d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream);
+    }
+    fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_step_rows(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream);
+    }
+    fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_step_rows_chunk(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
+    }
+    fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_step_rows_snap(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream);
+    }
+    fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_step_wy(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
+    }
+    fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_gamma(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream);
+    }
     // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
     // the same order) so `Launch` is the only seam between a launcher and its
     // no-CUDA fallback: the `dGdnPrefillCore` call sites used to name
     // `Kernels.q35_launch_*` directly, which made those 4 stubs dead code and
     // broke `zig build` (without -Dcuda) at LINK time on an undefined symbol -- a
     // class of failure the type errors above cannot catch.
-    const conv_step_rows = Kernels.q35_launch_conv_step_rows;
-    const gdn_gamma_rows = Kernels.q35_launch_gdn_gamma_rows;
+    fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_conv_step_rows(d_conv, d_y, d_wconv, n, tokens, y_stride, stream);
+    }
+    fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_gdn_gamma_rows(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream);
+    }
     const l2norm_strided = Kernels.q35_launch_l2norm_strided;
     const scale_vec_strided = Kernels.q35_launch_scale_vec_strided;
     fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
@@ -615,7 +642,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
-    fn conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_conv, d_y, d_wconv, n, stream };
         return stubNoCudaKernels();
     }
@@ -707,37 +735,45 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_ctl, pos, base_bits, kv_slot, attn_slot, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows_snap(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_wy(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
     // Prefill-only twins, now reached through `Launch` like every other launcher
     // (see the note in the CUDA branch: they used to bypass the seam).
-    fn conv_step_rows(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_conv, d_y, d_wconv, n, tokens, y_stride, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_gamma_rows(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream };
         return stubNoCudaKernels();
     }
@@ -6149,7 +6185,6 @@ const attn_score_arity: usize = 11;
     fn dGdnStep_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_step)) return;
         // vd != 128 is the CPU `gdnFused`'s slow path (four separate kernels);
@@ -6166,7 +6201,7 @@ const attn_score_arity: usize = 11;
                             if (dBufPtr(km)) |pkm| {
                                 if (dBufPtr(delta)) |pdelta| {
                                     if (dBufPtr(out)) |pout| {
-                                        const rc = Launch.gdn_step(pstate, pk, pv, pq, pkm, pdelta, pout, gamma, beta, @intCast(vd), self.launchStream());
+                                        const rc = Launch.gdn_step(g, pstate, pk, pv, pq, pkm, pdelta, pout, gamma, beta, @intCast(vd), self.launchStream());
                                         if (rc == cudart.cudaSuccess) return;
                                         self.ewLaunchFail("gdn_step", rc);
                                     } else return;
@@ -6194,7 +6229,6 @@ const attn_score_arity: usize = 11;
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_step_rows)) return;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and
@@ -6223,7 +6257,7 @@ const attn_score_arity: usize = 11;
                                         // layer 0's coefficients for the run.
                                         if (dBufPtr(gamma)) |pgamma| {
                                             if (dBufPtr(beta)) |pbeta| {
-                                                const rc = Launch.gdn_step_rows(
+                                                const rc = Launch.gdn_step_rows(g, 
                                                     pstate, @intCast(kd * vd),
                                                     pk, @intCast(kd),
                                                     pv, @intCast(vd),
@@ -6251,7 +6285,6 @@ const attn_score_arity: usize = 11;
 
     fn dGdnGamma_body(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_gamma)) return;
         // Every operand here is a backend region.  The two weight rows
@@ -6267,7 +6300,7 @@ const attn_score_arity: usize = 11;
                     if (dBufPtr(gamma)) |pg| {
                         if (dBufPtr(ssm_a)) |sa| {
                             if (dBufPtr(dt_bias)) |db| {
-                                const rc = Launch.gdn_gamma(pa, pb, sa, db, pg, @intCast(nv), self.launchStream());
+                                const rc = Launch.gdn_gamma(g, pa, pb, sa, db, pg, @intCast(nv), self.launchStream());
                                 if (rc == cudart.cudaSuccess) return;
                                 self.ewLaunchFail("gdn_gamma", rc);
                             } else return;
@@ -6298,7 +6331,6 @@ const attn_score_arity: usize = 11;
                             conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
                             ab_stride: usize, gamma_stride: usize, kq_dim: usize,
                             nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void {
-        _ = g;
         const self = self_(ctx);
         const stream = self.launchStream();
         const nk_reps = if (nk != 0) nv / nk else 0;
@@ -6323,7 +6355,7 @@ const attn_score_arity: usize = 11;
                                 if (dBufPtr(dt_bias)) |db| {
                                     if (dBufPtr(gamma)) |pg| {
                                         // 1. conv + silu for every token, one shared history.
-                                        var rc = Launch.conv_step_rows(
+                                        var rc = Launch.conv_step_rows(g, 
                                             pc, pq, pw, @intCast(conv_dim), @intCast(tokens),
                                             @intCast(conv_dim), stream);
                                         if (rc != cudart.cudaSuccess) {
@@ -6331,7 +6363,7 @@ const attn_score_arity: usize = 11;
                                             return;
                                         }
                                         // 2. beta (in place) + gamma, one row per token.
-                                        rc = Launch.gdn_gamma_rows(
+                                        rc = Launch.gdn_gamma_rows(g, 
                                             pab + ab_a_offset, pab + ab_b_offset, sa, db, pg,
                                             @intCast(nv), @intCast(tokens),
                                             @intCast(ab_stride), @intCast(ab_stride),
@@ -6755,7 +6787,6 @@ const attn_score_arity: usize = 11;
     }
 
     fn dConvStep_body(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
-        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.conv_step)) return;
         // `conv` is the GDN sliding window and is BOTH read and written (the
@@ -6774,7 +6805,7 @@ const attn_score_arity: usize = 11;
             if (dBufPtr(conv)) |pc| {
                 if (dBufPtr(y)) |py| {
                     if (dBufPtr(wconv)) |pw| {
-                        const rc = Launch.conv_step(pc, py, pw, @intCast(y.len), self.launchStream());
+                        const rc = Launch.conv_step(g, pc, py, pw, @intCast(y.len), self.launchStream());
                         if (rc == cudart.cudaSuccess) return;
                         self.ewLaunchFail("conv_step", rc);
                     } else return;
@@ -8233,7 +8264,6 @@ const attn_score_arity: usize = 11;
                               gamma: backend.Buf, beta: backend.Buf,
                               heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
                               k_stride: usize, v_stride: usize, q_stride: usize) void {
-        _ = g;
         const self = self_(ctx);
         // Same shape gate as the per-row body, plus the strides the chunk form
         // needs.  The last row must be fully inside each buffer, so the length
@@ -8272,7 +8302,7 @@ const attn_score_arity: usize = 11;
                                                 // against).
                                                 const use_wy = gdnWyEnabled();
                                                 const rc = if (use_wy)
-                                                    Launch.gdn_step_wy(
+                                                    Launch.gdn_step_wy(g, 
                                                         pstate, @intCast(kd * vd),
                                                         pk, @intCast(k_stride),
                                                         pv, @intCast(v_stride),
@@ -8287,7 +8317,7 @@ const attn_score_arity: usize = 11;
                                                         self.launchStream(),
                                                     )
                                                 else
-                                                    Launch.gdn_step_rows_chunk(
+                                                    Launch.gdn_step_rows_chunk(g, 
                                                         pstate, @intCast(kd * vd),
                                                         pk, @intCast(k_stride),
                                                         pv, @intCast(v_stride),
@@ -8309,7 +8339,7 @@ const attn_score_arity: usize = 11;
                                                     if (rc == cudart.cudaSuccess) return;
                                                     self.ewLaunchFail("gdn_step_rows_chunk", rc);
                                                 }
-                                                const rc2 = Launch.gdn_step_rows_chunk(
+                                                const rc2 = Launch.gdn_step_rows_chunk(g, 
                                                     pstate, @intCast(kd * vd),
                                                     pk, @intCast(k_stride),
                                                     pv, @intCast(v_stride),
@@ -8353,7 +8383,6 @@ const attn_score_arity: usize = 11;
                              gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
                              heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
                              k_stride: usize, v_stride: usize, q_stride: usize) void {
-        _ = g;
         const self = self_(ctx);
         const per = heads * kd * vd;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and rows != 0 and
@@ -8373,7 +8402,7 @@ const attn_score_arity: usize = 11;
                                         if (dBufPtr(gamma)) |pgamma| {
                                             if (dBufPtr(beta)) |pbeta| {
                                                 if (dBufPtr(snap)) |psnap| {
-                                                    const rc = Launch.gdn_step_rows_snap(
+                                                    const rc = Launch.gdn_step_rows_snap(g, 
                                                         pstate, @intCast(kd * vd),
                                                         pk, @intCast(k_stride),
                                                         pv, @intCast(v_stride),
