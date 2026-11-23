@@ -547,7 +547,7 @@ pub const Draft = struct {
                 self.exec.matvec(vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
                 self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
                 // Context rows sit at absolute positions pos0..pos0+rows-1.
-                self.exec.rope64Rows(krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
+                self.exec.rope64Rows(self.graph, krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
             }
             cache.ctx_len = @intCast(rows);
             cache.len = 0;
@@ -670,8 +670,8 @@ pub const Draft = struct {
         self.exec.rmsnormRows(self.graph, self.q.span(0, q_dim), self.q.span(0, q_dim), l.attn_q_norm, c.heads, c.rms_eps);
         self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
 
-        self.exec.rope64Rows(self.q.span(0, q_dim), pos, c.rope_freq_base, 1, c.heads, c.hd);
-        self.exec.rope64Rows(krow, pos, c.rope_freq_base, 1, c.kv_heads, c.hd);
+        self.exec.rope64Rows(self.graph, self.q.span(0, q_dim), pos, c.rope_freq_base, 1, c.heads, c.hd);
+        self.exec.rope64Rows(self.graph, krow, pos, c.rope_freq_base, 1, c.kv_heads, c.hd);
         if (self.hostDebug()) {
             self.emit("q", il, self.dump_row, self.q.slice()[0..q_dim]);
             self.emit("k", il, self.dump_row, krow.slice());

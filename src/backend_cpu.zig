@@ -1054,7 +1054,8 @@ pub const CpuBackend = struct {
         for (0..rows) |r| ew.bufRmsnorm(out.span(r * n, n), x.span(r * n, n), w, eps);
     }
 
-    fn vRope64(ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
+    fn vRope64(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
+        _ = g;
         _ = ctx;
         ew.bufRope64(x, pos, base);
     }
@@ -1074,7 +1075,8 @@ pub const CpuBackend = struct {
     ///
     /// Kept as the per-head loop (rather than one vectorised pass) because it is
     /// the reference the device kernel is checked against.
-    fn vRope64Rows(ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
+    fn vRope64Rows(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
+        _ = g;
         _ = ctx;
         const row_len = heads * hd;
         std.debug.assert(row_len != 0 and x.len % row_len == 0 and x.len / row_len == rows_in);
@@ -1088,7 +1090,8 @@ pub const CpuBackend = struct {
 
     /// RoPE over `rotary_dim` of each head.  `rotary_dim == 64` takes the same
     /// per-head call as `vRope64Rows`, so the two are bit-identical there.
-    fn vRopeRows(ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn vRopeRows(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        _ = g;
         _ = ctx;
         const row_len = heads * hd;
         std.debug.assert(row_len != 0 and x.len % row_len == 0 and x.len / row_len == rows_in);

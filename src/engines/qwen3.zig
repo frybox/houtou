@@ -633,8 +633,8 @@ pub const Engine = struct {
         // Qwen3.5 uses), then RoPE over the FULL head.
         self.exec.rmsnormRows(self.graph, q, q, lw.attn_q_norm, heads, c.rms_eps);
         self.exec.rmsnormRows(self.graph, self.k.span(0, kv_dim), self.k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
-        self.exec.ropeRows(q, pos, c.rope_freq_base, 1, heads, hd, c.rotary_dim);
-        self.exec.ropeRows(self.k.span(0, kv_dim), pos, c.rope_freq_base, 1, kv_heads, hd, c.rotary_dim);
+        self.exec.ropeRows(self.graph, q, pos, c.rope_freq_base, 1, heads, hd, c.rotary_dim);
+        self.exec.ropeRows(self.graph, self.k.span(0, kv_dim), pos, c.rope_freq_base, 1, kv_heads, hd, c.rotary_dim);
 
         const cache = &self.kv[li];
         std.debug.assert(cache.len < self.max_ctx);
@@ -780,8 +780,8 @@ pub const Engine = struct {
             // and normalising after would renormalise the rotation away.
             self.exec.rmsnormRows(self.graph, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
             self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
-            self.exec.ropeRows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
-            self.exec.ropeRows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
+            self.exec.ropeRows(self.graph, self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
+            self.exec.ropeRows(self.graph, self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
 
             // KV cache: the chunk's `k` rows land contiguously at `slot0`, so
             // this is ONE strided append per tensor instead of `k` of them.

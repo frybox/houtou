@@ -2206,8 +2206,8 @@ pub const Engine = struct {
             lw.attn_q_norm, k * heads, c.rms_eps);
         self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
             lw.attn_k_norm, k * kv_heads, c.rms_eps);
-        self.exec.rope64Rows(self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
-        self.exec.rope64Rows(self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
+        self.exec.rope64Rows(self.graph, self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
+        self.exec.rope64Rows(self.graph, self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
         self.exec.kvAppend(self.graph, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
         self.exec.kvAppend(self.graph, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
         cache.len += @intCast(k);
@@ -2447,8 +2447,8 @@ pub const Engine = struct {
         // 40 + 8 = 48 rope launches per full-attn layer, 768 per token, and
         // `k_rope64_dpos` was 12.84 ms / 6188 calls over 20 tokens -- 2.07 us
         // per launch for 64 cos+sin, and 27.9% of all non-matvec kernel time.
-        self.exec.rope64Rows(q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
-        self.exec.rope64Rows(self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
+        self.exec.rope64Rows(self.graph, q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
+        self.exec.rope64Rows(self.graph, self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
 
         // KV cache: quantize this token's rows into the cache (the backend
         // strides its own layout; `slot` is the per-token row the decode

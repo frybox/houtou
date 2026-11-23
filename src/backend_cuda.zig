@@ -412,12 +412,27 @@ const Launch = if (cuda_linked) struct {
     const gdn_gamma_rows = Kernels.q35_launch_gdn_gamma_rows;
     const l2norm_strided = Kernels.q35_launch_l2norm_strided;
     const scale_vec_strided = Kernels.q35_launch_scale_vec_strided;
-    const rope64 = Kernels.q35_launch_rope64;
-    const rope64_dpos = Kernels.q35_launch_rope64_dpos;
+    fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rope64(d_x, heads, hd, pos, base, stream);
+    }
+    fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rope64_dpos(d_x, heads, hd, d_ctl, stream);
+    }
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
-    const rope64_rows = Kernels.q35_launch_rope64_rows;
-    const rope_rows_dim = Kernels.q35_launch_rope_rows_dim;
-    const rope64_rows_dpos = Kernels.q35_launch_rope64_rows_dpos;
+    fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rope64_rows(d_x, rows, heads, hd, pos0, base, stream);
+    }
+    fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rope_rows_dim(d_x, rows, heads, hd, pos0, base, rotary_dim, stream);
+    }
+    fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_rope64_rows_dpos(d_x, rows, heads, hd, d_ctl, stream);
+    }
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
@@ -678,28 +693,33 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, offset, s, n, tokens, stride, stream };
         return stubNoCudaKernels();
     }
-    fn rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
+    fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, heads, hd, pos, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_x, heads, hd, d_dyn, stream };
+    fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        _ = g;
+        _ = .{ d_x, heads, hd, d_ctl, stream };
         return stubNoCudaKernels();
     }
     fn rope64_setenv(d_dyn: ?*anyopaque, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_dyn, pos, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
+    fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, rows, heads, hd, pos0, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope_rows_dim(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_x, rows, heads, hd, pos0, base, rotary_dim, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
-        _ = .{ d_x, rows, heads, hd, d_dyn, stream };
+    fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        _ = g;
+        _ = .{ d_x, rows, heads, hd, d_ctl, stream };
         return stubNoCudaKernels();
     }
     fn l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int {
@@ -6531,7 +6551,7 @@ const attn_score_arity: usize = 11;
     /// token would otherwise publish 448 times).  Returns true if it launched the
     /// writer, i.e. if the caller must not assume the values are already there.
 
-    fn dRope64_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+    fn dRope64_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.rope64)) return;
         const max_head: usize = 256;
@@ -6541,7 +6561,7 @@ const attn_score_arity: usize = 11;
             // Same length guard as the rest: rope is a per-head call (hd = 128
             // or 64 in every Qwen3.5 variant), so anything larger means the
             // engine's shape changed and the CPU reference must own it.
-            cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), x, pos, base);
+            cpu_mod.CpuBackend.vtable.rope64(.{}, @ptrCast(&self.cpu), x, pos, base);
             return;
         }
         if (ropeOnDevice()) {
@@ -6587,7 +6607,7 @@ const attn_score_arity: usize = 11;
                         .attn_slot = self.ctl_host.attn_slot,
                         .rows = self.ctl_host.rows,
                     }, self.launchStream(), false);
-                    const rc = Launch.rope64_dpos(px, 1, @intCast(n), ctl_dev, self.launchStream());
+                    const rc = Launch.rope64_dpos(g, px, 1, @intCast(n), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
                         self.stat_rope_devices += 1;
                         if (self.capturing()) self.graphNoteRope(pos, base);
@@ -6596,7 +6616,7 @@ const attn_score_arity: usize = 11;
                     if (self.capturing()) self.graphAbandon("rope64_dpos launch failed");
                     self.ewLaunchFail("rope64_dpos", rc);
                 }
-                const rc = Launch.rope64(px, 1, @intCast(n), @bitCast(pos), base, self.launchStream());
+                const rc = Launch.rope64(g, px, 1, @intCast(n), @bitCast(pos), base, self.launchStream());
                 if (rc == cudart.cudaSuccess) {
                     self.stat_rope_devices += 1;
                     if (self.capturing()) self.graphNoteRope(pos, base);
@@ -6611,7 +6631,7 @@ const attn_score_arity: usize = 11;
             // trip it actually was.
         }
         CudaBackend.dCopyToHost(.{}, @ptrCast(self), host[0..n], x);
-        cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), backend.Buf.wrap(host[0..n]), pos, base);
+        cpu_mod.CpuBackend.vtable.rope64(.{}, @ptrCast(&self.cpu), backend.Buf.wrap(host[0..n]), pos, base);
         CudaBackend.dCopyFromHost(.{}, @ptrCast(self), x, host[0..n]);
         // One H2D + one D2H per rotated head, per position.  Counted so the
         // report can state this remainder's exact share instead of guessing.
@@ -6628,7 +6648,7 @@ const attn_score_arity: usize = 11;
     /// NEVER used during a decode capture: this slot would add a node the graph
     /// cannot retarget (it matches `q35_func_rope64` node-by-node), so it bails
     /// out to the per-row loop when a capture is live.  Prefill does not capture.
-    fn dRope64Rows_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+    fn dRope64Rows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.rope64_rows)) return;
         const row_len = heads_in * hd_in;
@@ -6636,7 +6656,7 @@ const attn_score_arity: usize = 11;
             heads_in == 0 or hd_in < 64 or rows_in == 0 or
             row_len == 0 or x.len != rows_in * row_len or self.cu == null)
         {
-            cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+            cpu_mod.CpuBackend.vtable.rope64Rows(.{}, @ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
             return;
         }
         // Under a capture this must be the DEVICE-position variant: the graph
@@ -6659,7 +6679,7 @@ const attn_score_arity: usize = 11;
                     .rows = self.ctl_host.rows,
                 }, self.launchStream(), false);
                 if (dBufPtr(x)) |px| {
-                    const rc = Launch.rope64_rows_dpos(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), ctl_dev, self.launchStream());
+                    const rc = Launch.rope64_rows_dpos(g, px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
                         if (self.capturing()) self.graphNoteRope(pos, base);
                         return;
@@ -6668,15 +6688,15 @@ const attn_score_arity: usize = 11;
                     self.ewLaunchFail("rope64_rows_dpos", rc);
                 }
             }
-            cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+            cpu_mod.CpuBackend.vtable.rope64Rows(.{}, @ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
             return;
         }
         if (dBufPtr(x)) |px| {
-            const rc = Launch.rope64_rows(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), @bitCast(pos), base, self.launchStream());
+            const rc = Launch.rope64_rows(g, px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), @bitCast(pos), base, self.launchStream());
             if (rc == cudart.cudaSuccess) return;
             self.ewLaunchFail("rope64_rows", rc);
         }
-        cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+        cpu_mod.CpuBackend.vtable.rope64Rows(.{}, @ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
     }
 
     fn dConvStep_body(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
@@ -8515,12 +8535,12 @@ const attn_score_arity: usize = 11;
     }
 
     /// `rope64(slot)`, timed (`$QWEN35_PROF`).
-    fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+    fn dRope64(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64, t0);
         if (self.ablated(.rope64)) return;
-        dRope64_body(ctx, x, pos, base);
+        dRope64_body(g, ctx, x, pos, base);
     }
 
     /// The prefill row-batched `rope64` slot, timed (`$QWEN35_PROF`).
@@ -8557,27 +8577,27 @@ const attn_score_arity: usize = 11;
     /// live" line and no abandon message with or without this kernel).  It is
     /// kept because that is a property of `graphBegin` for that engine, not of
     /// this op, and it must not become a silent corruption if it changes.
-    fn dRopeRows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn dRopeRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64_rows, t0);
         if (self.ablated(.rope64_rows)) return;
-        dRopeRows_body(ctx, x, pos, base, rows, heads, hd, rotary_dim);
+        dRopeRows_body(g, ctx, x, pos, base, rows, heads, hd, rotary_dim);
     }
 
-    fn dRopeRows_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn dRopeRows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         const self = self_(ctx);
         const row_len = heads * hd;
         if (rotary_dim == 64) {
             // Same width as `rope64Rows`: delegate so the 3.5/3.8 path keeps
             // exactly one implementation (and one set of graph-identity rules).
-            return dRope64Rows_body(ctx, x, pos, base, rows, heads, hd);
+            return dRope64Rows_body(g, ctx, x, pos, base, rows, heads, hd);
         }
         if (!ropeOnDevice() or rows == 0 or heads == 0 or
             rotary_dim < 2 or rotary_dim > hd or
             row_len == 0 or x.len != rows * row_len or self.cu == null)
         {
-            cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+            cpu_mod.CpuBackend.vtable.ropeRows(.{}, @ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
             return;
         }
         // A capture would replay this node with the FIRST token's arguments and
@@ -8589,20 +8609,20 @@ const attn_score_arity: usize = 11;
             self.graphAbandon("ropeRows (variable rotary_dim) is not capture-safe");
         }
         if (dBufPtr(x)) |px| {
-            const rc = Launch.rope_rows_dim(px, @intCast(rows), @intCast(heads), @intCast(hd), @bitCast(pos), base, @intCast(rotary_dim), self.launchStream());
+            const rc = Launch.rope_rows_dim(g, px, @intCast(rows), @intCast(heads), @intCast(hd), @bitCast(pos), base, @intCast(rotary_dim), self.launchStream());
             if (rc == cudart.cudaSuccess) return;
             self.ewLaunchFail("rope_rows_dim", rc);
         }
-        cpu_mod.CpuBackend.vtable.ropeRows(@ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
+        cpu_mod.CpuBackend.vtable.ropeRows(.{}, @ptrCast(&self.cpu), x, pos, base, rows, heads, hd, rotary_dim);
     }
 
 
-    fn dRope64Rows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+    fn dRope64Rows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64_rows, t0);
         if (self.ablated(.rope64_rows)) return;
-        dRope64Rows_body(ctx, x, pos, base, rows_in, heads_in, hd_in);
+        dRope64Rows_body(g, ctx, x, pos, base, rows_in, heads_in, hd_in);
     }
 
     /// The `convStep` slot, timed (`$QWEN35_PROF`).

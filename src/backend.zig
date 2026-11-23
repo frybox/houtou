@@ -334,7 +334,7 @@ pub const Exec = struct {
         /// inside its own sum, so the rows are fully independent.
         l2normRows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, n: usize) void,
         /// Rotate the 64-dim rotary block of a row in place (cross-half pairing).
-        rope64: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
+        rope64: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
         /// `rows` consecutive `rope64` calls on `x.span(r * heads * hd, heads * hd)`
         /// with `pos + r`, i.e. row r is prefill token `pos + r`.  `heads` is the
         /// head count PER ROW, so `x.len == rows * heads * hd`.  Same
@@ -344,7 +344,7 @@ pub const Exec = struct {
         /// `rope64` calls because the decode CUDA graph identifies and retargets
         /// those nodes by host-stub address (see `q35_func_rope64`).  Prefill
         /// never captures a graph, so the batch reading is free there.
-        rope64Rows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
+        rope64Rows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
         /// RoPE over `rotary_dim` of each head, for architectures that are not
         /// Qwen3.5/3.8.  Qwen3 rotates the WHOLE head (`rotary_dim == hd`),
         /// so `rope64Rows` cannot express it.
@@ -353,7 +353,7 @@ pub const Exec = struct {
         /// identifies and retargets by host-stub address for Qwen3.5, and adding
         /// a parameter there would invalidate every captured node.  Backends
         /// that do not implement this may fall back to their CPU twin.
-        ropeRows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
+        ropeRows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
         l2norm: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
         /// x *= s
@@ -712,18 +712,18 @@ pub const Exec = struct {
     pub fn rmsnormRows(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
         self.vtable.rmsnormRows(g, self.ptr, out, x, w, rows, eps);
     }
-    pub fn rope64(self: Exec, x: Buf, pos: u32, base: f32) void {
-        self.vtable.rope64(self.ptr, x, pos, base);
+    pub fn rope64(self: Exec, g: Graph, x: Buf, pos: u32, base: f32) void {
+        self.vtable.rope64(g, self.ptr, x, pos, base);
     }
     /// See `VTable.rope64Rows`: `x` is `rows * heads * hd` long, row r (prefill
     /// token `pos + r`) is `heads * hd` floats.
-    pub fn rope64Rows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
-        self.vtable.rope64Rows(self.ptr, x, pos, base, rows, heads, hd);
+    pub fn rope64Rows(self: Exec, g: Graph, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
+        self.vtable.rope64Rows(g, self.ptr, x, pos, base, rows, heads, hd);
     }
     /// RoPE over `rotary_dim` of each head (`rotary_dim == 64` reproduces
     /// `rope64Rows` exactly).
-    pub fn ropeRows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
-        self.vtable.ropeRows(self.ptr, x, pos, base, rows, heads, hd, rotary_dim);
+    pub fn ropeRows(self: Exec, g: Graph, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+        self.vtable.ropeRows(g, self.ptr, x, pos, base, rows, heads, hd, rotary_dim);
     }
     pub fn l2norm(self: Exec, g: Graph, x: Buf) void {
         self.vtable.l2norm(g, self.ptr, x);
