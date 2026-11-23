@@ -35,6 +35,7 @@
 #include "vecdotq.cuh"
 #include "mmq-smem.cuh"
 #include "api.h"
+#include "xd.h"  // XD_CTL_*: the per-step control block
 
 // ---------------------------------------------------------------------------
 // device kernels: activation quantizers
@@ -783,7 +784,8 @@ extern "C" __global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
     if (b >= total) return;
     const int row = b / nblocks_per_row;
     const int bi = b - row * nblocks_per_row;
-    const int slot = *d_slot + row;
+    // `d_slot` 指向每步控制块（xd.h），读到的是本步的 KV 起始行。
+    const int slot = d_slot[XD_CTL_KV_SLOT] + row;
     const float *xb = x + (size_t)b * Q35_QK8_0;
     unsigned char *ob = out_base + (size_t)slot * row_bytes + (size_t)bi * 64;
     // 块内算术逐字照抄 `q35_k_kv_quant` 的 kind==0 分支。

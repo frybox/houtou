@@ -684,7 +684,7 @@ pub const Engine = struct {
         const c = &self.cfg;
         const hidden: usize = c.hidden;
         self.embedTo(token, self.x.span(0, hidden));
-        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .slot = pos, .rows = 1 });
+        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .kv_slot = pos, .attn_slot = pos, .rows = 1 });
         for (self.layers, 0..) |*lw, li| self.layerForward(lw, li, pos);
         self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {

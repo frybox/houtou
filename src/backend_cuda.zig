@@ -199,6 +199,7 @@ const Kernels = struct {
     extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Write one int32 from a 1-thread kernel (graph-safe per-token scalar).
     extern fn q35_launch_set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_xd_ctl_publish(d_ctl: ?*anyopaque, pos: c_int, base_bits: c_int, kv_slot: c_int, attn_slot: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
@@ -344,6 +345,7 @@ const Launch = if (cuda_linked) struct {
     const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
     const attn_decode_split_dyn = Kernels.q35_launch_attn_decode_split_dyn;
     const set_int1 = Kernels.q35_launch_set_int1;
+    const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_step_rows_chunk = Kernels.q35_launch_gdn_step_rows_chunk;
@@ -563,6 +565,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d, v, stream };
+        return stubNoCudaKernels();
+    }
+    fn xd_ctl_publish(d_ctl: ?*anyopaque, pos: c_int, base_bits: c_int, kv_slot: c_int, attn_slot: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_ctl, pos, base_bits, kv_slot, attn_slot, rows, stream };
         return stubNoCudaKernels();
     }
     fn gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -1508,6 +1514,18 @@ pub const CudaBackend = struct {
     /// 设备端的一个 int：当前 KV 写入的起始行号。`q35_launch_kv_quant_dslot`
     /// 从它读行号，所以 graph 捕获下来的指针在重放时仍然有效（每 token 只需
     /// 更新这一个 int）。非 graph 路径不使用它。
+    /// The device control block (see `ensureCtl`).  ONE per backend, shared by
+    /// every graph: the blocks carry per-STEP values, so two graphs never need
+    /// them at the same time.
+    ctl_dev: ?*anyopaque = null,
+    /// Host mirror of the device control block (`backend.GraphCtl`), written by
+    /// `publishCtl` once per step.  Kept so a step that would publish the SAME
+    /// values (e.g. `rope64` per head) does not launch the writer again.
+    ctl_host: backend.GraphCtl = .{},
+    /// True once `ctl_host` matches what is in the device block.
+    ctl_valid: bool = false,
+
+
     d_kv_slot: ?*anyopaque = null,
     /// Host 镜像，用来判断是否需要重新 H2D（只有值变了才写）。
     d_kv_slot_host: c_int = -1,
@@ -1812,6 +1830,66 @@ pub const CudaBackend = struct {
     /// they are link-time symbols, so their presence was settled by the build.
     /// False (e.g. `--backend cuda` on a host without a GPU) is a hard error
     /// reported from `allocScratch`, which is why no slot needs a CPU fallback.
+    /// The per-step control block (plan §1.5, `cell`).  ONE device buffer holds
+    /// every scalar a captured kernel needs to read at execution time:
+    ///
+    ///   [XD_CTL_POS]        rope phase base
+    ///   [XD_CTL_BASE_BITS]  bit pattern of the rope theta
+    ///   [XD_CTL_KV_SLOT]    first KV row this step writes
+    ///   [XD_CTL_ATTN_SLOT]  last KV row full attention must cover
+    ///   [XD_CTL_ROWS]       rows this step produces
+    ///
+    /// Allocated lazily; null only if the allocation failed, in which case every
+    /// consumer falls back to its per-scalar (capture-unsafe) path.
+    fn ensureCtl(self: *CudaBackend) ?*anyopaque {
+        if (self.ctl_dev) |p| return p;
+        const cu = &(self.cu orelse return null);
+        var p: ?*anyopaque = null;
+        // cudaMalloc inside a capture is illegal, so a capture must not get here.
+        // Every caller runs at `stepBegin`/`graphBegin`, i.e. before any capture.
+        const rc = cu.lib.Malloc(&p, @sizeOf(backend.GraphCtl));
+        if (rc != cudart.cudaSuccess or p == null) {
+            self.ewLaunchFail("ctl alloc", rc);
+            return null;
+        }
+        self.ctl_dev = p;
+        self.ctl_valid = false;
+        return p;
+    }
+
+    /// Publish the control block for THIS step on `stream` and remember it.
+    ///
+    /// Idempotent per distinct value set: `rope64` is called once per head and
+    /// publishes the same `{pos, base}` 448 times on the 27B, so the host mirror
+    /// short-circuits all but the first.  `force` bypasses that (a new step must
+    /// re-publish even if the values happen to repeat, because the graph's other
+    /// nodes may read them before `rope64` is reached).
+    fn publishCtl(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
+        if (!force and self.ctl_valid and std.meta.eql(self.ctl_host, ctl)) return true;
+        const p = self.ensureCtl() orelse return false;
+        const rc = Launch.xd_ctl_publish(
+            p,
+            @bitCast(ctl.pos),
+            ctl.rope_base_bits,
+            @bitCast(ctl.kv_slot),
+            @bitCast(ctl.attn_slot),
+            @bitCast(ctl.rows),
+            stream,
+        );
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("ctl publish", rc);
+            return false;
+        }
+        self.ctl_host = ctl;
+        self.ctl_valid = true;
+        return true;
+    }
+
+    /// Invalidate the host mirror so the next `publishCtl` writes unconditionally.
+    fn ctlInvalidate(self: *CudaBackend) void {
+        self.ctl_valid = false;
+    }
+
     fn gpuReady(self: *CudaBackend) bool {
         return self.cu != null;
     }
@@ -2219,15 +2297,6 @@ pub const CudaBackend = struct {
                 return false;
             }
             self.g_stream = s;
-        }
-        if (self.d_kv_slot == null) {
-            var p: ?*anyopaque = null;
-            if (cu.lib.Malloc(&p, @sizeOf(c_int)) != cudart.cudaSuccess or p == null) {
-                self.gs().failed = true;
-                return false;
-            }
-            self.d_kv_slot = p;
-            self.d_kv_slot_host = -1;
         }
         if (self.g_ev == null) {
             // Disable timing: this event is a pure ordering token, and the
@@ -4655,7 +4724,7 @@ const attn_score_arity: usize = 11;
         // allocating it on first use would land inside a capture, where
         // `cudaMalloc` is illegal ("operation not permitted when stream is
         // capturing").  Reserved here so the dyn path is always ready.
-        _ = self.ensureAttnDyn();
+        _ = self.ensureCtl();
     }
 
     /// K-token variant: the same buffers scaled by `k`.  `d_out`/`d_xq` dominate, so
@@ -4846,7 +4915,6 @@ const attn_score_arity: usize = 11;
             cpu_mod.CpuBackend.vtable.kvAppend(.{}, @ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
             return;
         }
-        const cu = &self.cu.?;
         // `dst` is the layer's WHOLE region (an f32 view); the cache row for
         // `slot` is `slot * row_bytes` bytes past the base.
         const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst.ptr));
@@ -4856,18 +4924,12 @@ const attn_score_arity: usize = 11;
         // this path: the H2D below would itself be recorded into the graph and
         // replayed with a stale value.  Capture keeps the historical
         // `out_ptr` + retargeting route instead.
-        if (self.gs().state == .live and self.kv_type == .f16 and rows == 1 and self.d_kv_slot != null) {
-            const want: c_int = @intCast(slot);
-            if (want != self.d_kv_slot_host) {
-                if (cu.lib.MemcpyAsync(self.d_kv_slot.?, &want, @sizeOf(c_int),
-                        cudart.MemcpyHostToDevice, self.launchStream()) == cudart.cudaSuccess)
-                {
-                    self.d_kv_slot_host = want;
-                }
-            }
+        if (self.gs().state == .live and self.kv_type == .f16 and rows == 1 and self.ctl_dev != null) {
+            // The row comes from the shared per-step block; `graphReplay` does
+            // not touch it, `graphBegin` already published it for this step.
             const nbp = @as(c_int, @intCast(kv_dim / 32));
             const rc0 = Launch.kv_quant_dslot(src.ptr, @ptrCast(dst_bytes),
-                @ptrCast(@alignCast(self.d_kv_slot.?)), nbp, 1,
+                @ptrCast(@alignCast(self.ctl_dev.?)), nbp, 1,
                 @intCast(row_bytes), self.launchStream());
             if (rc0 == cudart.cudaSuccess) return;
             self.ewLaunchFail("kv_quant_dslot", rc0);
@@ -6237,7 +6299,7 @@ const attn_score_arity: usize = 11;
                                     const want_dyn = graphWanted() and
                                         (self.gs().state == .live or self.gs().state == .rec or self.capturing());
                                     if (want_dyn) {
-                                        if (self.ensureAttnDyn()) |pdyn| {
+                                        if (self.ensureCtl()) |pdyn| {
                                             // DO NOT publish `slot` here.  During
                                             // capture `launchStream()` is the capture
                                             // stream, so a publish issued now would
@@ -6385,50 +6447,14 @@ const attn_score_arity: usize = 11;
     /// What works is a plain DEVICE buffer written by a 1-thread kernel on the
     /// launch stream (`k_rope64_setenv`), which captures like any other node and
     /// costs one launch per token instead of 448 retargets.
-    fn ensureRopeDyn(self: *CudaBackend) ?*anyopaque {
-        if (self.gs().rope_dyn) |p| return p;
-        const cu = &(self.cu orelse return null);
-        var p: ?*anyopaque = null;
-        const rc = cu.lib.Malloc(&p, @sizeOf([2]i32));
-        if (rc != cudart.cudaSuccess or p == null) {
-            self.ewLaunchFail("rope64_dpos alloc", rc);
-            return null;
-        }
-        self.gs().rope_dyn = p;
-        return p;
-    }
 
     /// Lazily allocate the device int that carries the decode `slot` to
     /// `q35_attn_decode_kernel_dyn`.  Returns null only if the allocation fails.
-    fn ensureAttnDyn(self: *CudaBackend) ?*anyopaque {
-        if (self.gs().attn_dyn) |p| return p;
-        const cu = &(self.cu orelse return null);
-        var p: ?*anyopaque = null;
-        const rc = cu.lib.Malloc(&p, @sizeOf(c_int));
-        if (rc != cudart.cudaSuccess or p == null) {
-            self.ewLaunchFail("attn_dyn alloc", rc);
-            return null;
-        }
-        self.gs().attn_dyn = p;
-        return p;
-    }
 
     /// Publish this token's `{pos, base}` into the device channel, but only when
     /// it actually changed (the engine calls `rope64` once per head, so the same
     /// token would otherwise publish 448 times).  Returns true if it launched the
     /// writer, i.e. if the caller must not assume the values are already there.
-    fn ropeDynPublished(self: *CudaBackend, pos: u32, base: f32) bool {
-        if (self.gs().rope_dyn == null) return false;
-        if (self.gs().rope_dyn_pos == pos and self.gs().rope_dyn_base == base) return false;
-        const rc = Launch.rope64_setenv(self.gs().rope_dyn, @bitCast(pos), base, self.launchStream());
-        if (rc != cudart.cudaSuccess) {
-            self.ewLaunchFail("rope64_setenv", rc);
-            return false;
-        }
-        self.gs().rope_dyn_pos = pos;
-        self.gs().rope_dyn_base = base;
-        return true;
-    }
 
     fn dRope64_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
@@ -6471,13 +6497,22 @@ const attn_score_arity: usize = 11;
                 // never a blocking one: a blocking `cuMemcpy` inside an open
                 // capture invalidates the graph (`cudaErrorStreamCaptureUnsupported`),
                 // which is what `copyFromHost` has to guard against.
-                if (self.ensureRopeDyn()) |dyn| {
-                    // Publish {pos, base} once per token (the engine calls this
-                    // once per head).  The writer is an ordinary kernel on the
-                    // launch stream, so it is captured and replayed with the
-                    // rest of the step and never needs re-parameterising.
-                    _ = self.ropeDynPublished(pos, base);
-                    const rc = Launch.rope64_dpos(px, 1, @intCast(n), dyn, self.launchStream());
+                if (self.ensureCtl()) |ctl_dev| {
+                    // `pos` / `base` reach `k_rope64_dpos` through the shared
+                    // per-step block, published once in `graphBegin`.  The
+                    // engine still passes them per call, so a step that changes
+                    // the theta mid-way (the rope-scaling threshold) publishes
+                    // again here -- `publishCtl` compares against the host
+                    // mirror, so the 448 per-head calls cost one launch in
+                    // total.
+                    _ = self.publishCtl(.{
+                        .pos = pos,
+                        .rope_base_bits = @bitCast(base),
+                        .kv_slot = self.ctl_host.kv_slot,
+                        .attn_slot = self.ctl_host.attn_slot,
+                        .rows = self.ctl_host.rows,
+                    }, self.launchStream(), false);
+                    const rc = Launch.rope64_dpos(px, 1, @intCast(n), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
                         self.stat_rope_devices += 1;
                         if (self.capturing()) self.graphNoteRope(pos, base);
@@ -6540,10 +6575,16 @@ const attn_score_arity: usize = 11;
         // path uses (`ropeSetEnv` runs once per token, not once per call), so
         // the captured node reads them fresh on every replay.
         if (self.capturing() or self.gs().state == .live) {
-            if (self.ensureRopeDyn()) |dyn| {
-                _ = self.ropeDynPublished(pos, base);
+            if (self.ensureCtl()) |ctl_dev| {
+                _ = self.publishCtl(.{
+                    .pos = pos,
+                    .rope_base_bits = @bitCast(base),
+                    .kv_slot = self.ctl_host.kv_slot,
+                    .attn_slot = self.ctl_host.attn_slot,
+                    .rows = self.ctl_host.rows,
+                }, self.launchStream(), false);
                 if (dBufPtr(x)) |px| {
-                    const rc = Launch.rope64_rows_dpos(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), dyn, self.launchStream());
+                    const rc = Launch.rope64_rows_dpos(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
                         if (self.capturing()) self.graphNoteRope(pos, base);
                         return;
@@ -7525,7 +7566,20 @@ const attn_score_arity: usize = 11;
     /// alive so the A/B switch (`QWEN35_CUDA_GRAPH`) and the diagnostics still
     /// describe what is going to happen.
     fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
-        _ = ctx;
+        const self = self_(ctx);
+        if (!self.gpuReady()) return .{ .kind = kind, .ctl = ctl };
+        // Publish this step's scalars BEFORE anything else runs.  This is the one
+        // place per step that can safely allocate the block (`cudaMalloc` inside
+        // a capture is illegal) and the one place that knows the step began.
+        //
+        // The write goes on the DEFAULT stream here and the graph stream waits
+        // for it in `graphSyncFromDefault`; a non-graph step reads the block
+        // through its own stream order, which is the same stream.
+        //
+        // A failed publish is not fatal: every consumer has a per-scalar
+        // fallback, so the step still runs (capture-unsafe, i.e. it simply will
+        // not be recorded).
+        _ = self.publishCtl(ctl, null, true);
         return .{ .kind = kind, .ctl = ctl };
     }
 

@@ -43,6 +43,7 @@
 // `addResid` / `scaleVec` safe, and it is also why the result does not depend
 // on the block size.
 #include "common.cuh"
+#include "xd.h"  // XD_CTL_*: the per-step control block indices
 #include <math_constants.h>
 
 namespace {
@@ -452,5 +453,36 @@ extern "C" int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stre
     if (blocks < 1) blocks = 1;
     k_argmax_partial<<<blocks, kArgmaxThreads, 0, stream>>>(d_x, n, s_pv, s_pi, blocks);
     k_argmax_final<<<1, kArgmaxThreads, 0, stream>>>(s_pv, s_pi, blocks, d_out);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// The per-step control block (xd.h XD_CTL_*).
+//
+// One 1-thread kernel per step writes the whole block on the LAUNCH STREAM, so
+// stream order alone makes it visible to every node of a replayed graph -- no
+// event, no `cudaMemcpyAsync` whose address would be baked into a node.
+//
+// Why a kernel and not an async H2D: an H2D launched *during* a capture would be
+// recorded into the graph and replayed with the capture token's value.  A
+// `cudaMemcpyAsync` issued outside the capture is fine, but it costs a driver
+// round trip; a 1-thread kernel costs ~3 us and composes with the graph's own
+// stream.  (This is the same argument `k_rope64_setenv` records in rope.cu.)
+__global__ void k_xd_ctl_publish(int *__restrict__ ctl, int pos, int base_bits,
+                                 int kv_slot, int attn_slot, int rows) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    ctl[XD_CTL_POS] = pos;
+    ctl[XD_CTL_BASE_BITS] = base_bits;
+    ctl[XD_CTL_KV_SLOT] = kv_slot;
+    ctl[XD_CTL_ATTN_SLOT] = attn_slot;
+    ctl[XD_CTL_ROWS] = rows;
+}
+
+extern "C" int q35_launch_xd_ctl_publish(void *d_ctl, int pos, int base_bits,
+                                         int kv_slot, int attn_slot, int rows,
+                                         void *stream_v) {
+    if (d_ctl == nullptr) return (int)cudaErrorInvalidValue;
+    k_xd_ctl_publish<<<1, 1, 0, (cudaStream_t)stream_v>>>(
+        (int *)d_ctl, pos, base_bits, kv_slot, attn_slot, rows);
     return (int)cudaGetLastError();
 }

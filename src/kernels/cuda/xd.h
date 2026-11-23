@@ -139,6 +139,30 @@ static_assert(offsetof(struct xd_node, argv) == 816, "xd_node.argv moved");
 static_assert(offsetof(struct xd_node, gate_argv) == 944, "xd_node.gate_argv moved");
 static_assert(offsetof(struct xd_node, derived) == 976, "xd_node.derived moved");
 
+// ---------------------------------------------------------------------------
+// The per-step control block (`cell` in plan §1.5).
+//
+// One device buffer per graph, refreshed once per step.  Every kernel that needs
+// a per-token scalar takes the block's address and reads the field at execution
+// time, so a captured node's ARGUMENT LIST never changes and a replay needs no
+// `cudaGraphExecKernelNodeSetParams` for any of them.
+//
+// Field meanings mirror `backend.GraphCtl` (src/backend.zig) field for field;
+// the static_asserts below are the cross-language check.
+// ---------------------------------------------------------------------------
+#define XD_CTL_POS       0   // rope phase base (row 0 of this step)
+#define XD_CTL_BASE_BITS 1   // bit pattern of the rope theta
+#define XD_CTL_KV_SLOT   2   // first KV row written by this step
+#define XD_CTL_ATTN_SLOT 3   // last KV row full attention must cover
+#define XD_CTL_ROWS      4   // rows this step produces
+#define XD_CTL_INTS      5
+
+static_assert(sizeof(int) == 4, "the control block is an int32 array");
+
+// A kernel that needs one per-step scalar takes `const int *ctl` and reads
+// `ctl[XD_CTL_<field>]`.  The named offsets above keep call sites from repeating
+// the arithmetic (and from getting it wrong).
+
 // ---- argument entry constructors ------------------------------------------
 void xd_set_f32(xd_slot *s, const float *src, float v);
 void xd_set_i32(xd_slot *s, const int *src, int v);

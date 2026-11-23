@@ -56,6 +56,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
+#include "xd.h"  // XD_CTL_*: the per-step control block
 
 // Upper bound for the dynamic shared-memory scratch (`scores`, 1 float per
 // written row).  Qwen3.5 max_seq is well under this; a longer sequence would
@@ -352,8 +353,9 @@ __global__ void q35_attn_chunk_kernel(
     int heads, int gqa, int hd, int kv_dim, float scale)
 {
     // `d_slot0` != null 时从设备读起始行，供 CUDA graph 重放使用（捕获时那个
-    // 标量会被固化）。指针与形状不变，graph 节点无需重定向。
-    if (d_slot0 != nullptr) slot0 = *d_slot0;
+    // 标量会被固化）。它现在指向**每步控制块**（xd.h），因此重放时读到的永远
+    // 是本步的值；指针与形状不变，graph 节点无需重定向。
+    if (d_slot0 != nullptr) slot0 = d_slot0[XD_CTL_KV_SLOT];
     const int r = blockIdx.x;               // token within the chunk
     const int h = blockIdx.y;               // head
     const int tid = threadIdx.x;
@@ -795,7 +797,8 @@ __global__ void q35_attn_decode_kernel_dyn(
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
     if (h >= heads) return;
-    const int n = *d_slot + 1;
+    // `d_slot` 指向每步控制块（xd.h）；读的是本步的 `attn_slot`。
+    const int n = d_slot[XD_CTL_ATTN_SLOT] + 1;
 
     const int kvh = h / gqa;
     const float *__restrict__ qs = d_q + (size_t)h * hd;

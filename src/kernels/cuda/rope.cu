@@ -47,6 +47,7 @@
 // `$QWEN35_CUDA_ROPE=host` reverts to the CPU body (bit-exact) for exactly this
 // A/B; see the note there.
 #include "common.cuh"
+#include "xd.h"  // XD_CTL_POS / XD_CTL_BASE_BITS
 
 namespace {
 
@@ -188,18 +189,21 @@ __global__ void k_rope_rows_dim(float *__restrict__ x, int rows, int heads, int 
 // a token costs one tiny H2D of the position and no per-node retargeting at all.
 // The arithmetic is copied expression for expression from `k_rope64` above, so a
 // node running this kernel produces bit-identical output for the same `pos`.
-extern "C" __global__ void k_rope64_dpos(float *__restrict__ x, int heads, int hd, const void *dyn_p) {
-    // `dyn_p` points at TWO device int32: {pos, float-bits(base)}.  `base` moves
-    // too -- the engine derives it from the position (it switches once a token
-    // passes the model's rope-scaling threshold) -- so freezing only `pos` would
-    // rotate replays with the capture token's theta.
+extern "C" __global__ void k_rope64_dpos(float *__restrict__ x, int heads, int hd, const void *ctl_p) {
+    // `ctl_p` is the per-step control block (xd.h XD_CTL_*).  `pos` is
+    // XD_CTL_POS and the theta is XD_CTL_BASE_BITS -- the SAME two fields, in
+    // the same order, that this kernel used when it had a private two-int
+    // buffer, so pointing it at the shared block changes nothing numerically.
+    // `base` moves too (the engine derives it from the position, switching once
+    // past the rope-scaling threshold), so freezing only `pos` would rotate
+    // replays with the capture token's theta.
     const int lane = threadIdx.x & (kHalf - 1);
     const int local_head = threadIdx.x / kHalf;
     const int h = blockIdx.x * kHeadsPerBlock + local_head;
     if (h >= heads) return;
-    const int *dyn = (const int *)dyn_p;
-    const int pos = dyn[0];
-    const float base = __int_as_float(dyn[1]);
+    const int *ctl = (const int *)ctl_p;
+    const int pos = ctl[XD_CTL_POS];
+    const float base = __int_as_float(ctl[XD_CTL_BASE_BITS]);
     float *hp = x + (size_t)h * (size_t)hd;
     const int j = lane;
     const float exponent = -2.0f * (float)j / 64.0f;
@@ -228,17 +232,17 @@ extern "C" __global__ void k_rope64_dpos(float *__restrict__ x, int heads, int h
 // without changing a single value: row r of this launch is bit-identical to
 // `k_rope64_rows` with `pos0 = pos + r` and the same base.
 __global__ void k_rope64_rows_dpos(float *__restrict__ x, int rows, int heads, int hd,
-                                   const void *dyn_p) {
+                                   const void *ctl_p) {
     const int lane = threadIdx.x & (kHalf - 1);
     const int local_head = threadIdx.x / kHalf;
     const int rh = blockIdx.x * kHeadsPerBlock + local_head;
     if (rh >= rows * heads) return;
-    const int *dyn = (const int *)dyn_p;
+    const int *ctl = (const int *)ctl_p;
     // Row r is token `pos + r`; decode passes rows == 1, so this reduces to the
     // per-head kernel's own indexing.
     const int r = rh / heads;
-    const int pos = dyn[0] + r;
-    const float base = __int_as_float(dyn[1]);
+    const int pos = ctl[XD_CTL_POS] + r;
+    const float base = __int_as_float(ctl[XD_CTL_BASE_BITS]);
     float *hp = x + ((size_t)rh) * (size_t)hd;
     const int j = lane;
     const float exponent = -2.0f * (float)j / 64.0f;

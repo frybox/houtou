@@ -145,22 +145,38 @@ pub const LoadError = error{
 pub const GraphKind = enum { decode, chunk };
 
 /// Per-step scalars of one graph.  This is the HOST mirror of the device control
-/// block: a backend that replays a captured graph copies this struct to the
-/// device once per step, so a per-token scalar never has to be retargeted on a
-/// graph node (see plan §1.5, `cell`).
+/// block (`GraphCtlDev` in `src/kernels/cuda/xd.h`): the backend copies it to
+/// the device once per step, so a per-token scalar never has to be retargeted on
+/// a graph node (see plan §1.5, `cell`).
 ///
-/// A plain opaque-ish record on purpose: the CPU backend stores one of these as
-/// a trivial value and never reads it, so the layout is only a contract between
-/// the engine and a device backend.
-pub const GraphCtl = struct {
-    /// Position of this step's first row (rope phase, KV slot for a single-row
-    /// step).
+/// EVERY field here is read by a kernel through `const int *`/`const float *`
+/// pointing at the device block, never passed by value.  That is the whole point:
+/// a captured node's argument list stays constant, so a replay needs no
+/// `cudaGraphExecKernelNodeSetParams` for any of them.
+///
+/// The CPU backend stores one of these as a plain value and never reads it.
+pub const GraphCtl = extern struct {
+    /// Position of this step's first row (`rope64`'s phase base).
     pos: u32 = 0,
-    /// First KV row written by this step (`pos` for decode, `slot0` for a chunk).
-    slot: u32 = 0,
+    /// Bit pattern of the RoPE `base` (theta), as an `i32` so the block is one
+    /// uniform int array the publish kernel copies verbatim.  The engine fills it
+    /// with `@bitCast(base)`; kernels read it with `__int_as_float`.
+    rope_base_bits: i32 = 0,
+    /// First KV row this step writes (`pos` for decode, `slot0` for a chunk).
+    kv_slot: u32 = 0,
+    /// KV row the full-attention kernels must cover (`slot` = `kv_slot` for
+    /// decode; for a chunk the kernels derive it from `kv_slot + rows`).
+    attn_slot: u32 = 0,
     /// Rows this step produces (1 for decode, k for a verify chunk).
     rows: u32 = 1,
 };
+
+comptime {
+    // The device block is a `int32_t[GRAPH_CTL_INTS]`; this must stay 5 ints
+    // wide.  Widening it needs the .cu side's array size changed in step.
+    std.debug.assert(@sizeOf(GraphCtl) == 5 * @sizeOf(i32));
+    std.debug.assert(@alignOf(GraphCtl) == 4);
+}
 
 /// A forward pass being recorded, replayed, or run straight through.
 ///

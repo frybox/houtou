@@ -1605,7 +1605,7 @@ pub const Engine = struct {
         // replayable unit: same weights, same buffers, `pos` the only moving
         // scalar.  A backend that cannot (or will not) record returns the
         // pass-through graph and every op runs exactly as before.
-        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .slot = pos, .rows = 1 });
+        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .kv_slot = pos, .attn_slot = pos, .rows = 1 });
         // `self.layers` has one extra slot when the model ships a nextn block
         // (see `nSlots`); a normal forward must stop at the decoder layers, or
         // it would run the drafter as layer 64 of every token.
@@ -1741,7 +1741,7 @@ pub const Engine = struct {
         // One chunk-shaped graph for the whole K-token pass (`slot0` and `rows`
         // are its per-step scalars).  S2 opens it here; a chunk graph is never
         // recorded yet, so the backend returns the pass-through one.
-        self.graph = self.exec.graphBegin(.chunk, .{ .pos = pos0, .slot = pos0, .rows = @intCast(k) });
+        self.graph = self.exec.graphBegin(.chunk, .{ .pos = pos0, .kv_slot = pos0, .attn_slot = pos0, .rows = @intCast(k) });
 
         var t: usize = 0;
         while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
