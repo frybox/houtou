@@ -61,6 +61,16 @@ pub const Engine = struct {
     owns_io: ?*std.Io.Threaded = null,
 
     exec: backend.Exec,
+    /// The compute graph the current forward pass is being recorded into or
+    /// replayed from.  Set by `forwardLogits` / `forwardChunk`, which are the
+    /// only entry points: every op between them and the next `graphEnd` reads
+    /// it.  The pass-through value (`ptr == null`) makes every op behave
+    /// exactly as it did before the graph existed, which is what the CPU
+    /// backend and a failed capture use.
+    ///
+    /// A field rather than a parameter threading: the layer helpers are 15 deep
+    /// and all of them would otherwise take it just to pass it on.
+    graph: backend.Graph = .{},
     backend_kind: backend.Kind,
 
     token_embd: LinearW,
@@ -292,7 +302,7 @@ pub const Engine = struct {
             const host = try alloc.alloc(f32, q_dim);
             defer alloc.free(host);
             @memset(host, std.math.inf(f32));
-            exec.copyFromHost(e.ones.span(0, q_dim), host);
+            exec.copyFromHost(e.graph, e.ones.span(0, q_dim), host);
         }
 
         e.sample_scratch = try exec.allocBuf(cfg.vocab);
@@ -322,7 +332,7 @@ pub const Engine = struct {
             const host = try alloc.alloc(f32, K * q_dim);
             defer alloc.free(host);
             @memset(host, std.math.inf(f32));
-            exec.copyFromHost(e.gateK.span(0, K * q_dim), host);
+            exec.copyFromHost(e.graph, e.gateK.span(0, K * q_dim), host);
         }
         try exec.allocScratchK(widest, K);
 
@@ -410,7 +420,7 @@ pub const Engine = struct {
     pub fn specTapPlaneToHost(self: *Engine, dst: []f32, i: usize, rows: usize) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len >= rows * hidden);
-        self.exec.copyOut(dst[0 .. rows * hidden], self.specTapPlane(i, rows));
+        self.exec.copyOut(self.graph, dst[0 .. rows * hidden], self.specTapPlane(i, rows));
     }
 
     /// Sequence length the draft's own KV may use (it shares the target's
@@ -434,12 +444,12 @@ pub const Engine = struct {
         // `x1` is engine scratch at least `hidden` wide and is rewritten by
         // every forward anyway, so borrowing it needs no new allocation.
         const row = self.x1.span(0, hidden);
-        self.exec.copyFromHost(row, x[0..hidden]);
+        self.exec.copyFromHost(self.graph, row, x[0..hidden]);
         switch (self.output_weight orelse self.token_embd) {
             .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, row),
             .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, row),
         }
-        self.exec.copyOut(out[0..self.cfg.vocab], self.logits);
+        self.exec.copyOut(self.graph, out[0..self.cfg.vocab], self.logits);
     }
 
     // ---- spec snapshot / rollback ----
@@ -519,7 +529,7 @@ pub const Engine = struct {
         for (0..self.tap_layers.len) |ti| {
             const src = self.tap_hidden.span(ti * self.n_batch * hidden, hidden);
             const dst = self.ring[ti * ctx * hidden + at * hidden ..][0..hidden];
-            self.exec.copyOut(dst, src);
+            self.exec.copyOut(self.graph, dst, src);
         }
         self.ring_next = (at + 1) % ctx;
         if (self.ring_filled < ctx) self.ring_filled += 1;
@@ -538,7 +548,7 @@ pub const Engine = struct {
             const at = (self.ring_next + r) % ctx;
             for (0..self.tap_layers.len) |ti| {
                 const src = self.tap_hidden.span(ti * self.n_batch * hidden + (skip + r) * hidden, hidden);
-                self.exec.copyOut(self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
+                self.exec.copyOut(self.graph, self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
             }
         }
         self.ring_next = (self.ring_next + take) % ctx;
@@ -592,7 +602,7 @@ pub const Engine = struct {
         // One row expanded to f32 is the only place this engine needs values
         // rather than a dot product; the dequantizer choice is the backend's.
         switch (self.token_embd) {
-            .f32 => |m| self.exec.copyRange(dst, Buf.wrap(m[token * hidden ..][0..hidden])),
+            .f32 => |m| self.exec.copyRange(self.graph, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
             .quant => |qrow| self.exec.dequantRow(dst, qrow, token),
         }
     }
@@ -629,29 +639,29 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < self.max_ctx);
         const slot: usize = cache.len;
-        self.exec.kvAppend(cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
-        self.exec.kvAppend(cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.graph, cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.graph, cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const gout = self.gout.span(0, q_dim);
-        self.exec.attnDecode(
+        self.exec.attnDecode(self.graph, 
             q, self.ones.span(0, q_dim),
             cache.k, cache.v,
             self.att.span(0, slot + 1), gout,
             slot, heads, gqa, hd, kv_dim, scale,
         );
         self.exec.matvec(self.x2.span(0, hidden), lw.attn_output, gout);
-        self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // ---- MLP ----
         self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
         const n_ff: usize = c.n_ff;
         self.exec.matvec(self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
         self.exec.matvec(self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
-        self.exec.swiglu(self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
+        self.exec.swiglu(self.graph, self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
         self.exec.matvec(self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
-        self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // Speculative-decoding tap: this layer's OUTPUT hidden state, written
         // after BOTH residual adds so it is the value the next layer's norm
@@ -660,7 +670,7 @@ pub const Engine = struct {
         if (self.tap_hidden.len != 0) {
             for (self.tap_layers, 0..) |tl, ti| {
                 if (tl == @as(u32, @intCast(li))) {
-                    self.exec.copyRange(
+                    self.exec.copyRange(self.graph, 
                         self.tap_hidden.span(ti * self.n_batch * hidden, hidden),
                         self.x.span(0, hidden),
                     );
@@ -674,7 +684,7 @@ pub const Engine = struct {
         const c = &self.cfg;
         const hidden: usize = c.hidden;
         self.embedTo(token, self.x.span(0, hidden));
-        self.exec.stepBegin(pos);
+        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .slot = pos, .rows = 1 });
         for (self.layers, 0..) |*lw, li| self.layerForward(lw, li, pos);
         self.exec.rmsnorm(self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
@@ -682,6 +692,8 @@ pub const Engine = struct {
         } else {
             self.exec.matvec(self.logits, self.token_embd, self.x1.span(0, hidden));
         }
+        self.exec.graphEnd(&self.graph);
+        self.graph = .{};
         return self.logits;
     }
 
@@ -776,36 +788,36 @@ pub const Engine = struct {
             const cache = &self.kv[li];
             std.debug.assert(cache.len + k <= self.max_ctx);
             const slot0: usize = cache.len;
-            self.exec.kvAppend(cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
-            self.exec.kvAppend(cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
+            self.exec.kvAppend(self.graph, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
+            self.exec.kvAppend(self.graph, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
             cache.len += @intCast(k);
 
             // scores -> softmax -> PV -> gate for all k rows in one launch.
             // `gateK` stays the all-`+inf` buffer (this architecture has no
             // attention output gate; `sigmoid(+inf) == 1`).
             const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-            self.exec.attnChunk(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+            self.exec.attnChunk(self.graph, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
                 cache.k, cache.v,
                 self.att.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
                 slot0, k, heads, gqa, hd, kv_dim, scale);
 
             self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
-            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP ----
             self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
             self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
             self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
-            self.exec.swiglu(self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
+            self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
             self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
-            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // Twin of `layerForward`'s tap, for the batched path: the whole
             // chunk's rows at once (they are contiguous, so one copy).
             if (self.tap_hidden.len != 0) {
                 for (self.tap_layers, 0..) |tl, ti| {
                     if (tl == @as(u32, @intCast(li))) {
-                        self.exec.copyRange(
+                        self.exec.copyRange(self.graph, 
                             self.tap_hidden.span(ti * self.n_batch * hidden, k * hidden),
                             self.xK.span(0, k * hidden),
                         );
@@ -912,7 +924,7 @@ pub const Engine = struct {
         var gen_ns: i96 = 0;
         var hit_eos = false;
         var hit_context_limit = false;
-        var next: u32 = self.exec.sample(last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
         var proposed_total: usize = 0;
         var accepted_total: usize = 0;
         var rounds: usize = 0;
@@ -951,7 +963,7 @@ pub const Engine = struct {
                     var logits = self.forwardLogits(next, pos);
                     self.specRingPush();
                     var committed: usize = 0;
-                    var pending: u32 = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                    var pending: u32 = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
                     if (self.spec_trace_dbg) {
                         std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
                             pos, next, draft_buf[0], pending, n_draft,
@@ -967,7 +979,7 @@ pub const Engine = struct {
                         const row_pos = block_pos + @as(u32, @intCast(committed));
                         logits = self.forwardLogits(cand, row_pos);
                         self.specRingPush();
-                        pending = self.exec.sample(logits, self.sample_scratch, &self.sampler);
+                        pending = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
                     }
                     accepted_total += committed;
                     if (committed < self.spec_pos_reached.len) self.spec_pos_reached[committed] += 1;
@@ -1075,7 +1087,7 @@ pub const Engine = struct {
     }
     fn dSample(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));
-        return e.exec.sample(e.logits, e.sample_scratch, &e.sampler);
+        return e.exec.sample(e.graph, e.logits, e.sample_scratch, &e.sampler);
     }
     fn dMaxSeq(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));

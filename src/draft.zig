@@ -139,6 +139,12 @@ pub const Draft = struct {
     /// Present iff `bridge_kind == .cuda`.  Owned.
     cuda: ?*@import("backend_cuda.zig").CudaBackend = null,
     exec: Exec,
+    /// The pass-through compute graph.  The draft runs OUTSIDE any recorded
+    /// step (it is driven by the target's generate loop, not by a forward pass),
+    /// so every op it issues uses the direct path.  S5 gives the draft chain its
+    /// own graph; until then this is the explicit "no graph" value rather than a
+    /// hidden implicit one.
+    graph: backend.Graph = .{},
     /// Which implementation of the four bridge kernels runs (see
     /// `dspine_bridge.Kind`).  `exec` and this are chosen together: `cuda` here
     /// means `exec` is the CUDA backend's vtable AND
@@ -676,15 +682,15 @@ pub const Draft = struct {
         const slot: usize = @as(usize, cache.ctx_len) + cache.len;
         if (self.dump_dir) |root| if (self.dump_row == 0) self.dumpKv(root, il, q_dim, kv_dim, krow, vrow);
         std.debug.assert(slot < c.max_seq);
-        self.exec.kvAppend(cache.k, krow, slot, kv_dim, 1);
-        self.exec.kvAppend(cache.v, vrow, slot, kv_dim, 1);
+        self.exec.kvAppend(self.graph, cache.k, krow, slot, kv_dim, 1);
+        self.exec.kvAppend(self.graph, cache.v, vrow, slot, kv_dim, 1);
 
         // Attention covers context rows [0, ctx_len) and block rows
         // [ctx_len, slot] -- exactly the slice `attnDecode` walks (`0..=slot`),
         // which is the same mask the reference builds: context rows are always
         // visible, block rows causally (`dspine_mlx/model.py:83-99`).
         self.exec.attnDecode(
-            self.q.span(0, q_dim), self.ones.span(0, q_dim),
+            self.graph, self.q.span(0, q_dim), self.ones.span(0, q_dim),
             cache.k, cache.v,
             self.att.span(0, slot + 1), self.gout.span(0, q_dim),
             slot, c.heads, c.heads / c.kv_heads, c.hd, kv_dim, scale,
@@ -700,7 +706,7 @@ pub const Draft = struct {
             self.debug_gout = maxAbs(self.gout.slice()[0..q_dim]);
             self.emit("attn", il, self.dump_row, self.gout.slice()[0..q_dim]);
         }
-        self.exec.addResid(self.resid.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.graph, self.resid.span(0, hidden), self.x2.span(0, hidden));
         if (self.hostDebug()) self.emit("h", il, self.dump_row, self.resid.slice()[0..hidden]);
 
         // ---- MLP ----
@@ -708,7 +714,7 @@ pub const Draft = struct {
         self.exec.matvec(self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
         self.exec.matvec(self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
         if (self.hostDebug()) self.debug_gate = maxAbs(self.mlp_h.slice()[0..c.ffn]);
-        self.exec.swiglu(self.mlp_h.span(0, c.ffn), self.mlp_h1.span(0, c.ffn));
+        self.exec.swiglu(self.graph, self.mlp_h.span(0, c.ffn), self.mlp_h1.span(0, c.ffn));
         if (self.hostDebug()) self.debug_swi = maxAbs(self.mlp_h.slice()[0..c.ffn]);
         self.exec.matvec(self.x2.span(0, hidden), l.ffn_down, self.mlp_h.span(0, c.ffn));
         if (self.hostDebug()) self.debug_mlp = maxAbs(self.x2.slice()[0..hidden]);
@@ -741,7 +747,7 @@ pub const Draft = struct {
             };
         }
         if (self.hostDebug()) self.emit("swiglu", il, self.dump_row, self.mlp_h.slice()[0..c.ffn]);
-        self.exec.addResid(self.resid.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.graph, self.resid.span(0, hidden), self.x2.span(0, hidden));
         if (self.hostDebug()) self.emit("layer_out", il, self.dump_row, self.resid.slice()[0..hidden]);
         if (self.dump_dir) |root| self.dumpLayer(root, il, self.dump_row);
     }
@@ -1141,7 +1147,7 @@ pub const Draft = struct {
         // backends carry it across calls.  (The device arm used to rely on a
         // block-sized `packed_rows` instead; that made row r its own sender.)
         // Copy, not alias: `packed_rows` slot 0 is overwritten by the next row.
-        self.exec.copyRange(self.prev_packed, packed_slice);
+        self.exec.copyRange(self.graph, self.prev_packed, packed_slice);
         self.syncBridge();
         self.prev_packed_valid = true;
         // `feature_finish` now writes straight into `resid`, so there is no

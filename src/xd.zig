@@ -1,0 +1,199 @@
+//! `src/kernels/cuda/xd.cu` 的 Zig 侧声明（显式计算图的 op 表）。
+//!
+//! 这里只声明 C 侧的四个入口与两个查询函数，**不做任何算术**：op 表、形状、
+//! 发射、重定向全在 `xd.cu`。Zig 侧需要知道的只有一件事——「这些 op 的编号
+//! 在表里是什么」，而编号由 `xd.cu` 的 `enum xd_op` 与 `xd_op_name` 唯一定义。
+//!
+//! 为什么单独一个文件而不是塞进 `backend_cuda.zig`：`backend_cuda.zig` 已经在
+//! 编译期用 `cuda_linked` 分支处理「没有 kernel 的构建」。这里沿用同样的模式，
+//! 但把它隔离出来，这样 `graph_tests.zig` 能 import 它而不拖进整个后端。
+const std = @import("std");
+const build_options = @import("build_options");
+
+pub const cuda_linked = build_options.cuda_linked;
+
+/// `xd_slot.kind` 的取值，与 `xd.h` 的 `enum xd_kind` 逐项对应。
+pub const Kind = enum(c_int) { f32 = 0, i32 = 1, u32 = 2, ptr = 3 };
+
+/// 一个实参槽，与 `xd.h` 的 `struct xd_slot` 二进制一致。
+///
+/// `src` 是一个八字节的 union：指针类实参用它存放**值本身**（设备地址）；
+/// 立即数类实参用它指向宿主的来源单元格（`*const f32` / `*const c_int` /
+/// `*const c_uint`），`xd_apply` 每次重放前从那里重新读一遍。`src = null`
+/// 表示「字面量」，重放时沿用 `v`。
+pub const Src = extern union {
+    f: ?*const f32,
+    i: ?*const c_int,
+    u: ?*const c_uint,
+    p: ?*anyopaque,
+};
+
+pub const Val = extern union {
+    f: f32,
+    i: c_int,
+    u: c_uint,
+};
+
+pub const Slot = extern struct {
+    kind: c_int,
+    src: Src,
+    v: Val,
+};
+
+/// 发射几何，与 `xd.h` 的 `struct xd_shape` 一致。
+pub const Shape = extern struct {
+    gx: c_uint,
+    gy: c_uint,
+    gz: c_uint,
+    bx: c_uint,
+    by: c_uint,
+    bz: c_uint,
+    smem: c_uint,
+};
+
+/// 与 `xd.h` 的 `XD_MAX_SLOTS` / `XD_MAX_NODES` 一致。
+pub const max_slots = 16;
+pub const max_nodes = 4;
+
+/// 一个已录制的 op，与 `xd.h` 的 `struct xd_node` 二进制一致。
+pub const Node = extern struct {
+    op: c_int,
+    n: c_int,
+    nnodes: c_int,
+    gnode: [max_nodes]?*anyopaque,
+    slots: [max_slots]Slot,
+    vals: [max_slots]Slot,
+    argv: [max_slots]?*anyopaque,
+    gate_argv: [4]?*anyopaque,
+    derived: [max_slots]c_int,
+    /// 本 op 会发射的 CUDA 内核（重放时用它把「自己的节点」同上一个 op 的
+    /// 节点区分开）。`attn_decode_dyn` 有两个。
+    kern: [max_nodes]?*anyopaque,
+};
+
+/// op 编号，与 `xd.h` 的 `enum xd_op` 一致。Zig 侧只按名字用两个
+/// （`attn_decode_dyn` 的双发射、`set_int1`），但整套列出来，这样增删 op 时
+/// 不一致会在编译期暴露（`comptime` 检查在下方）。
+pub const Op = enum(c_int) {
+    mul_mat_vec = 0,
+    mul_mat_vec_f32,
+    mul_mat_vec_w16,
+    quantize_q8_0,
+    quantize_q8_k,
+    rope64_dpos,
+    rope64_rows_dpos,
+    attn_decode_dyn,
+    kv_quant_dslot,
+    gdn_step_rows,
+    gdn_gamma,
+    rmsnorm,
+    swiglu,
+    silu,
+    add_resid,
+    copy_range,
+    scale_vec,
+    zero_buf,
+    deinterleave_qg,
+    argmax_batch,
+    set_int1,
+};
+
+/// 表里的 op 数（`xd.h` 的 `XD_OP_COUNT`）。S3 的接线要用它做一次
+/// `comptime` 对照：`xd_op_count()` 与 `@typeInfo(Op).@"enum".fields.len`
+/// 必须相等，否则某一边加了 op 而另一边没加。
+pub const op_count: usize = std.enums.values(Op).len;
+
+const C = if (cuda_linked) struct {
+    extern fn xd_op_count() c_int;
+    extern fn xd_op_exists(op: c_int) c_int;
+    extern fn xd_op_name(op: c_int) [*:0]const u8;
+    extern fn xd_launch_direct(op: c_int, a: [*]const Slot, stream: ?*anyopaque) c_int;
+    extern fn xd_capture(op: c_int, a: [*]const Slot, n: c_int, stream: ?*anyopaque, out: *Node) c_int;
+    extern fn xd_apply(node: *Node, gexec: ?*anyopaque) c_int;
+
+    fn count() usize {
+        return @intCast(xd_op_count());
+    }
+    fn exists(op: Op) bool {
+        return xd_op_exists(@intFromEnum(op)) != 0;
+    }
+    fn name(op: Op) [:0]const u8 {
+        return std.mem.span(xd_op_name(@intFromEnum(op)));
+    }
+    fn launch(op: Op, slots: []const Slot, stream: ?*anyopaque) c_int {
+        return xd_launch_direct(@intFromEnum(op), slots.ptr, stream);
+    }
+    fn record(op: Op, slots: []const Slot, stream: ?*anyopaque, out: *Node) c_int {
+        return xd_capture(@intFromEnum(op), slots.ptr, @intCast(slots.len), stream, out);
+    }
+    fn replay(node: *Node, gexec: ?*anyopaque) c_int {
+        return xd_apply(node, gexec);
+    }
+} else struct {
+    // 没有 CUDA kernel 的构建：所有入口都是 no-op，查询函数返回 0 / "?"。
+    // `cuda_linked` 是 comptime 已知的，所以这些函数体不会被链接进最终
+    // 二进制；它们只需要存在，让 `graph_tests.zig` 能引用本模块。
+    fn count() usize {
+        return 0;
+    }
+    fn exists(_: Op) bool {
+        return false;
+    }
+    fn name(_: Op) [:0]const u8 {
+        return "?";
+    }
+    fn launch(_: Op, _: []const Slot, _: ?*anyopaque) c_int {
+        return 0;
+    }
+    fn record(_: Op, _: []const Slot, _: ?*anyopaque, _: *Node) c_int {
+        return 0;
+    }
+    fn replay(_: *Node, _: ?*anyopaque) c_int {
+        return 0;
+    }
+};
+
+pub fn opCount() usize {
+    return C.count();
+}
+
+pub fn opExists(op: Op) bool {
+    return C.exists(op);
+}
+
+pub fn opName(op: Op) [:0]const u8 {
+    return C.name(op);
+}
+
+/// 直接发射一个 op（warm 路径）。`slots` 的下标即 `xd.cu` 表里该 op 的实参
+/// 顺序。返回 0 是 `cudaSuccess`。
+pub fn launchDirect(op: Op, slots: []const Slot, stream: ?*anyopaque) c_int {
+    return C.launch(op, slots, stream);
+}
+
+/// 在已打开的 capture 内录制一个 op，并把节点信息写进 `out`。
+pub fn capture(op: Op, slots: []const Slot, stream: ?*anyopaque, out: *Node) c_int {
+    return C.record(op, slots, stream, out);
+}
+
+/// 重放前刷新实参并重定向所有节点。
+pub fn apply(node: *Node, gexec: ?*anyopaque) c_int {
+    return C.replay(node, gexec);
+}
+
+/// 便于测试/诊断：把一个 `Slot` 设成字面 `f32`。
+pub fn setF32(s: *Slot, src: ?*const f32, v: f32) void {
+    s.* = .{ .kind = @intFromEnum(Kind.f32), .src = .{ .f = src }, .v = .{ .f = v } };
+}
+
+pub fn setI32(s: *Slot, src: ?*const c_int, v: c_int) void {
+    s.* = .{ .kind = @intFromEnum(Kind.i32), .src = .{ .i = src }, .v = .{ .i = v } };
+}
+
+pub fn setU32(s: *Slot, src: ?*const c_uint, v: c_uint) void {
+    s.* = .{ .kind = @intFromEnum(Kind.u32), .src = .{ .u = src }, .v = .{ .u = v } };
+}
+
+pub fn setPtr(s: *Slot, p: ?*anyopaque) void {
+    s.* = .{ .kind = @intFromEnum(Kind.ptr), .src = .{ .p = p }, .v = .{ .u = 0 } };
+}

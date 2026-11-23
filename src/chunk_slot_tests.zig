@@ -79,7 +79,7 @@ test "attnChunk: one call for k rows == k per-row attnDecode calls" {
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     // Chunk form: everything in ONE call.
-    vt.attnChunk(ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
+    vt.attnChunk(.{}, ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
         .{ .ptr = kc.ptr, .len = kc.len }, .{ .ptr = vc.ptr, .len = vc.len },
         .{ .ptr = att.ptr, .len = att.len }, .{ .ptr = got.ptr, .len = got.len },
         slot0, rows, heads, gqa, hd, kv_dim, scale);
@@ -87,7 +87,7 @@ test "attnChunk: one call for k rows == k per-row attnDecode calls" {
     // Row form: the calls the engine made before the slot existed.
     for (0..rows) |r| {
         const o = r * row_len;
-        vt.attnDecode(ctx, .{ .ptr = q.ptr + o, .len = row_len }, .{ .ptr = gate.ptr + o, .len = row_len },
+        vt.attnDecode(.{}, ctx, .{ .ptr = q.ptr + o, .len = row_len }, .{ .ptr = gate.ptr + o, .len = row_len },
             .{ .ptr = kc.ptr, .len = kc.len }, .{ .ptr = vc.ptr, .len = vc.len },
             .{ .ptr = att.ptr, .len = att.len }, .{ .ptr = want.ptr + o, .len = row_len },
             slot0 + r, heads, gqa, hd, kv_dim, scale);
@@ -150,7 +150,7 @@ test "attnChunk: row r sees a prefix that grows with r" {
     const ctx: *anyopaque = @ptrCast(&be);
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
-    vt.attnChunk(ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
+    vt.attnChunk(.{}, ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
         .{ .ptr = kc.ptr, .len = kc.len }, .{ .ptr = vc.ptr, .len = vc.len },
         .{ .ptr = att.ptr, .len = att.len }, .{ .ptr = a.ptr, .len = a.len },
         slot0, rows, heads, gqa, hd, kv_dim, scale);
@@ -161,7 +161,7 @@ test "attnChunk: row r sees a prefix that grows with r" {
         vc[(n_tot - 1) * kv_dim + i] += 3.0;
     }
 
-    vt.attnChunk(ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
+    vt.attnChunk(.{}, ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
         .{ .ptr = kc.ptr, .len = kc.len }, .{ .ptr = vc.ptr, .len = vc.len },
         .{ .ptr = att.ptr, .len = att.len }, .{ .ptr = b.ptr, .len = b.len },
         slot0, rows, heads, gqa, hd, kv_dim, scale);
@@ -201,12 +201,12 @@ test "deinterleaveQGStrided: one call for k rows == k per-row calls" {
 
     const vt = backend_cpu.CpuBackend.vtable;
     const ctx: *anyopaque = @ptrCast(&ctx_holder);
-    vt.deinterleaveQGStrided(ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
+    vt.deinterleaveQGStrided(.{}, ctx, .{ .ptr = q.ptr, .len = q.len }, .{ .ptr = gate.ptr, .len = gate.len },
         .{ .ptr = src.ptr, .len = src.len }, heads, hd, rows);
 
     for (0..rows) |t| {
         const o = t * row_len;
-        vt.deinterleaveQG(ctx, .{ .ptr = q2.ptr + o, .len = row_len },
+        vt.deinterleaveQG(.{}, ctx, .{ .ptr = q2.ptr + o, .len = row_len },
             .{ .ptr = gate2.ptr + o, .len = row_len },
             .{ .ptr = src.ptr + t * 2 * row_len, .len = 2 * row_len }, heads, hd);
     }
@@ -308,7 +308,7 @@ test "gdnStepRowsChunk: one fused call == rows successive gdnStepRows calls" {
     const ctx: *anyopaque = @ptrCast(&ctx_holder);
 
     // (a) the fused chunk call
-    vt.gdnStepRowsChunk(ctx,
+    vt.gdnStepRowsChunk(.{}, ctx,
         .{ .ptr = state_a.ptr, .len = state_a.len },
         .{ .ptr = qkv.ptr + kq_dim, .len = rows * conv_dim - kq_dim },
         .{ .ptr = qkv.ptr + 2 * kq_dim, .len = rows * conv_dim - 2 * kq_dim },
@@ -323,7 +323,7 @@ test "gdnStepRowsChunk: one fused call == rows successive gdnStepRows calls" {
     // (b) the sequential form the engine used before the slot existed
     for (0..rows) |t| {
         const qkv_t = qkv[t * conv_dim ..][0..conv_dim];
-        vt.gdnStepRows(ctx,
+        vt.gdnStepRows(.{}, ctx,
             .{ .ptr = state_b.ptr, .len = state_b.len },
             .{ .ptr = qkv_t.ptr + kq_dim, .len = kq_dim },
             .{ .ptr = qkv_t.ptr + 2 * kq_dim, .len = value_dim },
@@ -391,7 +391,7 @@ test "gdnStepRowsSnap: slot r == state after exactly r rows" {
     const ctx: *anyopaque = @ptrCast(&ctx_holder);
 
     @memcpy(state, init);
-    vt.gdnStepRowsSnap(ctx,
+    vt.gdnStepRowsSnap(.{}, ctx,
         .{ .ptr = state.ptr, .len = state.len },
         .{ .ptr = qkv.ptr + kq_dim, .len = rows * conv_dim - kq_dim },
         .{ .ptr = qkv.ptr + 2 * kq_dim, .len = rows * conv_dim - 2 * kq_dim },
@@ -412,7 +412,7 @@ test "gdnStepRowsSnap: slot r == state after exactly r rows" {
         @memcpy(want, init);
         for (0..r_rows) |t| {
             const qkv_t = qkv[t * conv_dim ..][0..conv_dim];
-            vt.gdnStepRows(ctx,
+            vt.gdnStepRows(.{}, ctx,
                 .{ .ptr = want.ptr, .len = want.len },
                 .{ .ptr = qkv_t.ptr + kq_dim, .len = kq_dim },
                 .{ .ptr = qkv_t.ptr + 2 * kq_dim, .len = value_dim },
@@ -432,7 +432,7 @@ test "gdnStepRowsSnap: slot r == state after exactly r rows" {
     @memcpy(last, init);
     for (0..rows) |t| {
         const qkv_t = qkv[t * conv_dim ..][0..conv_dim];
-        vt.gdnStepRows(ctx,
+        vt.gdnStepRows(.{}, ctx,
             .{ .ptr = last.ptr, .len = last.len },
             .{ .ptr = qkv_t.ptr + kq_dim, .len = kq_dim },
             .{ .ptr = qkv_t.ptr + 2 * kq_dim, .len = value_dim },
@@ -499,7 +499,7 @@ test "gdnStepRowsChunk: rows are serialised, not independent" {
         defer alloc.free(dl);
         @memset(out[run], 0);
 
-        vt.gdnStepRowsChunk(ctx,
+        vt.gdnStepRowsChunk(.{}, ctx,
             .{ .ptr = state.ptr, .len = state.len },
             .{ .ptr = qkv.ptr + nk * kd, .len = rows * conv_dim - nk * kd },
             .{ .ptr = qkv.ptr + 2 * nk * kd, .len = rows * conv_dim - 2 * nk * kd },

@@ -1459,13 +1459,11 @@ pub const CudaBackend = struct {
     /// The token `sample` produced on the current step, collected by
     /// `sampledToken` after `stepEnd` has done the download.  The split exists
     /// because the download cannot be captured but the sampler must be.
-    sample_pending: bool = false,
     sample_token: u32 = 0,
     /// The sampler whose PRNG state the pending download must advance.  A bare
     /// pointer on purpose: the engine owns the object and outlives every step
     /// (it is allocated with the engine's arena), so the backend must not copy
     /// or free it -- only write `state` through it, exactly as `dSample` would.
-    sample_sampler: ?*sampler.Sampler = null,
 
     // ---- decode CUDA graph ($QWEN35_CUDA_GRAPH) -----------------------------
     //
@@ -4824,16 +4822,16 @@ const attn_score_arity: usize = 11;
     /// recorded so the graph retargets it one row per token exactly like the
     /// f32 append.  The CPU path is the correctness net for a broken/missing
     /// device (mirrors `dCopyRange`), never the normal route.
-    fn dKvAppend_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
+    fn dKvAppend_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.kv_append)) return;
         if (rows == 0) return;
         // f32: the historical path, unchanged (and graph-identical).
         if (self.kv_type == .f32) {
             if (rows == 1) {
-                CudaBackend.dCopyRangeSlot_body(ctx, dst.span(slot * kv_dim, kv_dim), src, slot);
+                CudaBackend.dCopyRangeSlot_body(g, ctx, dst.span(slot * kv_dim, kv_dim), src, slot);
             } else {
-                CudaBackend.dCopyRange_body(ctx, dst.span(slot * kv_dim, rows * kv_dim), src);
+                CudaBackend.dCopyRange_body(g, ctx, dst.span(slot * kv_dim, rows * kv_dim), src);
             }
             return;
         }
@@ -4845,7 +4843,7 @@ const attn_score_arity: usize = 11;
         const row_bytes = backend.kvRowBytes(kv_dim, self.kv_type);
         const nblocks = rows * (kv_dim / 32);
         if (self.cu == null or kv_dim % 32 != 0) {
-            cpu_mod.CpuBackend.vtable.kvAppend(@ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
+            cpu_mod.CpuBackend.vtable.kvAppend(.{}, @ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
             return;
         }
         const cu = &self.cu.?;
@@ -4882,7 +4880,7 @@ const attn_score_arity: usize = 11;
         if (rc == cudart.cudaSuccess) return;
         if (self.capturing()) self.graphAbandon("kv_quant launch failed");
         self.ewLaunchFail("kv_quant", rc);
-        cpu_mod.CpuBackend.vtable.kvAppend(@ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
+        cpu_mod.CpuBackend.vtable.kvAppend(.{}, @ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
     }
 
     /// Release every region `dAllocBuf` handed out, plus the reusable scratch
@@ -5079,7 +5077,8 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.scaleVec(@ptrCast(&self.cpu), x, s);
     }
 
-    fn dAddResid_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dAddResid_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.add_resid)) return;
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
@@ -5087,7 +5086,7 @@ const attn_score_arity: usize = 11;
         // rather than silently truncating to the shorter.
         if (src.len != dst.len) {
             std.debug.print("cuda backend: addResid length mismatch (dst={d} src={d}); using the CPU path\n", .{ dst.len, src.len });
-            cpu_mod.CpuBackend.vtable.addResid(@ptrCast(&self.cpu), dst, src);
+            cpu_mod.CpuBackend.vtable.addResid(.{}, @ptrCast(&self.cpu), dst, src);
             return;
         }
         if (self.cu != null) {
@@ -5099,7 +5098,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.addResid(@ptrCast(&self.cpu), dst, src);
+        cpu_mod.CpuBackend.vtable.addResid(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
     /// True when this `Buf` is NOT one of ours, i.e. it wraps ordinary host
@@ -5135,7 +5134,7 @@ const attn_score_arity: usize = 11;
     /// recompute it per token (`base + slot * stride`).  A plain `copyRange`
     /// cannot be used here: nothing about the arguments says which of a token's
     /// dozens of `copy_range` launches is the cache append.
-    fn dCopyRangeSlot_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
+    fn dCopyRangeSlot_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         const self = self_(ctx);
         // The KV append is INSIDE the graph: the engine hands over `cache.row(slot)`
         // as the destination, a pointer that advances one row per token, and the
@@ -5154,17 +5153,18 @@ const attn_score_arity: usize = 11;
                 }
             }
         }
-        CudaBackend.dCopyRange_body(ctx, dst, src);
+        CudaBackend.dCopyRange_body(g, ctx, dst, src);
     }
 
-    fn dCopyRange_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dCopyRange_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         // Same contract as `addResid`: `elementwise.bufCopyRange` is a plain
         // `@memcpy`, which requires equal lengths.  Mismatch = engine bug ->
         // CPU path, not a silent partial copy.
         if (src.len != dst.len) {
             std.debug.print("cuda backend: copyRange length mismatch (dst={d} src={d}); using the CPU path\n", .{ dst.len, src.len });
-            cpu_mod.CpuBackend.vtable.copyRange(@ptrCast(&self.cpu), dst, src);
+            cpu_mod.CpuBackend.vtable.copyRange(.{}, @ptrCast(&self.cpu), dst, src);
             return;
         }
         if (self.cu != null) {
@@ -5179,15 +5179,16 @@ const attn_score_arity: usize = 11;
                 } else {
                     // `src` is host memory (an f32 embedding row).  Same kernel,
                     // opposite direction: this is the documented H2D path.
-                    CudaBackend.dCopyFromHost(@ptrCast(self), dst, src.slice()[0..dst.len]);
+                    CudaBackend.dCopyFromHost(.{}, @ptrCast(self), dst, src.slice()[0..dst.len]);
                     return;
                 }
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.copyRange(@ptrCast(&self.cpu), dst, src);
+        cpu_mod.CpuBackend.vtable.copyRange(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
-    fn dZeroBuf_body(ctx: *anyopaque, buf: backend.Buf) void {
+    fn dZeroBuf_body(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.zero_buf)) return;
         if (self.cu != null) {
@@ -5216,7 +5217,8 @@ const attn_score_arity: usize = 11;
     //
     // Everything else in this file is device-to-device.
 
-    fn dCopyFromHost_body(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+    fn dCopyFromHost_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+        _ = g;
         const self = self_(ctx);
         // The bytes behind `dst` just changed, so anything quantised from it is
         // stale.  Conservative and free: the next matvec re-quantises.
@@ -5256,10 +5258,11 @@ const attn_score_arity: usize = 11;
             } else return;
         }
         // A length mismatch is an engine bug; let the CPU reference report it.
-        cpu_mod.CpuBackend.vtable.copyFromHost(@ptrCast(&self.cpu), dst, src);
+        cpu_mod.CpuBackend.vtable.copyFromHost(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
-    fn dCopyToHost_body(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+    fn dCopyToHost_body(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         std.debug.assert(dst.len <= src.len);
         if (self.capturing()) self.graphAbandon("device-to-host copy inside forward");
@@ -5281,7 +5284,7 @@ const attn_score_arity: usize = 11;
                 self.ewLaunchFail("copyToHost", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.copyOut(@ptrCast(&self.cpu), dst, src);
+        cpu_mod.CpuBackend.vtable.copyOut(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
     // ==== slots: norms / activations (P2b, second batch) ====================
@@ -5417,12 +5420,13 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
     }
 
-    fn dMulSigmoid_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSigmoid_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.mul_sigmoid)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
-            cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
+            cpu_mod.CpuBackend.vtable.mulSigmoid(.{}, @ptrCast(&self.cpu), out, gate);
             return;
         }
         if (self.cu != null) {
@@ -5434,15 +5438,16 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
+        cpu_mod.CpuBackend.vtable.mulSigmoid(.{}, @ptrCast(&self.cpu), out, gate);
     }
 
-    fn dSwiglu_body(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+    fn dSwiglu_body(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.swiglu)) return;
         if (up.len != gate.len) {
             std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
-            cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
+            cpu_mod.CpuBackend.vtable.swiglu(.{}, @ptrCast(&self.cpu), gate, up);
             return;
         }
         if (self.cu != null) {
@@ -5454,10 +5459,11 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
+        cpu_mod.CpuBackend.vtable.swiglu(.{}, @ptrCast(&self.cpu), gate, up);
     }
 
-    fn dSoftmax_body(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSoftmax_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.softmax)) return;
         if (self.cu != null) {
@@ -5467,7 +5473,7 @@ const attn_score_arity: usize = 11;
                 self.ewLaunchFail("softmax", rc);
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.softmax(@ptrCast(&self.cpu), x);
+        cpu_mod.CpuBackend.vtable.softmax(.{}, @ptrCast(&self.cpu), x);
     }
 
     // ==== sampling (P2c: logits are device memory) ==========================
@@ -5491,30 +5497,31 @@ const attn_score_arity: usize = 11;
     /// 36 such calls totalled 235 ms of host wait against 9 us of kernel time --
     /// each one waited on the whole preceding round's launches, so paying that
     /// wait five times per round was pure loss.
-    fn dArgmaxRows(ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
+    fn dArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
+        _ = g;
         const self = self_(ctx);
         std.debug.assert(out.len >= rows and rows > 0);
         if (self.cu == null or logits.len == 0 or logits.len % rows != 0) {
             // Host memory (or a malformed region): the CPU oracle is the
             // definition, so fall back to it rather than refusing.
-            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         }
         const px = dBufPtr(logits) orelse {
-            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         };
         const cu = &self.cu.?;
         const vocab: usize = logits.len / rows;
         const bytes = rows * @sizeOf(c_int);
         ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, bytes) catch {
-            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         };
         const rc = Launch.argmax_batch(px, @intCast(vocab), @intCast(rows), @ptrCast(@alignCast(self.d_idx)), null);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("argmax_batch", rc);
-            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         }
         var host: [spec_argmax_rows]c_int = undefined;
@@ -5522,7 +5529,7 @@ const attn_score_arity: usize = 11;
         const rc2 = cu.lib.Memcpy(&host, self.d_idx, bytes, cudart.MemcpyDeviceToHost);
         if (rc2 != cudart.cudaSuccess) {
             self.ewLaunchFail("argmax_batch index download", rc2);
-            cpu_mod.CpuBackend.vtable.argmaxRows(@ptrCast(&self.cpu), logits, rows, out);
+            cpu_mod.CpuBackend.vtable.argmaxRows(.{}, @ptrCast(&self.cpu), logits, rows, out);
             return;
         }
         for (0..rows) |r| out[r] = @intCast(host[r]);
@@ -5579,13 +5586,15 @@ const attn_score_arity: usize = 11;
         return bi;
     }
 
-    fn dArgmaxConf(ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
+    fn dArgmaxConf(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
+        _ = g;
         const self = self_(ctx);
         if (self.gs().state == .live) p.* = 1.0; // the graph already ran it
         return self.argmaxConf(logits, p);
     }
 
-    fn dArgmax_body(ctx: *anyopaque, logits: backend.Buf) u32 {
+    fn dArgmax_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
+        _ = g;
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
             if (dBufPtr(logits)) |px| {
@@ -5669,7 +5678,7 @@ const attn_score_arity: usize = 11;
                 return @intCast(host_idx);
             } else return 0;
         }
-        return cpu_mod.CpuBackend.vtable.argmax(@ptrCast(&self.cpu), logits);
+        return cpu_mod.CpuBackend.vtable.argmax(.{}, @ptrCast(&self.cpu), logits);
     }
 
     /// Grow the A/B host row to at least `n` floats.  Only ever called from the
@@ -5814,7 +5823,8 @@ const attn_score_arity: usize = 11;
     ///     be captured; `stepEnd` performs it after the graph has been closed, and
     ///     `sampledToken` hands the value to the engine.  On the direct path the
     ///     download happens immediately and `sampledToken` is the identity.
-    fn dSample_body(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+    fn dSample_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+        _ = g;
         const self = self_(ctx);
         // A/B switch: run the CPU reference sampler on the GPU's own logits.
         //
@@ -5837,23 +5847,23 @@ const attn_score_arity: usize = 11;
             // demand and reused, and the copy is blocking -- this whole branch is
             // a debug A/B, never the compute path.
             if (!self.ensureSampleAbHost(logits.len)) {
-                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
             }
             const dst = self.h_sample_ab.?[0..logits.len];
             // Inlined blocking D2H (`dCopyToHost_body` is a sibling struct's
             // method and is not reachable by name from here).
             const cu = &(self.cu orelse return cpu_mod.CpuBackend.vtable.sample(
-                @ptrCast(&self.cpu), logits, scratch, sp,
+                .{}, @ptrCast(&self.cpu), logits, scratch, sp,
             ));
             const ps = dBufPtr(logits) orelse return cpu_mod.CpuBackend.vtable.sample(
-                @ptrCast(&self.cpu), logits, scratch, sp,
+                .{}, @ptrCast(&self.cpu), logits, scratch, sp,
             );
             const rc = cu.lib.Memcpy(
                 @ptrCast(dst.ptr), @ptrCast(ps), dst.len * @sizeOf(f32), cudart.MemcpyDeviceToHost,
             );
             if (rc != cudart.cudaSuccess) {
                 self.ewLaunchFail("sample ab row download", rc);
-                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
             }
             const host_row = backend.Buf.wrap(dst);
             // `scratch` reaches the CPU sampler too, and the engine's copy is a
@@ -5865,65 +5875,50 @@ const attn_score_arity: usize = 11;
                 self.h_sample_ab_scratch = alloc.alloc(f32, logits.len) catch null;
             }
             const hs = self.h_sample_ab_scratch orelse
-                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), host_row, scratch, sp);
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), host_row, scratch, sp);
             return cpu_mod.CpuBackend.vtable.sample(
-                @ptrCast(&self.cpu), host_row, backend.Buf.wrap(hs[0..logits.len]), sp,
+                .{}, @ptrCast(&self.cpu), host_row, backend.Buf.wrap(hs[0..logits.len]), sp,
             );
         }
         // The device sampler owns its own scratch (`d_sample_scratch`); the
         // engine-provided one is only needed by the CPU fallbacks below.
         if (self.cu == null or logits.len == 0) {
-            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // `gOpGate` cannot be used verbatim: it returns true for a REPLAYED step,
-        // where this call still has to produce a token (from the graph's own
-        // output), so the sampler branch is spelled out.
+        // A live S1 graph ran the sampler on `g_stream` during its last replay;
+        // `sample` is still the one that hands the token back, so the download
+        // happens here.  (S3 replaces this with the graph's own control-block
+        // read inside `graphEnd`; until capture exists on the new path, the S1
+        // graph is never live and this branch is unreachable.)
         const replayed = self.gs().state == .live;
         if (replayed) {
-            // The graph already ran the sampler on `g_stream`.  `stepEnd` ordered
-            // that stream before the default one, so the control block holds this
-            // token's result; `collectSampledToken` is deferred to `stepEnd`.
-            self.sample_pending = true;
-            self.sample_sampler = sp;
-            return 0; // placeholder; `sampledToken` overrides it
+            return self.collectSampledToken(sp);
         }
         if (!self.ensureSampleBufs()) {
-            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
         const px = dBufPtr(logits) orelse
-            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         const stream = self.launchStream(); // capture stream while recording
         if (!self.publishSampleCtl(logits.len, sp, stream)) {
-            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
         const rc = Launch.sample(
             px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,
         );
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("sample", rc);
-            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        if (self.capturing()) {
-            // Inside the capture: nothing can be downloaded, and nothing needs to
-            // be -- this step's token comes back through `stepEnd`.
-            self.sample_pending = true;
-            self.sample_sampler = sp;
-            return 0;
-        }
-        // Direct path: the launch is on the default stream, so a blocking copy
-        // right here is already ordered after it.
-        self.sample_pending = false;
-        self.sample_sampler = null;
+        // S2: `sample` returns the token.  On the DIRECT path the launch is on
+        // the default stream, so a blocking copy here is already ordered after
+        // it.  Inside a capture nothing can be downloaded -- this branch is
+        // unreachable until S3 makes capture real again.
+        if (self.capturing()) return 0;
         return self.collectSampledToken(sp);
     }
 
     /// The token from the current step's `sample`, after `stepEnd` downloaded it.
-    fn dSampledToken(ctx: *anyopaque, hinted: u32) u32 {
-        const self = self_(ctx);
-        if (!self.sample_pending) return hinted;
-        self.sample_pending = false;
-        return self.sample_token;
-    }
 
     // ==== slots: the two state machines (P2c) ===============================
     //
@@ -5938,9 +5933,10 @@ const attn_score_arity: usize = 11;
     // attn.cu): accumulation order follows the CPU reference element by
     // element, and neither is bit-exact (FMA contraction on the device side).
 
-    fn dGdnStep_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStep_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_step)) return;
         // vd != 128 is the CPU `gdnFused`'s slow path (four separate kernels);
@@ -5968,7 +5964,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.gdnStep(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, vd);
+        cpu_mod.CpuBackend.vtable.gdnStep(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
     /// Batched `dGdnStep_body`: one launch for all `heads`, otherwise the same
@@ -5981,10 +5977,11 @@ const attn_score_arity: usize = 11;
     /// per-head views the kernel computes must lie inside the buffers the
     /// caller handed us (a head whose slice overruns would read a neighbouring
     /// head's state, which is silent garbage rather than a fault).
-    fn dGdnStepRows_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRows_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_step_rows)) return;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and
@@ -6036,11 +6033,12 @@ const attn_score_arity: usize = 11;
                 }
             }
         }
-        cpu_mod.CpuBackend.vtable.gdnStepRows(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
+        cpu_mod.CpuBackend.vtable.gdnStepRows(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
-    fn dGdnGamma_body(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+    fn dGdnGamma_body(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.gdn_gamma)) return;
         // Every operand here is a backend region.  The two weight rows
@@ -6065,7 +6063,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.gdnGamma(@ptrCast(&self.cpu), a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+        cpu_mod.CpuBackend.vtable.gdnGamma(.{}, @ptrCast(&self.cpu), a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
     /// CUDA form of `VTable.gdnPrefillCore`: the whole chunk's conv+silu, gamma /
@@ -6081,12 +6079,13 @@ const attn_score_arity: usize = 11;
     /// Falls back to the CPU body when any region is not device-resident or a
     /// launch fails -- same policy as every other forwarder here (numbers stay
     /// right, only the speedup is lost).
-    fn dGdnPrefillCore_body(ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+    fn dGdnPrefillCore_body(g: backend.Graph, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
                             wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
                             dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
                             conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
                             ab_stride: usize, gamma_stride: usize, kq_dim: usize,
                             nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void {
+        _ = g;
         const self = self_(ctx);
         const stream = self.launchStream();
         const nk_reps = if (nk != 0) nv / nk else 0;
@@ -6175,6 +6174,7 @@ const attn_score_arity: usize = 11;
             } else return;
         }
         cpu_mod.CpuBackend.vtable.gdnPrefillCore(
+            .{},
             @ptrCast(&self.cpu), qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens,
             conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim,
             nv, nk, kd, conv_k, eps);
@@ -6192,9 +6192,10 @@ const attn_score_arity: usize = 11;
         };
     }
 
-    fn dAttnDecode_body(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnDecode_body(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.attn_decode)) return;
         // `kcache`/`vcache` are the first `slot+1` rows of the layer's cache, so
@@ -6328,7 +6329,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.attnDecode(@ptrCast(&self.cpu), q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+        cpu_mod.CpuBackend.vtable.attnDecode(.{}, @ptrCast(&self.cpu), q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
     // rope64: TWO paths, selected at runtime by `$QWEN35_CUDA_ROPE`.
@@ -6499,9 +6500,9 @@ const attn_score_arity: usize = 11;
             // unrotated.  `stat_rope_trips` then counts this head as the host
             // trip it actually was.
         }
-        CudaBackend.dCopyToHost(@ptrCast(self), host[0..n], x);
+        CudaBackend.dCopyToHost(.{}, @ptrCast(self), host[0..n], x);
         cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), backend.Buf.wrap(host[0..n]), pos, base);
-        CudaBackend.dCopyFromHost(@ptrCast(self), x, host[0..n]);
+        CudaBackend.dCopyFromHost(.{}, @ptrCast(self), x, host[0..n]);
         // One H2D + one D2H per rotated head, per position.  Counted so the
         // report can state this remainder's exact share instead of guessing.
         self.stat_rope_trips += 1;
@@ -6562,7 +6563,8 @@ const attn_score_arity: usize = 11;
         cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
     }
 
-    fn dConvStep_body(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+    fn dConvStep_body(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+        _ = g;
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.conv_step)) return;
         // `conv` is the GDN sliding window and is BOTH read and written (the
@@ -6574,7 +6576,7 @@ const attn_score_arity: usize = 11;
         // different window must reach the CPU rather than get a wrong answer.
         if (k != 4) {
             std.debug.print("cuda backend: convStep kernel width {d} != 4; using the CPU path\n", .{k});
-            cpu_mod.CpuBackend.vtable.convStep(@ptrCast(&self.cpu), conv, y, wconv, k);
+            cpu_mod.CpuBackend.vtable.convStep(.{}, @ptrCast(&self.cpu), conv, y, wconv, k);
             return;
         }
         if (conv.len == 3 * y.len and wconv.len == 4 * y.len and self.cu != null) {
@@ -6588,7 +6590,7 @@ const attn_score_arity: usize = 11;
                 } else return;
             } else return;
         }
-        cpu_mod.CpuBackend.vtable.convStep(@ptrCast(&self.cpu), conv, y, wconv, k);
+        cpu_mod.CpuBackend.vtable.convStep(.{}, @ptrCast(&self.cpu), conv, y, wconv, k);
     }
 
     // ==== profiling / introspection =========================================
@@ -7518,6 +7520,20 @@ const attn_score_arity: usize = 11;
         _ = tier_name;
     }
 
+    /// The explicit-compute-graph hooks.  S2 returns the pass-through graph:
+    /// capture/replay is wired in S3.  The CUDA backend keeps the S1 registry
+    /// alive so the A/B switch (`QWEN35_CUDA_GRAPH`) and the diagnostics still
+    /// describe what is going to happen.
+    fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
+        _ = ctx;
+        return .{ .kind = kind, .ctl = ctl };
+    }
+
+    fn dGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
+        _ = ctx;
+        _ = g;
+    }
+
     fn dSetThreads(ctx: *anyopaque, io: std.Io, nt: usize) void {
         // Only the (non-computational) metadata loader runs on the host; the pool is
         // otherwise unused, but the CPU backend is still told so its profile lines
@@ -7542,42 +7558,6 @@ const attn_score_arity: usize = 11;
     /// replays.  A step that cannot be captured or replayed simply runs as
     /// direct launches -- `stepEnd` then does nothing, because no capture is
     /// open and every `Launch.*` in the step already used the default stream.
-    fn dStepBegin(ctx: *anyopaque, pos: u32) void {
-        const self = self_(ctx);
-        if (!self.gpuReady()) return;
-        // A new token writes new activations, possibly at the same addresses.
-        self.actQClear();
-        if (!graphWanted()) {
-            // `$QWEN35_CUDA_GRAPH=0`: the direct path, untouched.
-            self.gs().state = .off;
-            return;
-        }
-        if (cudart.getenv("QWEN35_GRTIME") != null) self.grMark(true);
-        if (self.gs().state == .live) {
-            // `slot` starts at `pos` in this engine (`slot == kv.len`, advanced
-            // once per step), but it is only a *seed*: `attn_decode`'s own slot is
-            // recorded from the launch itself, so the replay retargets whichever
-            // layers actually ran.  `pos` is the only value this hook needs.
-            self.graphSyncFromDefault();
-            if (!self.graphReplay(pos, pos)) {
-                // Replay failed (e.g. a SetParams rejected).  The graph is torn
-                // down so this and every later step run directly -- the numbers
-                // stay right, only the speedup is lost.
-                self.graphDestroyForFallback();
-            }
-                        return;
-        }
-        if (self.gs().state == .warm and !self.gs().failed) {
-            // Allocate the rope {pos, base} channel BEFORE the capture opens.
-            // A `cudaMalloc` inside an open stream capture is not legal, and the
-            // first `rope64` of the capture step is where it would have landed:
-            // measured as "rope64 launch failed: operation failed due to a
-            // previous error during capture" with the graph abandoned from the
-            // very first token.
-            _ = self.ensureRopeDyn();
-            if (self.graphBegin(pos, pos)) self.gs().capturing_step = true;
-        }
-    }
 
     /// `VTable.selectGraphSlot`：切换 graph 状态槽。0 = decode，1 = verify。
     ///
@@ -7585,82 +7565,10 @@ const attn_score_arity: usize = 11;
     /// `graphUpdateRequired` 每次切换都为真，等于每步重捕获。
     /// `VTable.graphDirect`：进入/离开"非 graph 管辖"段。MTP 的 draft 循环在
     /// verify 的 graph 之外运行，这段里的每个 op 都必须真正执行。
-    fn dGraphDirect(ctx: *anyopaque, on: bool) void {
-        const self = self_(ctx);
-        self.g_direct = on;
-    }
 
-    fn dSelectGraphSlot(ctx: *anyopaque, slot: u8) void {
-        const self = self_(ctx);
-        self.g_cur = @min(@as(usize, slot), self.g_slots.len - 1);
-        // `graphReserve` 只在 decode 启动前跑过一次（那时 `g_cur == 0`），
-        // 所以第二槽永远停在 `.off`、`stepBegin` 也就什么都不做。这里给它
-        // 补上同样的 arm 条件：scratch 早已预留完，可以直接 warm。
-        if (self.gs().state == .off and graphWanted() and self.gpuReady()) {
-            self.gs().state = .warm;
-        }
-        if (cudart.getenv("QWEN35_GRAPHDBG") != null) {
-            std.debug.print("[graphdbg] slot={d} state={s} wanted={} gpu={}\n", .{
-                self.g_cur, @tagName(self.gs().state), graphWanted(), self.gpuReady(),
-            });
-        }
-    }
 
     /// Close a decode step: if this step was captured, instantiate the graph so
     /// the NEXT step can replay it.
-    fn dStepEnd(ctx: *anyopaque) void {
-        if (cudart.getenv("QWEN35_QSTAT") != null) {
-            const self0 = self_(ctx);
-            std.debug.print("[qstat] hit={d} miss={d}\n", .{ self0.q_hit, self0.q_miss });
-        }
-        const self = self_(ctx);
-        if (!self.gs().capturing_step) {
-            // A REPLAYED step lands here.  Its launches went to `g_stream`, and
-            // nothing else orders that private stream against the legacy default
-            // one: `sample`/`argmax` reads logits on the default stream and the
-            // next token's embedding is written there, so without this barrier
-            // the host reads whatever logits happen to be in the buffer --
-            // measured: the very first replayed token came out as garbage while
-            // the capture step (identical arguments, same stream) was correct.
-            // This is the mirror of `graphSyncFromDefault` in `dStepBegin`, and
-            // a replay step is precisely when it is needed, so it cannot live
-            // behind the `g_capturing_step` early return above.
-            if (cudart.getenv("QWEN35_GRTIME") != null) {
-                self.grMark(false);
-                std.debug.print("[grt] n={d} gpu_ms={d:.3} avg={d:.3} tok/s={d:.2}\n",
-                    .{ self.gr_n, self.gr_ms, if (self.gr_n > 0) self.gr_ms / @as(f64, @floatFromInt(self.gr_n)) else 0,
-                        if (self.gr_ms > 0) @as(f64, @floatFromInt(self.gr_n)) * 1000.0 / self.gr_ms else 0 });
-            }
-            if (self.gs().state == .live) self.graphSyncToDefault();
-            // The graph's tail IS the sampler, so its result is only readable now
-            // -- after the ordering barrier above, and outside any capture, which
-            // is the only place a blocking D2H is legal.  This is the single
-            // 64-byte-per-token crossing the device sampler exists to produce:
-            // 4 bytes of token plus the advanced PRNG state.
-            if (self.sample_pending) {
-                if (self.sample_sampler) |sp| _ = self.collectSampledToken(sp);
-            }
-            return;
-        }
-        self.gs().capturing_step = false;
-        _ = self.graphEnd();
-        // The captured step ran on `g_stream` (capture still executes).  Its
-        // results -- the token's logits, and the KV row it appended -- have to be
-        // ordered before the default stream samples them and before the next
-        // token's embedding lands; that is exactly what `graphSyncToDefault`
-        // does for a replayed step.  It must ALSO happen here, and the check is
-        // `g_state` rather than "did we just replay": `graphEnd` flips the state
-        // to `.live` when instantiation succeeds, so the one step that needs the
-        // barrier most -- the capture step, the only one which executed on the
-        // graph stream before any replay -- is the one where `g_state` is
-        // already `.live` on entry to this function.
-        if (self.gs().state == .live) self.graphSyncToDefault();
-        // The capture step executed too (capture still runs the kernels), so its
-        // token has to be downloaded the same way a replayed step's is.
-        if (self.sample_pending) {
-            if (self.sample_sampler) |sp| _ = self.collectSampledToken(sp);
-        }
-    }
 
     fn dProfPhase(ctx: *anyopaque, on: bool) void {
         const self = self_(ctx);
@@ -7849,16 +7757,16 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `addResid` slot, timed (`$QWEN35_PROF`).
-    fn dAddResid(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dAddResid(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.add_resid, t0);
         if (self.ablated(.add_resid)) return ;
-        dAddResid_body(ctx, dst, src);
+        dAddResid_body(g, ctx, dst, src);
     }
 
     /// The `copyRange` slot, timed (`$QWEN35_PROF`).
-    fn dCopyRange(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dCopyRange(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         // Per-width accounting, alongside the slot total.  The bucket comes from
@@ -7869,33 +7777,33 @@ const attn_score_arity: usize = 11;
             const b = &self.stat_copy_bins[copyBinOf(src.len)];
             b.n += 1;
             b.elems += src.len;
-            dCopyRange_body(ctx, dst, src);
+            dCopyRange_body(g, ctx, dst, src);
             const ns = durNs(t, self.io);
             b.ns += ns;
             self.slotExit(.copy_range, t);
             return;
         }
-        dCopyRange_body(ctx, dst, src);
+        dCopyRange_body(g, ctx, dst, src);
     }
 
     /// KV append, counted in the same slot as `copyRange` (it IS a copy; the
     /// only difference is that the capture records its destination).  Kept
     /// apart from `dCopyRange` so the recording cannot be reached from the
     /// generic path, where a moving destination does not exist.
-    fn dCopyRangeSlot(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
+    fn dCopyRangeSlot(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         if (t0) |t| {
             const b = &self.stat_copy_bins[copyBinOf(src.len)];
             b.n += 1;
             b.elems += src.len;
-            dCopyRangeSlot_body(ctx, dst, src, slot);
+            dCopyRangeSlot_body(g, ctx, dst, src, slot);
             const ns = durNs(t, self.io);
             b.ns += ns;
             self.slotExit(.copy_range, t);
             return;
         }
-        dCopyRangeSlot_body(ctx, dst, src, slot);
+        dCopyRangeSlot_body(g, ctx, dst, src, slot);
     }
 
     /// The `deinterleaveQG` slot, timed (`$QWEN35_PROF`).
@@ -7905,7 +7813,8 @@ const attn_score_arity: usize = 11;
     /// `2*heads` `copyRange` launches.  Not a `cudaMemcpy`: the two halves of a
     /// head are interleaved with the *other* half, so no single linear copy
     /// can produce the dense layout -- hence the kernel.
-    fn dDeinterleaveQG(ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
+    fn dDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
+        _ = g;
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
@@ -7923,14 +7832,15 @@ const attn_score_arity: usize = 11;
         }
         // CPU fallback: either there is no device, or a pointer was not a
         // device region (host `Buf`s reach this vtable only in tests).
-        cpu_mod.CpuBackend.vtable.deinterleaveQG(@ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd);
+        cpu_mod.CpuBackend.vtable.deinterleaveQG(.{}, @ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd);
     }
 
     /// Chunk-wide `deinterleaveQG`: `tokens` rows in one launch.  Same move as
     /// `dDeinterleaveQG`, so this is exact; it exists because the per-row form
     /// cost 940 launches per 525-token prefill (1.2% of device time at 6 us).
-    fn dDeinterleaveQGStrided(ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
+    fn dDeinterleaveQGStrided(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
                               src: backend.Buf, heads: usize, hd: usize, tokens: usize) void {
+        _ = g;
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
@@ -7951,33 +7861,33 @@ const attn_score_arity: usize = 11;
                 }
             }
         }
-        cpu_mod.CpuBackend.vtable.deinterleaveQGStrided(@ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd, tokens);
+        cpu_mod.CpuBackend.vtable.deinterleaveQGStrided(.{}, @ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd, tokens);
     }
 
     /// The `zeroBuf` slot, timed (`$QWEN35_PROF`).
-    fn dZeroBuf(ctx: *anyopaque, buf: backend.Buf) void {
+    fn dZeroBuf(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.zero_buf, t0);
         if (self.ablated(.zero_buf)) return ;
-        dZeroBuf_body(ctx, buf);
+        dZeroBuf_body(g, ctx, buf);
     }
 
     /// The `copyFromHost` slot, timed (`$QWEN35_PROF`).
-    fn dCopyFromHost(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+    fn dCopyFromHost(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.copy_from_host, t0);
         if (self.ablated(.copy_from_host)) return ;
-        dCopyFromHost_body(ctx, dst, src);
+        dCopyFromHost_body(g, ctx, dst, src);
     }
 
     /// The `copyToHost` slot, timed (`$QWEN35_PROF`).
-    fn dCopyToHost(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+    fn dCopyToHost(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.copy_to_host, t0);
-        dCopyToHost_body(ctx, dst, src);
+        dCopyToHost_body(g, ctx, dst, src);
     }
 
     /// The `rmsnorm` slot, timed (`$QWEN35_PROF`).
@@ -8036,66 +7946,66 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `mulSigmoid` slot, timed (`$QWEN35_PROF`).
-    fn dMulSigmoid(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSigmoid(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_sigmoid, t0);
         if (self.ablated(.mul_sigmoid)) return ;
-        dMulSigmoid_body(ctx, out, gate);
+        dMulSigmoid_body(g, ctx, out, gate);
     }
 
     /// The `swiglu` slot, timed (`$QWEN35_PROF`).
-    fn dSwiglu(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+    fn dSwiglu(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.swiglu, t0);
         if (self.ablated(.swiglu)) return ;
-        dSwiglu_body(ctx, gate, up);
+        dSwiglu_body(g, ctx, gate, up);
     }
 
     /// The `softmax` slot, timed (`$QWEN35_PROF`).
-    fn dSoftmax(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSoftmax(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.softmax, t0);
         if (self.ablated(.softmax)) return ;
-        dSoftmax_body(ctx, x);
+        dSoftmax_body(g, ctx, x);
     }
 
     /// The `argmax` slot, timed (`$QWEN35_PROF`).
-    fn dArgmax(ctx: *anyopaque, logits: backend.Buf) u32 {
+    fn dArgmax(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.argmax, t0);
         if (self.ablated(.argmax)) return 0;
-        return dArgmax_body(ctx, logits);
+        return dArgmax_body(g, ctx, logits);
     }
 
     /// The `sample` slot, timed (`$QWEN35_PROF`).
-    fn dSample(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+    fn dSample(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.sample, t0);
         if (self.ablated(.sample)) return 0;
-        return dSample_body(ctx, logits, scratch, sp);
+        return dSample_body(g, ctx, logits, scratch, sp);
     }
 
     /// The `gdnStep` slot, timed (`$QWEN35_PROF`).
-    fn dGdnStep(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStep(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
         if (self.ablated(.gdn_step)) return ;
-        dGdnStep_body(ctx, state, k, v, q, km, delta, out, gamma, beta, vd);
+        dGdnStep_body(g, ctx, state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
     /// The batched `gdnStep` slot, timed under the SAME `.gdn_step` slot as the
     /// single-row one: it does the same work for all heads, so the `PROF-SLOT`
     /// line stays comparable across the change (calls drops by `heads`x, which
     /// is the check that the batching actually took effect).
-    fn dGdnStepRows(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRows(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                     q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                     gamma: backend.Buf, beta: backend.Buf,
                     heads: usize, nk: usize, kd: usize, vd: usize) void {
@@ -8103,7 +8013,7 @@ const attn_score_arity: usize = 11;
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
         if (self.ablated(.gdn_step)) return ;
-        dGdnStepRows_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
+        dGdnStepRows_body(g, ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
     /// Chunk-wide `gdnStepRows` (`VTable.gdnStepRowsChunk`): the same state
@@ -8114,11 +8024,12 @@ const attn_score_arity: usize = 11;
     /// 10,500 launches for a 525-token prefill (48 GDN layers), whose device
     /// time was 42 ms but whose wall clock was 641 ms.  Deleting the loop
     /// outright (measurement only) took prefill 299 -> 453 tok/s.
-    fn dGdnStepRowsChunk_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsChunk_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                               q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                               gamma: backend.Buf, beta: backend.Buf,
                               heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
                               k_stride: usize, v_stride: usize, q_stride: usize) void {
+        _ = g;
         const self = self_(ctx);
         // Same shape gate as the per-row body, plus the strides the chunk form
         // needs.  The last row must be fully inside each buffer, so the length
@@ -8222,7 +8133,7 @@ const attn_score_arity: usize = 11;
         }
         // Fallback: the CPU oracle walks the rows one at a time, so a shape or
         // residency miss costs speed, never correctness.
-        cpu_mod.CpuBackend.vtable.gdnStepRowsChunk(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        cpu_mod.CpuBackend.vtable.gdnStepRowsChunk(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
     /// `VTable.gdnStepRowsSnap`：chunk 递推 + 每行一份状态快照。
@@ -8233,11 +8144,12 @@ const attn_score_arity: usize = 11;
     ///
     /// 代价：只有 decode 的 verify 会调（`rows <= spec_verify_rows`），prefill
     /// 热路径完全不受影响。
-    fn dGdnStepRowsSnap_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsSnap_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                              q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                              gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
                              heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
                              k_stride: usize, v_stride: usize, q_stride: usize) void {
+        _ = g;
         const self = self_(ctx);
         const per = heads * kd * vd;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and rows != 0 and
@@ -8286,10 +8198,10 @@ const attn_score_arity: usize = 11;
             }
         }
         // 形状或驻留不满足：走 CPU oracle（逐行 + 逐行快照），只慢不错。
-        cpu_mod.CpuBackend.vtable.gdnStepRowsSnap(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        cpu_mod.CpuBackend.vtable.gdnStepRowsSnap(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
-    fn dGdnStepRowsSnap(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsSnap(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                         q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                         gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
                         heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -8298,10 +8210,10 @@ const attn_score_arity: usize = 11;
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
         if (self.ablated(.gdn_step)) return ;
-        dGdnStepRowsSnap_body(ctx, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        dGdnStepRowsSnap_body(g, ctx, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
-    fn dGdnStepRowsChunk(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsChunk(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -8310,22 +8222,22 @@ const attn_score_arity: usize = 11;
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
         if (self.ablated(.gdn_step)) return ;
-        dGdnStepRowsChunk_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        dGdnStepRowsChunk_body(g, ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
     /// The `gdnGamma` slot, timed (`$QWEN35_PROF`).
-    fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+    fn dGdnGamma(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_gamma, t0);
         if (self.ablated(.gdn_gamma)) return ;
-        dGdnGamma_body(ctx, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+        dGdnGamma_body(g, ctx, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
     /// The prefill-only GDN prelude, timed separately so a profile shows
     /// directly how many launches the per-token form used to cost.
-    fn dGdnPrefillCore(ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+    fn dGdnPrefillCore(g: backend.Graph, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
                        wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
                        dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
                        conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
@@ -8334,20 +8246,20 @@ const attn_score_arity: usize = 11;
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_prelude, t0);
-        dGdnPrefillCore_body(ctx, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens,
+        dGdnPrefillCore_body(g, ctx, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens,
             conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim,
             nv, nk, kd, conv_k, eps);
     }
 
     /// The `attnDecode` slot, timed (`$QWEN35_PROF`).
-    fn dAttnDecode(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnDecode(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.attn_decode, t0);
         if (self.ablated(.attn_decode)) return ;
-        dAttnDecode_body(ctx, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+        dAttnDecode_body(g, ctx, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
     /// `attnChunk` -- the chunk-wide prefill attention, timed separately
@@ -8358,7 +8270,7 @@ const attn_score_arity: usize = 11;
     /// a size violation degrades to known-good behaviour instead of a launch on
     /// bad pointers.  The CUDA kernel was gated bit-identical against exactly
     /// that per-row form (`/tmp/gate_attn_chunk.cu`).
-    fn dAttnChunk(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnChunk(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                   vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot0: usize,
                   rows: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize,
                   scale: f32) void {
@@ -8464,7 +8376,7 @@ const attn_score_arity: usize = 11;
         // Fall back row by row (bad shapes, no device, or a rejected slice).
         var r: usize = 0;
         while (r < rows) : (r += 1) {
-            dAttnDecode_body(ctx,
+            dAttnDecode_body(g, ctx,
                 q.span(r * row_len, row_len),
                 gate.span(r * row_len, row_len),
                 kcache, vcache, att,
@@ -8565,12 +8477,12 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `convStep` slot, timed (`$QWEN35_PROF`).
-    fn dConvStep(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+    fn dConvStep(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.conv_step, t0);
         if (self.ablated(.conv_step)) return ;
-        dConvStep_body(ctx, conv, y, wconv, k);
+        dConvStep_body(g, ctx, conv, y, wconv, k);
     }
 
 };
@@ -8594,10 +8506,8 @@ pub const vtable = backend.Exec.VTable{
     .profPhase = CudaBackend.dProfPhase,
     .profReset = CudaBackend.dProfReset,
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
-    .stepBegin = CudaBackend.dStepBegin,
-    .stepEnd = CudaBackend.dStepEnd,
-    .selectGraphSlot = CudaBackend.dSelectGraphSlot,
-    .graphDirect = CudaBackend.dGraphDirect,
+    .graphBegin = CudaBackend.dGraphBegin,
+    .graphEnd = CudaBackend.dGraphEnd,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .profReport = CudaBackend.dProfReport,
@@ -8644,7 +8554,6 @@ pub const vtable = backend.Exec.VTable{
     .argmaxConf = CudaBackend.dArgmaxConf,
     .argmaxRows = CudaBackend.dArgmaxRows,
     .sample = CudaBackend.dSample,
-    .sampledToken = CudaBackend.dSampledToken,
     // The four pure elementwise slots.  Forwarders, NOT aliases: they need
     // `ctx` to reach the device, and the ctx here is a `*CudaBackend`
     // (aliasing a CPU body would work only because those bodies ignore ctx).

@@ -957,7 +957,8 @@ pub const CpuBackend = struct {
     }
 
     /// `VTable.kvAppend`: see `kvAppendRows`.
-    fn vKvAppend(ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+    fn vKvAppend(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+        _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         kvAppendRows(self.kv_type, dst, src, slot, kv_dim, rows);
     }
@@ -987,28 +988,17 @@ pub const CpuBackend = struct {
         _ = ctx;
     }
 
-    /// Decode-step boundary: nothing to do on the CPU.  The bounds exist for a
-    /// device backend that can replay a step as one graph; the CPU executes
-    /// straight-line code, so there is nothing to capture or replay.
-    fn vStepBegin(ctx: *anyopaque, pos: u32) void {
+    /// The explicit-compute-graph hooks.  The CPU runs straight-line code: there
+    /// is nothing to capture and nothing to replay, so `graphBegin` hands back
+    /// the pass-through graph (`ptr == null`) and every op ignores its `g`.
+    fn vGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
         _ = ctx;
-        _ = pos;
+        return .{ .kind = kind, .ctl = ctl };
     }
 
-    fn vStepEnd(ctx: *anyopaque) void {
+    fn vGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
         _ = ctx;
-    }
-
-    /// `VTable.selectGraphSlot`: the CPU backend has no CUDA graph, so the
-    /// slot selection is a no-op.
-    fn vSelectGraphSlot(ctx: *anyopaque, slot: u8) void {
-        _ = ctx;
-        _ = slot;
-    }
-
-    fn vGraphDirect(ctx: *anyopaque, on: bool) void {
-        _ = ctx;
-        _ = on;
+        _ = g;
     }
 
     fn vName(ctx: *anyopaque) []const u8 {
@@ -1161,33 +1151,39 @@ pub const CpuBackend = struct {
         ew.bufMulSilu(out, gate);
     }
 
-    fn vMulSigmoid(ctx: *anyopaque, out: Buf, gate: Buf) void {
+    fn vMulSigmoid(g: backend.Graph, ctx: *anyopaque, out: Buf, gate: Buf) void {
         _ = ctx;
+        _ = g;
         ew.bufMulSigmoid(out, gate);
     }
 
-    fn vSoftmax(ctx: *anyopaque, x: Buf) void {
+    fn vSoftmax(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
         _ = ctx;
+        _ = g;
         ew.bufSoftmax(x);
     }
 
-    fn vAddResid(ctx: *anyopaque, dst: Buf, src: Buf) void {
+    fn vAddResid(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
+        _ = g;
         ew.bufAddResid(dst, src);
     }
 
-    fn vSwiglu(ctx: *anyopaque, gate: Buf, up: Buf) void {
+    fn vSwiglu(g: backend.Graph, ctx: *anyopaque, gate: Buf, up: Buf) void {
         _ = ctx;
+        _ = g;
         ew.bufSwiglu(gate, up);
     }
 
-    fn vConvStep(ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
+    fn vConvStep(g: backend.Graph, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
         _ = ctx;
+        _ = g;
         ew.bufConvStep(conv, y, wconv, k);
     }
 
-    fn vGdnStep(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
+    fn vGdnStep(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
         _ = ctx;
+        _ = g;
         ew.bufGdnStep(state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
@@ -1203,14 +1199,15 @@ pub const CpuBackend = struct {
     /// writes them, making the repetition a plain re-read.  (Contrast
     /// `l2norm`, which the engine must apply once per repeat because it is not
     /// idempotent.)
-    fn vGdnStepRows(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRows(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                     gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         _ = ctx;
+        _ = g;
         if (heads == 0 or vd == 0 or nk == 0) return;
         // Both are per-head coefficient regions (`gdnGamma`'s output and its
         // in-place sigmoid(b)); the vtable contract is "at least `heads` long".
         std.debug.assert(gamma.len >= heads and beta.len >= heads);
-        const g = gamma.slice();
+        const gam = gamma.slice();
         const b = beta.slice();
         for (0..heads) |h| {
             const kh = h % nk;
@@ -1222,16 +1219,17 @@ pub const CpuBackend = struct {
                 km.span(h * vd, vd),
                 delta.span(h * vd, vd),
                 out.span(h * vd, vd),
-                g[h],
+                gam[h],
                 b[h],
                 vd,
             );
         }
     }
 
-    fn vAttnDecode(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+    fn vAttnDecode(g: backend.Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                    gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
                    kv_dim: usize, scale: f32) void {
+        _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         switch (self.kv_type) {
             // f32 KV: the historical oracle loop, byte-exact.
@@ -1252,12 +1250,12 @@ pub const CpuBackend = struct {
     /// `while (t < k) forwardGdnCore(...)` loop passed, so a device kernel that
     /// fuses the loop has something meaningful to be compared against instead
     /// of a copy checked against a copy.
-    fn vGdnStepRowsChunk(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRowsChunk(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                          gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                          rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         if (heads == 0 or vd == 0 or nk == 0) return;
         for (0..rows) |t| {
-            vGdnStepRows(ctx,
+            vGdnStepRows(g, ctx,
                 state,
                 k.span(t * k_stride, nk * kd),
                 v.span(t * v_stride, heads * vd),
@@ -1274,13 +1272,13 @@ pub const CpuBackend = struct {
     /// CPU 参照实现 for `VTable.gdnStepRowsSnap`: 与 `vGdnStepRowsChunk` 相同的
     /// 逐行 `gdnStepRows`，外加每行结束后拷一份 state（槽 `r-1` = 第 r 行之后）。
     /// 拷贝发生在**两行之间**，这正是设备内核必须复现的性质。
-    fn vGdnStepRowsSnap(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRowsSnap(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                         gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                         rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         if (heads == 0 or vd == 0 or nk == 0) return;
         const per = heads * kd * vd;
         for (0..rows) |t| {
-            vGdnStepRows(ctx,
+            vGdnStepRows(g, ctx,
                 state,
                 k.span(t * k_stride, nk * kd),
                 v.span(t * v_stride, heads * vd),
@@ -1301,13 +1299,13 @@ pub const CpuBackend = struct {
     /// calls the engine made before the chunk slot existed, in the same order.
     /// Keeping the naive loop here is what makes a device implementation's
     /// comparison meaningful instead of a copy checked against a copy.
-    fn vAttnChunk(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+    fn vAttnChunk(g: backend.Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                   gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
                   hd: usize, kv_dim: usize, scale: f32) void {
             const row_len = heads * hd;
             var r: usize = 0;
             while (r < rows) : (r += 1) {
-                vAttnDecode(ctx,
+                vAttnDecode(g, ctx,
                     q.span(r * row_len, row_len),
                     gate.span(r * row_len, row_len),
                     kcache, vcache, att,
@@ -1316,8 +1314,9 @@ pub const CpuBackend = struct {
             }
     }
 
-    fn vGdnGamma(ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+    fn vGdnGamma(g: backend.Graph, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         _ = ctx;
+        _ = g;
         ew.bufGdnGamma(a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
@@ -1325,12 +1324,13 @@ pub const CpuBackend = struct {
     /// engine used to make, in the same order.  A device backend must reproduce
     /// these numbers; keeping this as the naive loop is what makes that a
     /// meaningful comparison rather than a copy against a copy.
-    fn vGdnPrefillCore(ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+    fn vGdnPrefillCore(g: backend.Graph, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
         ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
         ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
         gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
         conv_k: usize, eps: f32) void {
         _ = ctx;
+        _ = g;
         const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
         var t: usize = 0;
         while (t < tokens) : (t += 1) {
@@ -1370,34 +1370,36 @@ pub const CpuBackend = struct {
         _ = eps; // the CPU l2norm pins its own eps, exactly as `Exec.l2norm` does
     }
 
-    fn vCopyRange(ctx: *anyopaque, dst: Buf, src: Buf) void {
+    fn vCopyRange(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
+        _ = g;
         ew.bufCopyRange(dst, src);
     }
 
     /// KV append.  Host memory has no captured schedule, so the slot is
     /// irrelevant here and this is `copyRange` (see `VTable.copyRangeSlot`).
-    fn vCopyRangeSlot(ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void {
+    fn vCopyRangeSlot(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void {
         _ = slot;
-        CpuBackend.vCopyRange(ctx, dst, src);
+        CpuBackend.vCopyRange(g, ctx, dst, src);
     }
 
     /// Host regions on this backend, so the split is the plain per-head copy
     /// (`ew.bufDeinterleaveQG`); it exists as a slot only so a device backend
     /// can replace `2*heads` launches with one.
-    fn vDeinterleaveQG(ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+    fn vDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         _ = ctx;
+        _ = g;
         ew.bufDeinterleaveQG(dst_q, dst_gate, src, heads, hd);
     }
 
     /// CPU oracle for `VTable.deinterleaveQGStrided`: the per-row calls, in row
     /// order.  Pure move, so this is exact, not approximate.
-    fn vDeinterleaveQGStrided(ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf,
+    fn vDeinterleaveQGStrided(g: backend.Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf,
                               heads: usize, hd: usize, tokens: usize) void {
         const row_len = heads * hd;
         var t: usize = 0;
         while (t < tokens) : (t += 1) {
-            vDeinterleaveQG(ctx,
+            vDeinterleaveQG(g, ctx,
                 dst_q.span(t * row_len, row_len),
                 dst_gate.span(t * row_len, row_len),
                 src.span(t * 2 * row_len, 2 * row_len),
@@ -1405,34 +1407,39 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vCopyFromHost(ctx: *anyopaque, dst: Buf, src: []const f32) void {
+    fn vCopyFromHost(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: []const f32) void {
         _ = ctx;
+        _ = g;
         ew.bufCopyFromHost(dst, src);
     }
 
     /// Host slices on this backend, so the "copy" is a plain memcpy (and for
     /// the `beta`/`gamma` scalars, the very same region the caller reads).
-    fn vCopyOut(ctx: *anyopaque, dst: []f32, src: Buf) void {
+    fn vCopyOut(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: Buf) void {
         _ = ctx;
+        _ = g;
         std.debug.assert(dst.len <= src.len);
         @memcpy(dst, src.slice()[0..dst.len]);
     }
 
-    fn vZeroBuf(ctx: *anyopaque, buf: Buf) void {
+    fn vZeroBuf(g: backend.Graph, ctx: *anyopaque, buf: Buf) void {
         _ = ctx;
+        _ = g;
         @memset(buf.slice(), 0);
     }
 
-    fn vArgmax(ctx: *anyopaque, logits: Buf) u32 {
+    fn vArgmax(g: backend.Graph, ctx: *anyopaque, logits: Buf) u32 {
         _ = ctx;
+        _ = g;
         return ew.bufArgmax(logits);
     }
 
     /// Host logits are free to read, so the probability costs one extra pass and
     /// the CPU is a genuine reference for it rather than a "1.0, disabled"
     /// placeholder.
-    fn vArgmaxConf(ctx: *anyopaque, logits: Buf, p: *f32) u32 {
+    fn vArgmaxConf(g: backend.Graph, ctx: *anyopaque, logits: Buf, p: *f32) u32 {
         _ = ctx;
+        _ = g;
         const row = logits.slice();
         if (row.len == 0) {
             p.* = 1.0;
@@ -1455,24 +1462,18 @@ pub const CpuBackend = struct {
     /// CPU oracle for `VTable.argmaxRows`: the same `bufArgmax` per row.  Host
     /// memory has no read-back cost, so this is literally the loop the device
     /// slot replaces -- which is what makes the comparison meaningful.
-    fn vArgmaxRows(ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void {
+    fn vArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void {
         _ = ctx;
+        _ = g;
         const vocab = logits.len / rows;
         std.debug.assert(vocab * rows == logits.len and out.len >= rows);
         for (0..rows) |r| out[r] = ew.bufArgmax(logits.span(r * vocab, vocab));
     }
 
-    fn vSample(ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
+    fn vSample(g: backend.Graph, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         _ = ctx;
+        _ = g;
         return ew.bufSample(logits, scratch, sp);
-    }
-
-    /// The CPU sampler is synchronous, so `vSample` already returned the real
-    /// token and this is the identity.  See `VTable.sampledToken`: the split
-    /// exists only for backends that defer the download past `stepEnd`.
-    fn vSampledToken(ctx: *anyopaque, hinted: u32) u32 {
-        _ = ctx;
-        return hinted;
     }
 
     /// Load a 1-D f32 weight vector by name and hand back a `Buf` over the
@@ -1562,15 +1563,12 @@ pub const CpuBackend = struct {
         .argmaxConf = vArgmaxConf,
         .argmaxRows = vArgmaxRows,
         .sample = vSample,
-        .sampledToken = vSampledToken,
+        .graphBegin = vGraphBegin,
+        .graphEnd = vGraphEnd,
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,
         .profPrefillEnd = vProfPrefillEnd,
-        .stepBegin = vStepBegin,
-        .stepEnd = vStepEnd,
-        .selectGraphSlot = vSelectGraphSlot,
-        .graphDirect = vGraphDirect,
         .name = vName,
         .describe = vDescribe,
         .setTier = vSetTier,
@@ -1815,7 +1813,7 @@ test "gdnPrefillCore equals the per-token primitive sequence" {
     var gamma_serial: [tokens * ab_stride]f32 = @splat(std.math.nan(f32));
 
     const ctx: *anyopaque = undefined;
-    CpuBackend.vGdnPrefillCore(ctx, Buf.wrap(&qkv_batch), Buf.wrap(&conv_batch), Buf.wrap(&wconv),
+    CpuBackend.vGdnPrefillCore(.{}, ctx, Buf.wrap(&qkv_batch), Buf.wrap(&conv_batch), Buf.wrap(&wconv),
         Buf.wrap(&ab_batch), Buf.wrap(&ssm_a), Buf.wrap(&dt_bias),
         Buf.wrap(&gamma_batch), tokens, conv_dim, ab_a_offset, ab_b_offset,
         ab_stride, ab_stride, kq_dim, nv, nk, kd, conv_k, 1e-6);

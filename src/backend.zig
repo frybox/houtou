@@ -139,6 +139,45 @@ pub const LoadError = error{
     BackendUnavailable,
 };
 
+/// What shape of forward a graph captures.  **Decode** is the one-row forward
+/// (`forwardGdn`/`forwardFull`/`forwardMlp`); **chunk** is the K-row forward
+/// (`forwardChunkRun`), shared by prefill and by the speculative verify.
+pub const GraphKind = enum { decode, chunk };
+
+/// Per-step scalars of one graph.  This is the HOST mirror of the device control
+/// block: a backend that replays a captured graph copies this struct to the
+/// device once per step, so a per-token scalar never has to be retargeted on a
+/// graph node (see plan §1.5, `cell`).
+///
+/// A plain opaque-ish record on purpose: the CPU backend stores one of these as
+/// a trivial value and never reads it, so the layout is only a contract between
+/// the engine and a device backend.
+pub const GraphCtl = struct {
+    /// Position of this step's first row (rope phase, KV slot for a single-row
+    /// step).
+    pos: u32 = 0,
+    /// First KV row written by this step (`pos` for decode, `slot0` for a chunk).
+    slot: u32 = 0,
+    /// Rows this step produces (1 for decode, k for a verify chunk).
+    rows: u32 = 1,
+};
+
+/// A forward pass being recorded, replayed, or run straight through.
+///
+/// `ptr == null` is the **pass-through** graph: every op behaves exactly as it
+/// did before this type existed.  The CPU backend always returns that, and so
+/// does a device backend when graphs are disabled or have not been built yet.
+/// A non-null `ptr` is a backend-owned handle (the CUDA backend stores the
+/// registry entry there), and `ctl` is this step's scalars for it.
+pub const Graph = struct {
+    ptr: ?*anyopaque = null,
+    kind: GraphKind = .decode,
+    ctl: GraphCtl = .{},
+
+    /// The graph a caller passes when it wants the historical direct path.
+    pub const direct = Graph{};
+};
+
 /// The hardware boundary.  One instance per loaded model.
 ///
 /// Every method the engine calls during a forward pass is here; the engine
@@ -210,7 +249,7 @@ pub const Exec = struct {
         /// backend the destination advances one row per token exactly like the
         /// historical `copyRangeSlot` KV append (which this replaces).  Prefill
         /// calls it with `rows = k` for the chunk, outside any capture.
-        kvAppend: *const fn (ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void,
+        kvAppend: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void,
 
         // ---- dequantization -------------------------------------------------
         /// Expand one row of a packed weight into `dst` (f32, `cols` wide).
@@ -318,20 +357,20 @@ pub const Exec = struct {
         /// out[i] *= silu(gate[i])
         mulSilu: *const fn (ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// out[i] *= sigmoid(gate[i])
-        mulSigmoid: *const fn (ctx: *anyopaque, out: Buf, gate: Buf) void,
+        mulSigmoid: *const fn (g: Graph, ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// softmax over the whole slice
-        softmax: *const fn (ctx: *anyopaque, x: Buf) void,
+        softmax: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
         /// dst[i] += src[i]
-        addResid: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
+        addResid: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf) void,
         /// SwiGLU: gate[i] = silu(gate[i]) * up[i], in place
-        swiglu: *const fn (ctx: *anyopaque, gate: Buf, up: Buf) void,
+        swiglu: *const fn (g: Graph, ctx: *anyopaque, gate: Buf, up: Buf) void,
         /// Gated Delta Net: one token of the causal conv (history `conv` is
         /// `y.len * 3` floats, oldest..newest) + silu, in place on `y`.
-        convStep: *const fn (ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void,
+        convStep: *const fn (g: Graph, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void,
         /// Gated Delta Net: one token of the delta-rule state update.
         /// state is [nv, kd, vd] (kd == vd == 128), `k`/`q` are kd wide,
         /// `v`/`km`/`delta`/`out` are vd wide, per head.
-        gdnStep: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void,
+        gdnStep: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void,
         /// Batched `gdnStep`: the SAME per-head call, `heads` times, in one
         /// launch instead of `heads` launches (48 of them per token per layer on
         /// this model).  Semantics are defined as "for h in 0..heads-1: the
@@ -369,7 +408,7 @@ pub const Exec = struct {
         /// must NEVER be routed through a `devConst`-style cache: those key on
         /// pointer identity and never re-upload, which would silently serve the
         /// first layer's coefficients forever.
-        gdnStepRows: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRows: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void,
 
         /// Chunk-wide twin of `gdnStepRows` for prefill: `rows` successive state
@@ -395,7 +434,7 @@ pub const Exec = struct {
         /// `2*nk*kd + heads*vd` floats, so their per-token stride is the whole
         /// row, NOT `nk*kd`.  Inferring it from the buffer length would read the
         /// gate half as if it were the next token's k.
-        gdnStepRowsChunk: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRowsChunk: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
             k_stride: usize, v_stride: usize, q_stride: usize) void,
 
@@ -409,7 +448,7 @@ pub const Exec = struct {
         ///   * `snap` 是 `nsnap * heads * kd * vd`，槽 `t` = 跑完第 t+1 行之后
         ///     的状态。第 0 行**之前**的状态不写（调用方自己有）。
         ///   * 空 `snap` 表示不要快照；被拒绝的形状同样退化为普通 chunk 递推。
-        gdnStepRowsSnap: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRowsSnap: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
             k_stride: usize, v_stride: usize, q_stride: usize) void,
 
@@ -418,7 +457,7 @@ pub const Exec = struct {
         /// / `vcache` are this layer's WHOLE KV regions (`kv_dim` elements per
         /// token row, `slot+1` rows written so far); the backend strides them in
         /// its own `KvType` layout.
-        attnDecode: *const fn (ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
+        attnDecode: *const fn (g: Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
             kv_dim: usize, scale: f32) void,
         /// Chunk-wide twin of `attnDecode` for prefill: `rows` tokens in ONE call
@@ -440,11 +479,11 @@ pub const Exec = struct {
         /// Equivalent to calling `attnDecode` once per row with
         /// `slot = slot0 + r`, ULP for ULP -- the CUDA kernel was gated against
         /// exactly that (`/tmp/gate_attn_chunk.cu`: 23 rows, bit-identical).
-        attnChunk: *const fn (ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
+        attnChunk: *const fn (g: Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
             hd: usize, kv_dim: usize, scale: f32) void,
         /// GDN per-token beta/gamma from the raw a/b projections.
-        gdnGamma: *const fn (ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
+        gdnGamma: *const fn (g: Graph, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
 
         /// GDN chunk prelude: the three per-token GDN steps that do NOT depend on
         /// the running state, done for a whole prefill chunk in a handful of
@@ -468,14 +507,14 @@ pub const Exec = struct {
         ///   l2k   [t*row_stride + kq_offset ..]  the k run, same
         /// `nk_reps` is `nv / nk` and is applied to each run in exactly the order
         /// the per-head loop did (q then k, then the q scale, repeated).
-        gdnPrefillCore: *const fn (ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf,
+        gdnPrefillCore: *const fn (g: Graph, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf,
             ab: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf,
             tokens: usize, conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
             ab_stride: usize, gamma_stride: usize,
             kq_dim: usize, nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void,
         /// Region-to-region copy (KV writes, GDN state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
-        copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
+        copyRange: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf) void,
         /// `copyRange` whose destination advances once per token: the KV cache
         /// append, `dst = cache.k/v + slot * kv_dim`.
         ///
@@ -486,7 +525,7 @@ pub const Exec = struct {
         /// token attends to the prefix it saw the first time.  Wrong numbers, no
         /// error, so the slot has to be declared rather than inferred: a bare
         /// device pointer carries no trace of which row of which cache it is.
-        copyRangeSlot: *const fn (ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void,
+        copyRangeSlot: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void,
         /// Split the interleaved `attn_q` projection into `q` and `gate`.
         ///
         /// The GGUF `attn_q` rows are ordered `[h][q_head | gate_head]` -- one
@@ -499,15 +538,15 @@ pub const Exec = struct {
         /// go.
         ///
         /// `dst_q.len == dst_gate.len == heads*hd`, `src.len == 2*heads*hd`.
-        deinterleaveQG: *const fn (ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
+        deinterleaveQG: *const fn (g: Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
         /// Chunk-wide twin of `deinterleaveQG`: `tokens` rows in ONE call.
         /// Row t's `[q|gate]` block starts `t * 2 * heads * hd` floats into
         /// `src`, and row t's q/gate start `t * heads * hd` into each output.
         /// Pure move, no arithmetic -- exactly `tokens` per-row calls.
-        deinterleaveQGStrided: *const fn (ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void,
+        deinterleaveQGStrided: *const fn (g: Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void,
         /// Copy a host tensor row into a backend region (the f32 embedding row
         /// when token_embd is unquantized).
-        copyFromHost: *const fn (ctx: *anyopaque, dst: Buf, src: []const f32) void,
+        copyFromHost: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: []const f32) void,
         /// Copy a small backend region back into a host slice.
         ///
         /// NOT on the per-token path any more: its one historical user was the
@@ -518,17 +557,17 @@ pub const Exec = struct {
         /// style tooling, debug paths).  Never use it to bring activations
         /// back -- that is what P2c removed, and a device->host copy also
         /// serialises the stream.
-        copyOut: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
+        copyOut: *const fn (g: Graph, ctx: *anyopaque, dst: []f32, src: Buf) void,
         /// Zero a region (reset of the conv history / GDN state).
-        zeroBuf: *const fn (ctx: *anyopaque, buf: Buf) void,
+        zeroBuf: *const fn (g: Graph, ctx: *anyopaque, buf: Buf) void,
         /// Greedy argmax over logits.  On a device backend this runs on the
         /// device and the token id is the only thing that comes back.
-        argmax: *const fn (ctx: *anyopaque, logits: Buf) u32,
+        argmax: *const fn (g: Graph, ctx: *anyopaque, logits: Buf) u32,
         /// `argmax` plus the top-1 softmax probability, for the speculative
         /// drafter's confidence early stop.  `p` receives a value in (0, 1];
         /// a backend that cannot produce it cheaply reports 1.0, which makes
         /// the stop a no-op rather than changing any output.
-        argmaxConf: *const fn (ctx: *anyopaque, logits: Buf, p: *f32) u32,
+        argmaxConf: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, p: *f32) u32,
         /// `rows` independent argmaxes over `rows * vocab` contiguous logits
         /// (the batched speculative verify's output), written to `out[0..rows)`.
         ///
@@ -536,31 +575,30 @@ pub const Exec = struct {
         /// device each `argmax` ends in a BLOCKING read-back: measured on 27B
         /// MTP, five per-row calls cost 6.5 ms of host wait each against a 9 us
         /// kernel.  One launch + one copy removes that.
-        argmaxRows: *const fn (ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void,
+        argmaxRows: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void,
         /// Sampling.  The policy/PRNG object stays in the engine (set from the
         /// CLI); the backend runs the algorithm wherever the logits live, so a
         /// device backend samples on the device and returns a 4-byte token id.
         /// Passing the sampler by pointer keeps its PRNG state advancing
         /// identically on both paths.
-        sample: *const fn (ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
-        /// Return the token that the LAST `sample` on this step produced.
-        ///
-        /// WHY THIS EXISTS: a device backend that captures its decode step into a
-        /// CUDA graph needs the sampler to be INSIDE the graph (llama.cpp does
-        /// the same: the sampler is a node of the same `ggml_cgraph`), otherwise
-        /// the graph's tail is a serialised launch + full-vocabulary D2H at the
-        /// one moment the device has nothing to do.  But the token id is the next
-        /// token, so it must reach the host before the next step can exist -- and
-        /// that download cannot happen inside a capture.
-        ///
-        /// So the split is: `sample` LAUNCHES the sampler (inside the span, so it
-        /// is captured); `stepEnd` closes the graph and performs the download; and
-        /// this method hands the value over afterwards.  Its argument is the value
-        /// `sample` returned (`sample` must return a BEST GUESS that this call is
-        /// free to override), which lets a CPU backend -- where the sampler
-        /// already produced the answer synchronously -- be the identity.
-        sampledToken: *const fn (ctx: *anyopaque, hinted: u32) u32,
+        sample: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
 
+
+        // ---- explicit compute graph (XG) ------------------------------------
+        //
+        // A forward pass is handed to the backend as a `Graph`.  The FIRST time
+        // a given (kind, rows) is seen the backend runs it straight through and
+        // warms its lazy allocations; the second time it RECORDS the calls and
+        // instantiates the graph, then launches it once (so the recorded step
+        // really executes); every later time it replays.  See
+        // `src/graph_registry.zig` for the state machine and plan §1.2.
+        //
+        // `graphBegin` returns the handle the engine threads through every op of
+        // the pass; `graphEnd` closes it.  A CPU backend returns the
+        // pass-through graph and does nothing on `graphEnd`, so the engine's
+        // code is identical on both.
+        graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl) Graph,
+        graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
 
         /// Mark a phase boundary in the pool's timing counters (no-op for a
         /// device backend, which reports its own timings).
@@ -572,36 +610,6 @@ pub const Exec = struct {
         /// fires after the decode loop and would fold decode into prefill.
         profPrefillEnd: *const fn (ctx: *anyopaque) void,
 
-        // ---- decode-step boundary -------------------------------------------
-        //
-        // WHAT THIS IS FOR: a CUDA graph can only wrap a whole sequence of
-        // launches that is known in advance, and the only such sequence in this
-        // engine is one decode step's forward pass (weights resident, shapes
-        // fixed, `pos`/`slot` the sole variables).  The engine therefore tells
-        // the backend where that sequence starts and ends; the backend decides
-        // whether to capture it, replay it, or ignore the hint entirely.
-        //
-        // WHY THE HINT IS NEEDED AT ALL: the backend never sees the model's
-        // control flow -- it is called one op at a time -- so without this it
-        // could only guess where a step begins.  Guessing wrong is what a CUDA
-        // graph punishes hardest (a graph spanning two steps replays stale
-        // state, a graph spanning half a step omits ops: both give wrong
-        // numbers with no error).
-        //
-        // `stepBegin` carries `pos`, the step's position, which is the value
-        // that (a) identifies a capturable step and (b) changes every token.
-        // `stepEnd` closes the span.  Both must be no-ops for a CPU backend,
-        // and a device backend must be free to ignore them.
-        stepBegin: *const fn (ctx: *anyopaque, pos: u32) void,
-        stepEnd: *const fn (ctx: *anyopaque) void,
-        /// 选择哪一份 graph 状态。0 = decode（1 行 `forwardLogits`），
-        /// 1 = speculative verify（k 行 `forwardChunkVerify`）。两者形状不同，
-        /// 必须各自捕获一份；CPU 后端是空操作。
-        selectGraphSlot: *const fn (ctx: *anyopaque, slot: u8) void,
-        /// 进入/离开"不在任何 graph 管辖范围"的代码段。段内的每个 op 都必须
-        /// 真正执行（不能被"已由 graph 吸收"的判据跳过）。MTP 的 draft 循环
-        /// 就是这样跑的。CPU 后端是空操作。
-        graphDirect: *const fn (ctx: *anyopaque, on: bool) void,
 
         // ---- introspection --------------------------------------------------
         name: *const fn (ctx: *anyopaque) []const u8,
@@ -662,8 +670,8 @@ pub const Exec = struct {
     }
     /// Quantize `rows` f32 rows into the KV cache `dst` at row `slot`; see
     /// `VTable.kvAppend`.
-    pub fn kvAppend(self: Exec, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
-        self.vtable.kvAppend(self.ptr, dst, src, slot, kv_dim, rows);
+    pub fn kvAppend(self: Exec, g: Graph, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+        self.vtable.kvAppend(g, self.ptr, dst, src, slot, kv_dim, rows);
     }
     pub fn dequantRow(self: Exec, dst: Buf, w: QuantRow, row: usize) void {
         self.vtable.dequantRow(self.ptr, dst, w, row);
@@ -725,55 +733,55 @@ pub const Exec = struct {
     pub fn mulSilu(self: Exec, out: Buf, gate: Buf) void {
         self.vtable.mulSilu(self.ptr, out, gate);
     }
-    pub fn mulSigmoid(self: Exec, out: Buf, gate: Buf) void {
-        self.vtable.mulSigmoid(self.ptr, out, gate);
+    pub fn mulSigmoid(self: Exec, g: Graph, out: Buf, gate: Buf) void {
+        self.vtable.mulSigmoid(g, self.ptr, out, gate);
     }
-    pub fn softmax(self: Exec, x: Buf) void {
-        self.vtable.softmax(self.ptr, x);
+    pub fn softmax(self: Exec, g: Graph, x: Buf) void {
+        self.vtable.softmax(g, self.ptr, x);
     }
-    pub fn addResid(self: Exec, dst: Buf, src: Buf) void {
-        self.vtable.addResid(self.ptr, dst, src);
+    pub fn addResid(self: Exec, g: Graph, dst: Buf, src: Buf) void {
+        self.vtable.addResid(g, self.ptr, dst, src);
     }
-    pub fn swiglu(self: Exec, gate: Buf, up: Buf) void {
-        self.vtable.swiglu(self.ptr, gate, up);
+    pub fn swiglu(self: Exec, g: Graph, gate: Buf, up: Buf) void {
+        self.vtable.swiglu(g, self.ptr, gate, up);
     }
-    pub fn convStep(self: Exec, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
-        self.vtable.convStep(self.ptr, conv, y, wconv, k);
+    pub fn convStep(self: Exec, g: Graph, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
+        self.vtable.convStep(g, self.ptr, conv, y, wconv, k);
     }
-    pub fn gdnStep(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
-        self.vtable.gdnStep(self.ptr, state, k, v, q, km, delta, out, gamma, beta, vd);
+    pub fn gdnStep(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
+        self.vtable.gdnStep(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, vd);
     }
     /// Batched `gdnStep` -- see `VTable.gdnStepRows` for the per-head strides.
     /// Byte-for-byte the `heads` single calls it replaces; the engine uses this
     /// one (the single-row slot is kept for fallback and for A/B).
-    pub fn gdnStepRows(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRows(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                        gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
-        self.vtable.gdnStepRows(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
+        self.vtable.gdnStepRows(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
     /// See `VTable.gdnStepRowsChunk`: `rows` sequential `gdnStepRows` steps in
     /// one call, on the successive slices of every strided operand.
-    pub fn gdnStepRowsChunk(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRowsChunk(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                             rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
-        self.vtable.gdnStepRowsChunk(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        self.vtable.gdnStepRowsChunk(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
     /// `gdnStepRowsChunk` 加每行的状态快照，见 `VTable.gdnStepRowsSnap`。
-    pub fn gdnStepRowsSnap(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRowsSnap(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                            gamma: Buf, beta: Buf, snap: Buf,
                            heads: usize, nk: usize, kd: usize, vd: usize,
                            rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
-        self.vtable.gdnStepRowsSnap(self.ptr, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+        self.vtable.gdnStepRowsSnap(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
-    pub fn attnDecode(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
+    pub fn attnDecode(self: Exec, g: Graph, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
-        self.vtable.attnDecode(self.ptr, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+        self.vtable.attnDecode(g, self.ptr, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
     /// `rows` tokens of prefill attention in one call; see `VTable.attnChunk`
     /// for the preconditions and the equivalence to the per-row form.
-    pub fn attnChunk(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
+    pub fn attnChunk(self: Exec, g: Graph, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                      slot0: usize, rows: usize, heads: usize, gqa: usize, hd: usize,
                      kv_dim: usize, scale: f32) void {
-        self.vtable.attnChunk(self.ptr, q, gate, kcache, vcache, att, gout, slot0, rows, heads, gqa, hd, kv_dim, scale);
+        self.vtable.attnChunk(g, self.ptr, q, gate, kcache, vcache, att, gout, slot0, rows, heads, gqa, hd, kv_dim, scale);
     }
     /// beta = sigmoid(b_raw) written IN PLACE into `b_raw`, and
     /// gamma[h] = exp(ssm_a[h] * softplus(a_raw[h] + dt_bias[h])).
@@ -781,20 +789,20 @@ pub const Exec = struct {
     /// writes alpha as `abK[0..k*nv]` and beta as `abK[k*nv..]` -- two
     /// non-contiguous regions -- while the serial path passes the two halves
     /// of one row.
-    pub fn gdnGamma(self: Exec, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
-        self.vtable.gdnGamma(self.ptr, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+    pub fn gdnGamma(self: Exec, g: Graph, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+        self.vtable.gdnGamma(g, self.ptr, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
     /// GDN chunk prelude -- see `VTable.gdnPrefillCore` for the contract.
-    pub fn gdnPrefillCore(self: Exec, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+    pub fn gdnPrefillCore(self: Exec, g: Graph, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
         ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
         ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
         gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
         conv_k: usize, eps: f32) void {
-        self.vtable.gdnPrefillCore(self.ptr, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens, conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim, nv, nk, kd, conv_k, eps);
+        self.vtable.gdnPrefillCore(g, self.ptr, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens, conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim, nv, nk, kd, conv_k, eps);
     }
-    pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
-        self.vtable.copyRange(self.ptr, dst, src);
+    pub fn copyRange(self: Exec, g: Graph, dst: Buf, src: Buf) void {
+        self.vtable.copyRange(g, self.ptr, dst, src);
     }
 
     /// Device -> host copy into a plain host slice.
@@ -803,52 +811,47 @@ pub const Exec = struct {
     /// SOURCE is a backend region, so a host destination (wrapped as a `Buf`)
     /// is written through as if it were device memory, which aborts the context
     /// on CUDA.  Any caller holding a host buffer uses this instead.
-    pub fn copyOut(self: Exec, dst: []f32, src: Buf) void {
+    pub fn copyOut(self: Exec, g: Graph, dst: []f32, src: Buf) void {
         std.debug.assert(dst.len >= src.len);
-        self.vtable.copyOut(self.ptr, dst[0..src.len], src);
+        self.vtable.copyOut(g, self.ptr, dst[0..src.len], src);
     }
 
 
     /// KV-cache append: `copyRange` whose destination is `base + slot * stride`.
     /// See `VTable.copyRangeSlot` for why a replaying backend needs the slot
     /// spelled out.
-    pub fn copyRangeSlot(self: Exec, dst: Buf, src: Buf, slot: usize) void {
-        self.vtable.copyRangeSlot(self.ptr, dst, src, slot);
+    pub fn copyRangeSlot(self: Exec, g: Graph, dst: Buf, src: Buf, slot: usize) void {
+        self.vtable.copyRangeSlot(g, self.ptr, dst, src, slot);
     }
-    pub fn deinterleaveQG(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
-        self.vtable.deinterleaveQG(self.ptr, dst_q, dst_gate, src, heads, hd);
+    pub fn deinterleaveQG(self: Exec, g: Graph, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+        self.vtable.deinterleaveQG(g, self.ptr, dst_q, dst_gate, src, heads, hd);
     }
-    pub fn deinterleaveQGStrided(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void {
-        self.vtable.deinterleaveQGStrided(self.ptr, dst_q, dst_gate, src, heads, hd, tokens);
+    pub fn deinterleaveQGStrided(self: Exec, g: Graph, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void {
+        self.vtable.deinterleaveQGStrided(g, self.ptr, dst_q, dst_gate, src, heads, hd, tokens);
     }
-    pub fn copyFromHost(self: Exec, dst: Buf, src: []const f32) void {
-        self.vtable.copyFromHost(self.ptr, dst, src);
+    pub fn copyFromHost(self: Exec, g: Graph, dst: Buf, src: []const f32) void {
+        self.vtable.copyFromHost(g, self.ptr, dst, src);
     }
     pub fn copyToHost(self: Exec, dst: []f32, src: Buf) void {
         self.vtable.copyToHost(self.ptr, dst, src);
     }
-    pub fn zeroBuf(self: Exec, buf: Buf) void {
-        self.vtable.zeroBuf(self.ptr, buf);
+    pub fn zeroBuf(self: Exec, g: Graph, buf: Buf) void {
+        self.vtable.zeroBuf(g, self.ptr, buf);
     }
-    pub fn argmax(self: Exec, logits: Buf) u32 {
-        return self.vtable.argmax(self.ptr, logits);
+    pub fn argmax(self: Exec, g: Graph, logits: Buf) u32 {
+        return self.vtable.argmax(g, self.ptr, logits);
     }
     /// See `VTable.argmaxConf`.
-    pub fn argmaxConf(self: Exec, logits: Buf, p: *f32) u32 {
-        return self.vtable.argmaxConf(self.ptr, logits, p);
+    pub fn argmaxConf(self: Exec, g: Graph, logits: Buf, p: *f32) u32 {
+        return self.vtable.argmaxConf(g, self.ptr, logits, p);
     }
     /// `rows` argmaxes over `rows * vocab` logits, one launch and one
     /// read-back on a device backend.  See `VTable.argmaxRows`.
-    pub fn argmaxRows(self: Exec, logits: Buf, rows: usize, out: []u32) void {
-        self.vtable.argmaxRows(self.ptr, logits, rows, out);
+    pub fn argmaxRows(self: Exec, g: Graph, logits: Buf, rows: usize, out: []u32) void {
+        self.vtable.argmaxRows(g, self.ptr, logits, rows, out);
     }
-    pub fn sample(self: Exec, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
-        return self.vtable.sample(self.ptr, logits, scratch, sp);
-    }
-    /// The token the last `sample` of the current step produced; see the vtable
-    /// slot for why sampling and its download are split around `stepEnd`.
-    pub fn sampledToken(self: Exec, hinted: u32) u32 {
-        return self.vtable.sampledToken(self.ptr, hinted);
+    pub fn sample(self: Exec, g: Graph, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
+        return self.vtable.sample(g, self.ptr, logits, scratch, sp);
     }
     pub fn profPhase(self: Exec, on: bool) void {
         self.vtable.profPhase(self.ptr, on);
@@ -861,17 +864,11 @@ pub const Exec = struct {
     }
     /// Open / close one decode step.  See the vtable comments: this is a
     /// boundary hint the backend may ignore, and the CPU backend does.
-    pub fn stepBegin(self: Exec, pos: u32) void {
-        self.vtable.stepBegin(self.ptr, pos);
+    pub fn graphBegin(self: Exec, kind: GraphKind, ctl: GraphCtl) Graph {
+        return self.vtable.graphBegin(self.ptr, kind, ctl);
     }
-    pub fn selectGraphSlot(self: Exec, slot: u8) void {
-        self.vtable.selectGraphSlot(self.ptr, slot);
-    }
-    pub fn graphDirect(self: Exec, on: bool) void {
-        self.vtable.graphDirect(self.ptr, on);
-    }
-    pub fn stepEnd(self: Exec) void {
-        self.vtable.stepEnd(self.ptr);
+    pub fn graphEnd(self: Exec, g: *Graph) void {
+        self.vtable.graphEnd(self.ptr, g);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);

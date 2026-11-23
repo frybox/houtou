@@ -251,6 +251,7 @@ pub fn build(b: *std.Build) void {
     // exe is a re-export of an identical value, not a distinct configuration.
     mod.addOptions("build_options", build_options);
 
+
     // ---------------------------------------------------------------------------
     // The IQ lookup tables: ONE Zig source file, already the definition
     // ---------------------------------------------------------------------------
@@ -429,6 +430,40 @@ pub fn build(b: *std.Build) void {
             @panic("nvcc not found; install the CUDA toolkit or build without -Dcuda");
         };
         const cuda_dir = "src/kernels/cuda";
+
+    // ---------------------------------------------------------------------------
+    // The explicit compute graph's kernel table (src/kernels/cuda/xd.cu)
+    // ---------------------------------------------------------------------------
+    // What it is: one entry per device kernel a captured forward may contain,
+    // with the launch shape and the launch itself.  See xd.h's header and plan
+    // §1.4.
+    //
+    // WHY IT IS COMPILED TWICE, ON PURPOSE:
+    //   * with `Q35_XD_NO_KERNELS`, through Zig's own C++ front end, into `mod`.
+    //     That object has no kernel definitions and no references to any, so a
+    //     CPU-only build links and the module's roster/ABI queries work.  It is
+    //     what makes `src/graph_tests.zig` runnable in `zig build test`.
+    //   * without the guard, through nvcc with the other kernels, into the
+    //     `-Dcuda=true` executable.  That object holds the real launches.
+    //     `xd.cu` is therefore NOT in `cuda_sources` (which every kernel unit
+    //     enters); it is appended to the nvcc steps separately below.
+    //
+    // The ABI asserts in xd.h run in both compilations, so `src/xd.zig`'s
+    // layout checks are checked from the C++ side as well.
+    {
+        // `xd_cpu.cpp` is `xd.cu` with `Q35_XD_NO_KERNELS` defined (see the
+        // file): same table source, kernel half switched off, and a `.cpp`
+        // extension so Zig's C++ front end (not its CUDA path) compiles it.
+        const xd_host = b.addSystemCommand(&.{ b.graph.zig_exe, "c++", "-std=c++17", "-O2", "-c", "-I" });
+        xd_host.has_side_effects = false;
+        xd_host.addDirectoryArg(b.path(cuda_dir));
+        xd_host.addFileArg(b.path(b.fmt("{s}/xd_cpu.cpp", .{cuda_dir})));
+        xd_host.addArg("-o");
+        const xd_obj = xd_host.addOutputFileArg("xd_cpu.o");
+        xd_host.addFileInput(b.path(b.fmt("{s}/xd.cu", .{cuda_dir})));
+        xd_host.addFileInput(b.path(b.fmt("{s}/xd.h", .{cuda_dir})));
+        mod.addObjectFile(xd_obj);
+    }
         // Every file in the directory, used as an *input dependency* below so a
         // .cuh edit invalidates the nvcc step.
         const cuda_files = listCudaInputs(b) catch |e| {
@@ -449,6 +484,11 @@ pub fn build(b: *std.Build) void {
             for (cuda_sources) |src| {
                 if (std.mem.eql(u8, src, base)) listed = true;
             }
+            // `xd.cu` is deliberately NOT in `cuda_sources`: it is compiled
+            // twice (once without kernels into `mod`, once with them into the
+            // CUDA objects), so it has its own nvcc step right above the device
+            // link.  Listed here so this check does not demand a duplicate.
+            if (std.mem.eql(u8, base, "xd.cu")) listed = true;
             if (!listed) {
                 unregistered += 1;
                 std.debug.print("error: {s} is not registered in `cuda_sources` (build.zig); " ++
@@ -515,6 +555,23 @@ pub fn build(b: *std.Build) void {
             _ = check.addOutputFileArg(b.fmt("check-{s}.o", .{src[0 .. src.len - 3]}));
             for (cuda_files) |p| check.addFileInput(b.path(p));
             cuda_check_step.dependOn(&check.step);
+        }
+
+        // The graph table's CUDA half: same flags as stage 1, added here rather
+        // than in `cuda_sources` because it is compiled a second time (without
+        // kernels) into `mod` above.  `-DQ35_XD_NO_KERNELS` is NOT passed, so
+        // this object holds the real launches.
+        {
+            const step = b.addSystemCommand(&.{ nvcc, cuda_arch, "-O3", "--std=c++17", "-rdc=true", "-c", "-Xcompiler", "-fPIC" });
+            step.has_side_effects = false;
+            step.addArg("-I");
+            step.addDirectoryArg(b.path(cuda_dir));
+            step.addFileArg(b.path(b.fmt("{s}/xd.cu", .{cuda_dir})));
+            step.addArg("-o");
+            const obj = step.addOutputFileArg("xd_kernels.o");
+            for (cuda_files) |p| step.addFileInput(b.path(p));
+            objs = b.allocator.realloc(objs, objs.len + 1) catch @panic("oom");
+            objs[objs.len - 1] = obj;
         }
 
         // Stage 2: the device link.  `nvcc -rdc=true -dlink` runs nvlink over the
