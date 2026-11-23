@@ -1651,13 +1651,13 @@ pub const Engine = struct {
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
             }
         } else {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
         if (sp) |sampler_obj| self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, sampler_obj);
@@ -1760,9 +1760,9 @@ pub const Engine = struct {
             self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
-                self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
-                self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
-                self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
                 // ---- RoPE ----
                 // MOVED: both q's and k's rotation now happen inside
                 // `forwardFullChunk`, AFTER the q_norm/k_norm pass.  Doing them
@@ -1781,12 +1781,12 @@ pub const Engine = struct {
                 // first sampled token of a 17-token prompt.
                 t = 0;
                 self.forwardFullChunk(lw, li, k);
-                self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
+                self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
             } else {
-                self.exec.matvecBatchK(self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
-                self.exec.matvecBatchK(self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
-                self.exec.matvecBatchK(self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
-                self.exec.matvecBatchK(self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
+                self.exec.matvecBatchK(self.graph, self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
                 // 为推测解码回滚保留 PRE-prelude 的投影。必须是原始行：
                 // 回滚只对 `rows` 个 token 重跑 prelude，而 prelude 会推进卷积
                 // 历史并就地重写 `qkv`/`ab`——这两样都无法从 POST-prelude 的
@@ -1812,7 +1812,7 @@ pub const Engine = struct {
                 // Chunk-wide gated RMSNorm + silu gate, hoisted out of the
                 // token loop above; `ssm_out` is the first reader of `goutK`.
                 self.forwardGdnGated(lw, k);
-                self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
+                self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
             }
 
             // ---- residual add: the `k` rows are CONSECUTIVE (`xK`/`x2K` are
@@ -1825,14 +1825,14 @@ pub const Engine = struct {
             // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
             // batched down, residual ----
             self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
-            self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
-            self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             // SwiGLU over the whole chunk: `gate[i] = silu(gate[i]) * up[i]` is
             // elementwise and each token's `n_ff` run is independent, so one
             // launch over `k * n_ff` is the same arithmetic as `k` launches of
             // an `n_ff`-long one.
             self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
-            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
+            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
             self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- speculative-decoding tap: copy this layer's OUTPUT hidden
@@ -1862,12 +1862,12 @@ pub const Engine = struct {
         self.exec.rmsnorm(self.graph, self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
         self.exec.graphEnd(&self.graph);
@@ -1900,7 +1900,7 @@ pub const Engine = struct {
         // Normalise every row and project them all through lm_head.
         self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
         const w = self.output_weight orelse self.token_embd;
-        self.exec.matvecBatchK(self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
+        self.exec.matvecBatchK(self.graph, self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
         return self.logitsK.span(0, k * c.vocab);
     }
 
@@ -1929,11 +1929,11 @@ pub const Engine = struct {
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
         const qkv = self.qkv.span(0, conv_dim);
-        self.exec.matvec(qkv, lw.attn_qkv.?, self.x1);
+        self.exec.matvec(self.graph, qkv, lw.attn_qkv.?, self.x1);
 
         // z projection (attn_gate [hidden, value_dim])
         const z = self.z.span(0, value_dim);
-        self.exec.matvec(z, lw.attn_gate.?, self.x1);
+        self.exec.matvec(self.graph, z, lw.attn_gate.?, self.x1);
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
@@ -1951,7 +1951,7 @@ pub const Engine = struct {
         // block shape tested (/tmp/shp/bw2.cu) -- that is the launch floor, not
         // bandwidth.  96 such launches per token (~0.3 ms, 1.6%) halve to 48.
         const ab = self.ab.span(0, 2 * nv);
-        self.exec.matvecPair(ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
+        self.exec.matvecPair(self.graph, ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
@@ -2078,7 +2078,7 @@ pub const Engine = struct {
         self.exec.mulSilu(self.graph, gout.span(0, value_dim), z.span(0, value_dim));
 
         // out projection [2048 -> 1024]
-        self.exec.matvec(self.x2.span(0, hidden), lw.ssm_out.?, gout);
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ssm_out.?, gout);
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
@@ -2409,7 +2409,7 @@ pub const Engine = struct {
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv.span(0, 2 * q_dim);
-        self.exec.matvec(qg, lw.attn_q.?, self.x1);
+        self.exec.matvec(self.graph, qg, lw.attn_q.?, self.x1);
         const q = self.q.span(0, q_dim);
         const gate = self.z.span(0, q_dim);
         // Batched split (see `forwardFullCore`): the GGUF `attn_q` rows are
@@ -2417,8 +2417,8 @@ pub const Engine = struct {
         // so this is a layout change no single memcpy can express -- the slot
         // just does it in one launch instead of `2*heads`.
         self.exec.deinterleaveQG(self.graph, q, gate, qg, heads, hd);
-        self.exec.matvec(self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
-        self.exec.matvec(self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
+        self.exec.matvec(self.graph, self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
+        self.exec.matvec(self.graph, self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         //
@@ -2469,7 +2469,7 @@ pub const Engine = struct {
             self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
         // o_proj [2048 -> 1024]
-        self.exec.matvec(self.x2.span(0, hidden), lw.attn_output.?, gout);
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.attn_output.?, gout);
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
@@ -2541,7 +2541,7 @@ pub const Engine = struct {
         self.exec.copyRange(self.graph, nn.input.span(hidden, hidden), self.x1.span(0, hidden));
 
         // The projected value becomes the residual stream for the block.
-        self.exec.matvec(self.x.span(0, hidden), nn.eh_proj, nn.input.span(0, 2 * hidden));
+        self.exec.matvec(self.graph, self.x.span(0, hidden), nn.eh_proj, nn.input.span(0, 2 * hidden));
 
         // Full-attention layer + MLP, over the drafter's OWN KV cache.
         //
@@ -2563,12 +2563,12 @@ pub const Engine = struct {
         if (out_hidden) |oh| self.exec.copyRange(self.graph, oh.span(0, hidden), self.x1.span(0, hidden));
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1.span(0, hidden)),
+                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1.span(0, hidden)),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1.span(0, hidden)),
-                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1.span(0, hidden)),
+                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1.span(0, hidden)),
+                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1.span(0, hidden)),
             }
         }
     }
@@ -2579,10 +2579,10 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         self.exec.rmsnorm(self.graph, self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        self.exec.matvec(self.mlp_h, lw.ffn_gate, self.x1);
-        self.exec.matvec(self.mlp_h1, lw.ffn_up, self.x1);
+        self.exec.matvec(self.graph, self.mlp_h, lw.ffn_gate, self.x1);
+        self.exec.matvec(self.graph, self.mlp_h1, lw.ffn_up, self.x1);
         self.exec.swiglu(self.graph, self.mlp_h, self.mlp_h1);
-        self.exec.matvec(self.x2.span(0, hidden), lw.ffn_down, self.mlp_h);
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h);
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
@@ -2933,8 +2933,8 @@ pub const Engine = struct {
         const row = self.x1;
         self.exec.copyFromHost(self.graph, row, x[0..hidden]);
         switch (self.output_weight orelse self.token_embd) {
-            .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, row),
-            .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, row),
+            .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, row),
         }
         self.exec.copyOut(self.graph, out[0..self.cfg.vocab], self.logits);
     }
@@ -3022,12 +3022,12 @@ pub const Engine = struct {
         self.exec.rmsnorm(self.graph, self.x1, h, self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
     }
@@ -3203,7 +3203,7 @@ pub const Engine = struct {
         @memcpy(src.slice()[0..c.hidden], h[0..c.hidden]);
         const lw = self.lmHead();
         const tmp = self.exec.allocBuf(c.vocab) catch unreachable;
-        self.exec.matvec(tmp, lw, src);
+        self.exec.matvec(self.graph, tmp, lw, src);
         @memcpy(out[0..c.vocab], tmp.slice()[0..c.vocab]);
     }
 

@@ -887,7 +887,8 @@ pub const CpuBackend = struct {
         dequantRowInto(dst.slice(), w, row);
     }
 
-    fn vMatvec(ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
+    fn vMatvec(g: backend.Graph, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
+        _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         switch (w) {
             .f32 => |m| matvecF32(out.slice(), m, x.slice(), self.pool),
@@ -895,7 +896,8 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vMatvecBatchK(ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void {
+    fn vMatvecBatchK(g: backend.Graph, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void {
+        _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         matvecBatchK(out.slice(), w, xK.slice(), k, self.q8K, self.q8kK, self.pool);
     }
@@ -1123,10 +1125,10 @@ pub const CpuBackend = struct {
     /// Oracle for `matvecPair`: literally two `matvec` calls.  The fused device
     /// path must produce exactly these bytes, so writing the oracle as anything
     /// other than the pair would defeat the purpose.
-    fn vMatvecPair(ctx: *anyopaque, out: Buf, a: backend.LinearW, b: backend.LinearW, x: Buf) void {
+    fn vMatvecPair(g: backend.Graph, ctx: *anyopaque, out: Buf, a: backend.LinearW, b: backend.LinearW, x: Buf) void {
         const r = out.len / 2;
-        vMatvec(ctx, out.span(0, r), a, x);
-        vMatvec(ctx, out.span(r, r), b, x);
+        vMatvec(g, ctx, out.span(0, r), a, x);
+        vMatvec(g, ctx, out.span(r, r), b, x);
     }
 
     fn vScaleVec(g: backend.Graph, ctx: *anyopaque, x: Buf, s: f32) void {

@@ -284,7 +284,7 @@ test "dspine: bf16 matvec on the real draft file" {
         for ([_]usize{ 0, 7, 31 }) |off| {
             const probe = blk * 32 + off;
             onehot[probe] = 1.0;
-            exec.matvec(.{ .ptr = out.ptr, .len = q.rows }, w, .{ .ptr = onehot.ptr, .len = cols });
+            exec.matvec(.{}, .{ .ptr = out.ptr, .len = q.rows }, w, .{ .ptr = onehot.ptr, .len = cols });
             for ([_]usize{ 0, probe_row, q.rows - 1 }) |r| {
                 deqWide.into(wide, q, r);
                 const expect = wide[probe];

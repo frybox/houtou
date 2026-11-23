@@ -446,8 +446,8 @@ pub const Engine = struct {
         const row = self.x1.span(0, hidden);
         self.exec.copyFromHost(self.graph, row, x[0..hidden]);
         switch (self.output_weight orelse self.token_embd) {
-            .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, row),
-            .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, row),
+            .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, row),
         }
         self.exec.copyOut(self.graph, out[0..self.cfg.vocab], self.logits);
     }
@@ -625,9 +625,9 @@ pub const Engine = struct {
         // Qwen3's `attn_q` is a plain [q_dim, hidden] projection: there is no
         // per-head [q|gate] interleave and no output gate (unlike Qwen3.5).
         const q = self.q.span(0, q_dim);
-        self.exec.matvec(q, lw.attn_q, self.x1.span(0, hidden));
-        self.exec.matvec(self.k.span(0, kv_dim), lw.attn_k, self.x1.span(0, hidden));
-        self.exec.matvec(self.v.span(0, kv_dim), lw.attn_v, self.x1.span(0, hidden));
+        self.exec.matvec(self.graph, q, lw.attn_q, self.x1.span(0, hidden));
+        self.exec.matvec(self.graph, self.k.span(0, kv_dim), lw.attn_k, self.x1.span(0, hidden));
+        self.exec.matvec(self.graph, self.v.span(0, kv_dim), lw.attn_v, self.x1.span(0, hidden));
 
         // Per-head RMSNorm over `head_dim` (=128 here, not the 256-wide kind
         // Qwen3.5 uses), then RoPE over the FULL head.
@@ -651,16 +651,16 @@ pub const Engine = struct {
             self.att.span(0, slot + 1), gout,
             slot, heads, gqa, hd, kv_dim, scale,
         );
-        self.exec.matvec(self.x2.span(0, hidden), lw.attn_output, gout);
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.attn_output, gout);
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // ---- MLP ----
         self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
         const n_ff: usize = c.n_ff;
-        self.exec.matvec(self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
-        self.exec.matvec(self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
+        self.exec.matvec(self.graph, self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
+        self.exec.matvec(self.graph, self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
         self.exec.swiglu(self.graph, self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
-        self.exec.matvec(self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
         self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // Speculative-decoding tap: this layer's OUTPUT hidden state, written
@@ -688,9 +688,9 @@ pub const Engine = struct {
         for (self.layers, 0..) |*lw, li| self.layerForward(lw, li, pos);
         self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
-            self.exec.matvec(self.logits, ow, self.x1.span(0, hidden));
+            self.exec.matvec(self.graph, self.logits, ow, self.x1.span(0, hidden));
         } else {
-            self.exec.matvec(self.logits, self.token_embd, self.x1.span(0, hidden));
+            self.exec.matvec(self.graph, self.logits, self.token_embd, self.x1.span(0, hidden));
         }
         self.exec.graphEnd(&self.graph);
         self.graph = .{};
@@ -771,9 +771,9 @@ pub const Engine = struct {
             // Plain [q_dim, hidden] projection: no `[q|gate]` interleave, so
             // `qK` is filled directly (Qwen3.5 has to deinterleave first, which
             // is why its RoPE lives inside `forwardFullChunk`).
-            self.exec.matvecBatchK(self.qK.span(0, k * q_dim), lw.attn_q, self.x1K, k);
-            self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k, self.x1K, k);
-            self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.qK.span(0, k * q_dim), lw.attn_q, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.kK.span(0, k * kv_dim), lw.attn_k, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.vK.span(0, k * kv_dim), lw.attn_v, self.x1K, k);
 
             // Per-head norm over `head_dim`, then RoPE over the FULL head.
             // Order matters: norm -> rope, as in `layerForward`; rotating first
@@ -801,15 +801,15 @@ pub const Engine = struct {
                 self.att.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
                 slot0, k, heads, gqa, hd, kv_dim, scale);
 
-            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
+            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
             self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP ----
             self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
-            self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
-            self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.graph, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
-            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
+            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
             self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // Twin of `layerForward`'s tap, for the batched path: the whole
@@ -835,9 +835,9 @@ pub const Engine = struct {
         const normed = self.x1.span(0, hidden);
         self.exec.rmsnorm(self.graph, normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
-            self.exec.matvec(self.logits, ow, normed);
+            self.exec.matvec(self.graph, self.logits, ow, normed);
         } else {
-            self.exec.matvec(self.logits, self.token_embd, normed);
+            self.exec.matvec(self.graph, self.logits, self.token_embd, normed);
         }
         return self.logits;
     }

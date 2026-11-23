@@ -315,9 +315,18 @@ const Launch = if (cuda_linked) struct {
     const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
     const dequantize = Kernels.q35_launch_dequantize;
     const dequantize_row = Kernels.q35_launch_dequantize_row;
-    const mul_mat_vec = Kernels.q35_launch_mul_mat_vec;
-    const mul_mat_vec_f32 = Kernels.q35_launch_mul_mat_vec_f32;
-    const mul_mat_vec_w16 = Kernels.q35_launch_mul_mat_vec_w16;
+    fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_mul_mat_vec(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
+    }
+    fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_mul_mat_vec_f32(d_w, d_x, d_out, rows, cols, tokens, stream);
+    }
+    fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_mul_mat_vec_w16(d_w, d_x, d_out, rows, cols, tokens, ttype, stream);
+    }
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
@@ -465,15 +474,18 @@ const Launch = if (cuda_linked) struct {
         _ = .{ ttype, d_src_row, d_dst, cols, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec(d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_w, d_xq, d_out, rows, cols, tokens, ttype, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_w, d_x, d_out, rows, cols, tokens, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec_w16(d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+    fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
         _ = .{ d_w, d_x, d_out, rows, cols, tokens, ttype, stream };
         return stubNoCudaKernels();
     }
@@ -3750,12 +3762,12 @@ const attn_score_arity: usize = 11;
     /// is already device memory (the CUDA-graph decode path), otherwise into the
     /// shared staging buffer and downloads.  Returns the launch result code so the
     /// caller reports it; 0 (cudaSuccess) means the work is queued/done.
-    fn launchW16(self: *CudaBackend, d_w: ?*const anyopaque, d_x: ?[*]const f32,
+    fn launchW16(self: *CudaBackend, g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32,
                  ttype: gguf.TensorType, rows: usize, cols: usize, tokens: usize,
                  outBuf: backend.Buf) c_int {
         const n = tokens * rows;
         if (dBufPtr(outBuf)) |pd| {
-            return Launch.mul_mat_vec_w16(d_w, d_x, pd, @intCast(rows), @intCast(cols),
+            return Launch.mul_mat_vec_w16(g, d_w, d_x, pd, @intCast(rows), @intCast(cols),
                                           @intCast(tokens), @intCast(@backingInt(ttype)),
                                           self.launchStream());
         }
@@ -3765,7 +3777,7 @@ const attn_score_arity: usize = 11;
             // (the same shape `stubNoCudaKernels` uses).
             return -1;
         };
-        const rc = Launch.mul_mat_vec_w16(d_w, d_x, @ptrCast(@alignCast(self.d_out)),
+        const rc = Launch.mul_mat_vec_w16(g, d_w, d_x, @ptrCast(@alignCast(self.d_out)),
                                           @intCast(rows), @intCast(cols), @intCast(tokens),
                                           @intCast(@backingInt(ttype)), self.launchStream());
         // The staging branch must download (same contract as the f32 branch: a
@@ -4128,19 +4140,19 @@ const attn_score_arity: usize = 11;
     /// padding between the two tensors would break that (it does not here --
     /// checked for all 48 layers), and gluing across a pad would make the kernel
     /// read the pad as a block, so the test is exact rather than approximate.
-    fn vMatvecPair_body(ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvecPair_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const r = outBuf.len / 2;
         if (outBuf.len % 2 != 0 or r == 0) {
-            vMatvec_body(ctx, outBuf, a, xBuf);
+            vMatvec_body(g, ctx, outBuf, a, xBuf);
             return;
         }
         if (pairViewInit(self, a, b, r)) |pair| {
-            vMatvec_body(ctx, outBuf, .{ .quant = pair }, xBuf);
+            vMatvec_body(g, ctx, outBuf, .{ .quant = pair }, xBuf);
             return;
         }
-        vMatvec_body(ctx, outBuf.span(0, r), a, xBuf);
-        vMatvec_body(ctx, outBuf.span(r, r), b, xBuf);
+        vMatvec_body(g, ctx, outBuf.span(0, r), a, xBuf);
+        vMatvec_body(g, ctx, outBuf.span(r, r), b, xBuf);
     }
 
     /// The fused `QuantRow` for `matvecPair`, or null when the two weights are
@@ -4181,7 +4193,7 @@ const attn_score_arity: usize = 11;
         };
     }
 
-    fn vMatvec_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvec_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.gs().op_seen.matvec)) return;
         if (!self.gpuReady()) {
@@ -4212,7 +4224,7 @@ const attn_score_arity: usize = 11;
                 const cols = e.cols;
                 std.debug.assert(xBuf.len >= cols and outBuf.len >= rows);
                 if (dBufPtr(outBuf)) |pd| {
-                    const rc = Launch.mul_mat_vec_f32(
+                    const rc = Launch.mul_mat_vec_f32(g, 
                         @ptrCast(@alignCast(e.dev)),
                         d_x,
                         pd,
@@ -4233,7 +4245,7 @@ const attn_score_arity: usize = 11;
                         self.clearDevBuf(outBuf);
                         return;
                     };
-                    const rc = Launch.mul_mat_vec_f32(
+                    const rc = Launch.mul_mat_vec_f32(g, 
                         @ptrCast(@alignCast(e.dev)),
                         d_x,
                         @ptrCast(@alignCast(self.d_out)),
@@ -4271,7 +4283,7 @@ const attn_score_arity: usize = 11;
                 // widens them element by element against the engine's f32
                 // activation (`q35_k_mul_mat_vec_w16` in mmvq.cu).
                 if (q.ttype == .f16 or q.ttype == .bf16) {
-                    const rcw = self.launchW16(e.dev, d_x, q.ttype, rows, cols, 1, outBuf);
+                    const rcw = self.launchW16(g, e.dev, d_x, q.ttype, rows, cols, 1, outBuf);
                     if (rcw != cudart.cudaSuccess) {
                         if (self.capturing()) self.graphAbandon("mul_mat_vec_w16 launch failed");
                         std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
@@ -4331,7 +4343,7 @@ const attn_score_arity: usize = 11;
                 }
                 if (dBufPtr(outBuf)) |pd| {
                     // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
-                    const rc = Launch.mul_mat_vec(
+                    const rc = Launch.mul_mat_vec(g, 
                         e.dev,
                         self.d_xq,
                         pd,
@@ -4355,7 +4367,7 @@ const attn_score_arity: usize = 11;
                         self.clearDevBuf(outBuf);
                         return;
                     };
-                    const rc = Launch.mul_mat_vec(
+                    const rc = Launch.mul_mat_vec(g, 
                         e.dev,
                         self.d_xq,
                         @ptrCast(@alignCast(self.d_out)),
@@ -4480,7 +4492,7 @@ const attn_score_arity: usize = 11;
 
         const cput = self.alloc.alloc(f32, outBuf.len) catch return;
         defer self.alloc.free(cput);
-        if (batchk) cpu.matvecBatchK(backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x), k) else cpu.matvec(backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x));
+        if (batchk) cpu.matvecBatchK(.{}, backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x), k) else cpu.matvec(.{}, backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x));
         // NOT `cpu.exec()` above: that is the diagnostic's OWN backend, whose
         // scratch is sized here, one token wide -- `matvecBatchK` wants K slots.
         // Those CPUs are never fully initialised (`setThreads` etc.), so this runs
@@ -4510,7 +4522,7 @@ const attn_score_arity: usize = 11;
     /// in one `cudaMemcpy`, quantized as `K` consecutive block groups in one buffer
     /// (`d_xq`, group `j` at `j * actBytes(ttype, cols)`), then a single launch
     /// computes `K*rows` outputs and one download returns them.
-    fn vMatvecBatchK_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+    fn vMatvecBatchK_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvecBatchK: {s}\n", .{self.needHelp()});
@@ -4559,7 +4571,7 @@ const attn_score_arity: usize = 11;
                     ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
                     d_out = @ptrCast(@alignCast(self.d_out.?));
                 }
-                const rc = Launch.mul_mat_vec_f32(
+                const rc = Launch.mul_mat_vec_f32(g, 
                     @ptrCast(@alignCast(e.dev)),
                     d_x,
                     d_out,
@@ -4633,7 +4645,7 @@ const attn_score_arity: usize = 11;
                         ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
                         d_out_w = @ptrCast(@alignCast(self.d_out.?));
                     }
-                    const rcw = Launch.mul_mat_vec_w16(
+                    const rcw = Launch.mul_mat_vec_w16(g, 
                         e.dev,
                         base_act,
                         d_out_w,
@@ -4729,7 +4741,7 @@ const attn_score_arity: usize = 11;
                 // is `ensureBuf`'d right there), and `q35_mmq_dp4a_wants` is the
                 // same predicate the kernel uses to pick its branch, so the two
                 // cannot disagree.
-                const rc_mm = kern_mm.mul_mat_vec(
+                const rc_mm = kern_mm.mul_mat_vec(g,
                     e.dev,
                     if (wants_mmq) self.d_xqm else self.d_xq,
                     d_out,
@@ -7838,31 +7850,31 @@ const attn_score_arity: usize = 11;
     }
 
     /// The `matvec` slot, timed (`$QWEN35_PROF`).
-    fn vMatvec(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvec(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec, t0);
         if (self.ablated(.matvec)) return ;
-        vMatvec_body(ctx, outBuf, w, xBuf);
+        vMatvec_body(g, ctx, outBuf, w, xBuf);
     }
 
     /// The `matvecPair` slot; charged to `matvec` since it IS a matvec launch
     /// (or two), and a separate slot would only split the same total.
-    fn vMatvecPair(ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvecPair(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec, t0);
         if (self.ablated(.matvec)) return ;
-        vMatvecPair_body(ctx, outBuf, a, b, xBuf);
+        vMatvecPair_body(g, ctx, outBuf, a, b, xBuf);
     }
 
     /// The `matvecBatchK` slot, timed (`$QWEN35_PROF`).
-    fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+    fn vMatvecBatchK(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec_batchk, t0);
         if (self.ablated(.matvec_batchk)) return ;
-        vMatvecBatchK_body(ctx, outBuf, w, xKBuf, k);
+        vMatvecBatchK_body(g, ctx, outBuf, w, xKBuf, k);
     }
 
     /// The `allocScratch` slot, timed (`$QWEN35_PROF`).

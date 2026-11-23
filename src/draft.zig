@@ -462,7 +462,7 @@ pub const Draft = struct {
         }
         // fc: [n*hidden, hidden] -- one matvec per context row.
         for (0..rows) |r| {
-            self.exec.matvec(
+            self.exec.matvec(self.graph, 
                 self.ctx.span(r * hidden, hidden),
                 self.fc,
                 self.ctx_raw.span(r * n * hidden, n * hidden),
@@ -543,8 +543,8 @@ pub const Draft = struct {
             for (0..rows) |r| {
                 const krow = cache.k.span(r * kv_dim, kv_dim);
                 const vrow = cache.v.span(r * kv_dim, kv_dim);
-                self.exec.matvec(krow, l.attn_k, self.ctx.span(r * hidden, hidden));
-                self.exec.matvec(vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
+                self.exec.matvec(self.graph, krow, l.attn_k, self.ctx.span(r * hidden, hidden));
+                self.exec.matvec(self.graph, vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
                 self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
                 // Context rows sit at absolute positions pos0..pos0+rows-1.
                 self.exec.rope64Rows(self.graph, krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
@@ -659,11 +659,11 @@ pub const Draft = struct {
         // `ffn_norm`'s output, so the reference dump has to take it here.
         if (self.dump_dir) |root| self.dumpStage(root, il, self.dump_row, "xin", self.xin, hidden);
         // ---- attention over [context | block-prefix] ----
-        self.exec.matvec(self.q.span(0, q_dim), l.attn_q, self.xin.span(0, hidden));
+        self.exec.matvec(self.graph, self.q.span(0, q_dim), l.attn_q, self.xin.span(0, hidden));
         const krow = self.kv.span(0, kv_dim);
         const vrow = self.kv.span(kv_dim, kv_dim);
-        self.exec.matvec(krow, l.attn_k, self.xin.span(0, hidden));
-        self.exec.matvec(vrow, l.attn_v, self.xin.span(0, hidden));
+        self.exec.matvec(self.graph, krow, l.attn_k, self.xin.span(0, hidden));
+        self.exec.matvec(self.graph, vrow, l.attn_v, self.xin.span(0, hidden));
 
         // q_norm/k_norm are per-head RMSNorms over `hd` (=128), unlike the
         // target's 256-wide ones.
@@ -697,7 +697,7 @@ pub const Draft = struct {
         );
         cache.len += 1;
 
-        self.exec.matvec(self.x2.span(0, hidden), l.attn_output, self.gout.span(0, q_dim));
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), l.attn_output, self.gout.span(0, q_dim));
         // `x2` is reused by the MLP's down-projection, so the attention output has
         // to be captured here, not in the end-of-layer dump.
         if (self.dump_dir) |root| self.dumpStage(root, il, self.dump_row, "attn", self.x2, hidden);
@@ -711,12 +711,12 @@ pub const Draft = struct {
 
         // ---- MLP ----
         self.exec.rmsnorm(self.graph, self.xin.span(0, hidden), self.resid.span(0, hidden), l.ffn_norm, c.rms_eps);
-        self.exec.matvec(self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
-        self.exec.matvec(self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
+        self.exec.matvec(self.graph, self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
+        self.exec.matvec(self.graph, self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
         if (self.hostDebug()) self.debug_gate = maxAbs(self.mlp_h.slice()[0..c.ffn]);
         self.exec.swiglu(self.graph, self.mlp_h.span(0, c.ffn), self.mlp_h1.span(0, c.ffn));
         if (self.hostDebug()) self.debug_swi = maxAbs(self.mlp_h.slice()[0..c.ffn]);
-        self.exec.matvec(self.x2.span(0, hidden), l.ffn_down, self.mlp_h.span(0, c.ffn));
+        self.exec.matvec(self.graph, self.x2.span(0, hidden), l.ffn_down, self.mlp_h.span(0, c.ffn));
         if (self.hostDebug()) self.debug_mlp = maxAbs(self.x2.slice()[0..hidden]);
         // Per-layer telemetry, on BOTH backends through `toHost` so the device
         // path never dereferences a device pointer.  `$QWEN35_DRAFT_DEBUG`
@@ -1008,7 +1008,7 @@ pub const Draft = struct {
         // `layer_read_weight`: the LAST layer uses `dspine_read`, the others
         // `blk.i.dspine_read` (both land in `Layer.read` at load time).
         const projected = self.projected.span(0, c.code_len);
-        self.exec.matvec(projected, l.read, self.bridge_normed.span(0, hidden));
+        self.exec.matvec(self.graph, projected, l.read, self.bridge_normed.span(0, hidden));
 
         // ---- 3. normalize_codes: anchors from the codebook, others L2-scaled ----
         self.dequantCodebookRow(self.anchor_tokens[if (row < self.anchor_tokens.len) row else 0]);
@@ -1049,9 +1049,9 @@ pub const Draft = struct {
         // `prev_packed`), but one slot per row is harmless there and keeps the
         // two arms reading the same memory.
         const packed_slice = self.packed_rows.span(0, 3 * c.rank);
-        self.exec.matvec(packed_slice.span(0, c.rank), self.gate_w, codes);
-        self.exec.matvec(packed_slice.span(c.rank, c.rank), self.pred_gate_w, codes);
-        self.exec.matvec(packed_slice.span(2 * c.rank, c.rank), self.prev_w, codes);
+        self.exec.matvec(self.graph, packed_slice.span(0, c.rank), self.gate_w, codes);
+        self.exec.matvec(self.graph, packed_slice.span(c.rank, c.rank), self.pred_gate_w, codes);
+        self.exec.matvec(self.graph, packed_slice.span(2 * c.rank, c.rank), self.prev_w, codes);
 
         // ---- 5. feature_message: gate * predecessor value, anchor zeroed ----
         // Row `row-1`'s packed triple is the `prev` sender; see
@@ -1060,7 +1060,7 @@ pub const Draft = struct {
 
         // ---- 6. write: [H, R] @ message[R] -> delta[H] ----
         const delta = self.delta.span(0, hidden);
-        self.exec.matvec(delta, l.write, self.msg.span(0, c.rank));
+        self.exec.matvec(self.graph, delta, l.write, self.msg.span(0, c.rank));
 
         // ---- 7. feature_finish: out = bf16(raw + rms*delta),
         //                              normed = bf16(bf16(next_norm(out)) * w) ----

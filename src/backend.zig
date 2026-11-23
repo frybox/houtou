@@ -277,7 +277,7 @@ pub const Exec = struct {
         /// activation sides are `Buf`s, so on a device backend the input is the
         /// region the previous op wrote and the output is the region the next
         /// op reads: no PCIe between them.
-        matvec: *const fn (ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void,
+        matvec: *const fn (g: Graph, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void,
         /// `matvec(out[0..r], a, x)` then `matvec(out[r..2r], b, x)` as ONE
         /// device launch, when `a` and `b` are the *same* shape and type and
         /// their device ranges are adjacent (`a.dev + a_bytes == b.dev`), so the
@@ -295,9 +295,9 @@ pub const Exec = struct {
         ///
         /// The fallback is two plain `matvec` calls, so a backend (or a GGUF)
         /// that cannot prove adjacency pays exactly what it paid before.
-        matvecPair: *const fn (ctx: *anyopaque, out: Buf, a: LinearW, b: LinearW, x: Buf) void,
+        matvecPair: *const fn (g: Graph, ctx: *anyopaque, out: Buf, a: LinearW, b: LinearW, x: Buf) void,
         /// Same, for `k` tokens at once: `out[j*rows + r] = W[r] . x_j`.
-        matvecBatchK: *const fn (ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void,
+        matvecBatchK: *const fn (g: Graph, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void,
 
         /// Create the intra-op thread pool (CPU); a device backend ignores it.
         /// `nt` is the worker count, 1 = serial.
@@ -692,17 +692,17 @@ pub const Exec = struct {
     pub fn dequantRow(self: Exec, dst: Buf, w: QuantRow, row: usize) void {
         self.vtable.dequantRow(self.ptr, dst, w, row);
     }
-    pub fn matvec(self: Exec, out: Buf, w: LinearW, x: Buf) void {
-        self.vtable.matvec(self.ptr, out, w, x);
+    pub fn matvec(self: Exec, g: Graph, out: Buf, w: LinearW, x: Buf) void {
+        self.vtable.matvec(g, self.ptr, out, w, x);
     }
     /// Two same-shape matvecs over adjacent weights, as one launch when the
     /// backend can prove the layout.  `out` is `2*rows` long, `a`'s result
     /// first.  Semantically identical to two `matvec` calls.
-    pub fn matvecPair(self: Exec, out: Buf, a: LinearW, b: LinearW, x: Buf) void {
-        self.vtable.matvecPair(self.ptr, out, a, b, x);
+    pub fn matvecPair(self: Exec, g: Graph, out: Buf, a: LinearW, b: LinearW, x: Buf) void {
+        self.vtable.matvecPair(g, self.ptr, out, a, b, x);
     }
-    pub fn matvecBatchK(self: Exec, out: Buf, w: LinearW, xK: Buf, k: usize) void {
-        self.vtable.matvecBatchK(self.ptr, out, w, xK, k);
+    pub fn matvecBatchK(self: Exec, g: Graph, out: Buf, w: LinearW, xK: Buf, k: usize) void {
+        self.vtable.matvecBatchK(g, self.ptr, out, w, xK, k);
     }
     pub fn rmsnorm(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, eps: f32) void {
         self.vtable.rmsnorm(g, self.ptr, out, x, w, eps);
