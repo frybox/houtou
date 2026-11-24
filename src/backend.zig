@@ -189,6 +189,11 @@ pub const Graph = struct {
     ptr: ?*anyopaque = null,
     kind: GraphKind = .decode,
     ctl: GraphCtl = .{},
+    /// True when THIS step's work is being carried out by a graph replay, so the
+    /// host must not issue the same launches again.  False while recording: the
+    /// launches are what the capture records.  A backend that has no graph
+    /// (the CPU one) always leaves it false, so every op runs normally.
+    replayed: bool = false,
 
     /// The graph a caller passes when it wants the historical direct path.
     pub const direct = Graph{};
