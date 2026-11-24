@@ -1765,6 +1765,15 @@ pub const CudaBackend = struct {
     /// The two graph slots.  `g_cur` selects which one `gs()` returns; the
     /// decode path uses 0, the speculative verify path uses 1.
     g_slots: [2]GraphSlot = .{ .{}, .{} },
+    /// `sample` 的结果。图活跃时由 `dSample` 留空（只有 kernel 进图），
+    /// token 在 `graphEnd` 之后由 `dSampledToken` 读回时填入。
+    sampled: u32 = 0,
+
+    /// 本步的采样器。`collectSampledToken` 除了取 id 还要把 kernel 推进过的
+    /// PRNG 状态写回这里，而 `graphEnd` 之后 engine 不再传它，所以在
+    /// `dSample` 里记下指针（engine 的采样器活的比一步长）。
+    sample_sp: ?*sampler.Sampler = null,
+
     g_cur: usize = 0,
     /// 见 `gOpGate`：非 graph 管辖段。
     g_direct: bool = false,
@@ -6456,6 +6465,7 @@ const attn_score_arity: usize = 11;
         }
         const px = dBufPtr(logits) orelse
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+        self.sample_sp = sp;
         const stream = self.launchStream(); // capture stream while recording
         if (!self.publishSampleCtl(logits.len, sp, stream)) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
@@ -6467,12 +6477,14 @@ const attn_score_arity: usize = 11;
             self.ewLaunchFail("sample", rc);
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // `sample` 返回 token，靠的是一次阻塞 D2H。capture 期间既不能做 D2H，
-        // 也不该把"读出哪个 token"录进图，所以 engine 现在把采样放在
-        // `graphEnd` 之后（见 engines/qwen35.zig 的 `forwardLogitsSampled`）。
-        // 这里保留守卫，万一有人在图内调用也不会静默污染 capture。
-        if (self.capturing() or self.gs().xd_capturing) return 0;
-        return self.collectSampledToken(sp);
+        // 采样 kernel 本身是图里的最后一个节点，但**读回 token 的 D2H 不能
+        // 进图**：录进去的话重放永远返回录制时那个 id（实测每 token 重复）。
+        // 所以图活跃时这里只发射、返回 0，由 `dGraphEnd` 在图关闭后做那一次
+        // 4 字节读取（`sampledToken` 再把结果交给 engine）。
+        // 直接发射路径没有图，就地读回，行为和以前完全一致。
+        if (self.graphActive()) return 0;
+        self.sampled = self.collectSampledToken(sp);
+        return self.sampled;
     }
 
     /// The token from the current step's `sample`, after `stepEnd` downloaded it.
@@ -8085,6 +8097,24 @@ const attn_score_arity: usize = 11;
         g.ptr = null;
     }
 
+    /// 图关闭之后取回本步 `sample` 写进设备控制块的那个 id。
+    ///
+    /// 为什么必须在这里而不是在 `sample` 里：这读是一次阻塞 D2H，capture
+    /// 期间非法；把它录进图又会让每次重放都返回录制时那个 token（实测：
+    /// 24 个 token 全是同一个 id）。`sample` 的 kernel 仍然是图的最后一个
+    /// 节点，这里只负责把结果搬回主机。
+    fn dSampledToken(ctx: *anyopaque) u32 {
+        const self = self_(ctx);
+        const sp = self.sample_sp orelse return self.sampled;
+        // 采样 kernel 刚由图/默认流写出，读之前要确保它执行完。
+        if (self.cu) |*cu| {
+            if (self.g_stream) |st| _ = cu.lib.StreamSynchronize(st);
+            if (cu.lib.StreamSynchronize(null) != cudart.cudaSuccess) _ = cu.lib.GetLastError();
+        }
+        self.sampled = self.collectSampledToken(sp);
+        return self.sampled;
+    }
+
     fn dSetThreads(ctx: *anyopaque, io: std.Io, nt: usize) void {
         // Only the (non-computational) metadata loader runs on the host; the pool is
         // otherwise unused, but the CPU backend is still told so its profile lines
@@ -9102,6 +9132,7 @@ pub const vtable = backend.Exec.VTable{
     .argmaxConf = CudaBackend.dArgmaxConf,
     .argmaxRows = CudaBackend.dArgmaxRows,
     .sample = CudaBackend.dSample,
+    .sampledToken = CudaBackend.dSampledToken,
     // The four pure elementwise slots.  Forwarders, NOT aliases: they need
     // `ctx` to reach the device, and the ctx here is a `*CudaBackend`
     // (aliasing a CPU body would work only because those bodies ignore ctx).

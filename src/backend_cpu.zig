@@ -778,6 +778,10 @@ pub fn attnDecodeKv(
 pub const CpuBackend = struct {
     alloc: std.mem.Allocator,
     g: *const gguf.File,
+    /// `sample` 的返回值。CPU 侧采样是普通调用，没有 D2H 要搬家，所以
+    /// `vSample` 存下结果、`vSampledToken` 原样交回（`backend.zig` 的
+    /// `VTable.sampledToken` 说明了这个拆分存在的理由）。
+    sampled: u32 = 0,
     pool: ?*pool_mod.Pool = null,
     /// Q8_0 activation scratch for one token.
     q8: []u8 = &.{},
@@ -1500,9 +1504,15 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     }
 
     fn vSample(g: backend.Graph, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
-        _ = ctx;
         _ = g;
-        return ew.bufSample(logits, scratch, sp);
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        self.sampled = ew.bufSample(logits, scratch, sp);
+        return self.sampled;
+    }
+
+    fn vSampledToken(ctx: *anyopaque) u32 {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        return self.sampled;
     }
 
     /// Load a 1-D f32 weight vector by name and hand back a `Buf` over the
@@ -1592,6 +1602,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         .argmaxConf = vArgmaxConf,
         .argmaxRows = vArgmaxRows,
         .sample = vSample,
+        .sampledToken = vSampledToken,
         .graphBegin = vGraphBegin,
         .graphEnd = vGraphEnd,
         .setThreads = vSetThreads,

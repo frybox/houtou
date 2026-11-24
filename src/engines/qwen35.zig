@@ -1660,13 +1660,16 @@ pub const Engine = struct {
                 .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
-        // 采样在**图关闭之后**做。采样器读回 token 是一次阻塞 D2H，而 D2H 在
-        // capture 期间非法、在重放期间又会把"读出哪个 token"固化进图（实测：
-        // 每 token 都重放出同一个 id）。参照项目同样把采样留在图外
-        // （llama.cpp 的采样器在 llama_decode 之后）。
+        // 采样是图里的**最后一个节点**：kernel 写设备控制块，读回 token 的
+        // 那次 D2H 留在图外（`graphEnd` 之后由后端做）。capture 期间不能拷贝，
+        // 重放期间更不能不拷 —— 把 D2H 录进图会让每一 token 都读回录制时的
+        // 那个 id。CPU 后端里 `sample` 就是一次普通调用，`sampled` 直接是结果。
+        if (sp) |sampler_obj| self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, sampler_obj);
         self.exec.graphEnd(&self.graph);
         self.graph = .{};
-        if (sp) |sampler_obj| self.sampled = self.exec.sample(.{}, self.logits, self.sample_scratch, sampler_obj);
+        // 图关闭之后才拿得到真实 token（见 backend_cuda.zig 的 `dGraphEnd`）。
+        // CPU 后端与直接发射路径在 `sample` 里就填好了，这里是恒等。
+        self.sampled = self.exec.sampledToken();
         if (prof) prof_lm += profNs(io, b);
         return self.logits;
     }
@@ -3353,7 +3356,8 @@ pub const Engine = struct {
         var hit_context_limit = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
-        var next: u32 = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken();
         // Two independent limits: how many tokens the caller asked for, and how
         // many slots the KV cache has left.  `pos` advances regardless.
         while (generated < n_predict) {
@@ -3508,7 +3512,8 @@ pub const Engine = struct {
         var gen_ns: i96 = 0;
         var hit_eos = false;
         var hit_context_limit = false;
-        var next: u32 = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken();
         var proposed_total: usize = 0;
         var accepted_total: usize = 0;
         var rounds: usize = 0;

@@ -924,7 +924,8 @@ pub const Engine = struct {
         var gen_ns: i96 = 0;
         var hit_eos = false;
         var hit_context_limit = false;
-        var next: u32 = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken();
         var proposed_total: usize = 0;
         var accepted_total: usize = 0;
         var rounds: usize = 0;
@@ -963,7 +964,8 @@ pub const Engine = struct {
                     var logits = self.forwardLogits(next, pos);
                     self.specRingPush();
                     var committed: usize = 0;
-                    var pending: u32 = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
+                    _ = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
+                    var pending: u32 = self.exec.sampledToken();
                     if (self.spec_trace_dbg) {
                         std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
                             pos, next, draft_buf[0], pending, n_draft,
@@ -979,7 +981,8 @@ pub const Engine = struct {
                         const row_pos = block_pos + @as(u32, @intCast(committed));
                         logits = self.forwardLogits(cand, row_pos);
                         self.specRingPush();
-                        pending = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
+                        _ = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
+                        pending = self.exec.sampledToken();
                     }
                     accepted_total += committed;
                     if (committed < self.spec_pos_reached.len) self.spec_pos_reached[committed] += 1;
@@ -1087,7 +1090,8 @@ pub const Engine = struct {
     }
     fn dSample(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));
-        return e.exec.sample(e.graph, e.logits, e.sample_scratch, &e.sampler);
+        _ = e.exec.sample(e.graph, e.logits, e.sample_scratch, &e.sampler);
+        return e.exec.sampledToken();
     }
     fn dMaxSeq(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));

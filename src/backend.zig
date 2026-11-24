@@ -616,6 +616,18 @@ pub const Exec = struct {
         graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl) Graph,
         graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
 
+        /// The token this step's `sample` produced, valid AFTER `graphEnd`.
+        ///
+        /// `sample` runs INSIDE the graph span (it is the graph's last node) so a
+        /// device backend can capture it, but getting the id to the host is a
+        /// blocking D2H that neither can be recorded (a captured copy replays the
+        /// same id forever) nor legally performed while the stream is capturing.
+        /// So the split is: `sample` launches and returns 0 on a device backend;
+        /// this slot performs the one 4-byte read after the graph has been
+        /// closed.  A backend that samples eagerly (the CPU one) returns the
+        /// value `sample` already produced, i.e. an identity.
+        sampledToken: *const fn (ctx: *anyopaque) u32,
+
         /// Mark a phase boundary in the pool's timing counters (no-op for a
         /// device backend, which reports its own timings).
         profPhase: *const fn (ctx: *anyopaque, on: bool) void,
@@ -885,6 +897,10 @@ pub const Exec = struct {
     }
     pub fn graphEnd(self: Exec, g: *Graph) void {
         self.vtable.graphEnd(self.ptr, g);
+    }
+    /// See `VTable.sampledToken`: valid only after `graphEnd`.
+    pub fn sampledToken(self: Exec) u32 {
+        return self.vtable.sampledToken(self.ptr);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);
