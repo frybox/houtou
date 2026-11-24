@@ -297,10 +297,18 @@ fn stubNoCudaKernels() c_int {
 
 /// The one place that decides what a `Launch.*` call does inside a graph span.
 ///
-/// S3c: this is the A/B switch only.  The per-op decision (record now / skip
-/// because the graph already replays it) lives in `xdGate`, next to the table
-/// that needs the context; keeping the two apart is what lets this function
-/// stay outside the `cuda_linked` branch and free of backend types.
+/// 语义只有一条：**`g.ptr` 非空表示"这一步由图在跑，主机侧不要再发射"**。
+///
+///   off / rec  `dGraphBegin` 返回 `ptr == null` 的直通图 → 这里返回 false，
+///              op 照常发射。`rec` 期间这在 CUDA 里是期望行为：capture 会把
+///              每一次发射记进图（参照项目同样如此，capture 期没有任何特殊
+///              分支）。
+///   live       `dGraphBegin` 在 `GraphLaunch` 之后返回带 `ptr` 的图 → 这里
+///              返回 true，op 被跳过。不跳过就是在默认流上把整步再算一遍，
+///              结果会和图的输出交错。
+///
+/// 这样就不需要 op 表，也不需要按 op 分别记账：判断依据是"这一 token 的
+/// 工作是否已经由图承担"。
 fn graphGate(g: backend.Graph) bool {
     _ = g;
     return false;
@@ -310,50 +318,13 @@ fn graphGate(g: backend.Graph) bool {
 /// each field collapses to either the extern or the stub -- no indirection at
 /// run time.
 const Launch = if (cuda_linked) struct {
-    // ---- XG 转发助手（S3c）------------------------------------------------
-    //
-    // `xdCtx` 把 `Graph.ptr`（`dGraphBegin` 放进去的 `*GraphSlot`）取出来。
-    // 直通图（`.direct`，`ptr == null`）返回 null，转发器照旧直接发射。
-    /// 收 `Graph.ptr` 而不是 `backend.Graph`：这三个是内部助手，不是 op。
-    /// seam 的结构测试把「`fn <name>(g: backend.Graph, ...)`」一律当成 op 并要求
-    /// 它在 CPU 分支有同名 stub；助手没有 stub，签名上区分开即可，不需要在
-    /// 测试里维护一份例外名单。
-    fn xdCtx(ptr: ?*anyopaque) ?*GraphSlot {
-        const p = ptr orelse return null;
-        return @ptrCast(@alignCast(p));
-    }
-
-    /// 录制 / 重放期的决策，返回 true 表示"不要按原样发射"：
-    ///   * `.live`：这台 op 已在这张图里，重放会执行它 —— 抑制主机侧发射；
-    ///   * `.rec`：这一步会由 `xd_rec_*` 发射（因此也不能再调 launcher）。
-    /// 其余（`.off` / `.warm`）返回 false，走原来的直接发射。
-    fn xdGate(ptr: ?*anyopaque) bool {
-        const s = xdCtx(ptr) orelse return false;
-        return switch (s.xd_phase) {
-            .rec, .live => true,
-            else => false,
-        };
-    }
-
-    /// 录制一个 op：占用下一个录制槽位，调用 `f(slot, stream)`（形式是
-    /// `xd.xd_rec_<op>(stream, slot, <该 op 自己的参数...>)`），失败置
-    /// `xd_dropped`。
-    ///
-    /// 用法（转发器里一行）：
-    ///   `if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recRmsnorm, .{ d_out, d_x, d_w, rows, n, eps });`
-    ///
-    /// 槽位溢出同样置 `xd_dropped`：这一步的图会被放弃，不会少记一个 op。
-    fn xdRecord(ptr: ?*anyopaque, stream: ?*anyopaque, comptime f: anytype, args: anytype) c_int {
-        const s = xdCtx(ptr) orelse return 0;
-        if (s.xd_rec_n >= xd_max_ops) {
-            s.xd_dropped = true;
-            return 0;
-        }
-        const slot = &s.xd_rec[s.xd_rec_n];
-        s.xd_rec_n += 1;
-        const rc = @call(.auto, f, .{ stream, slot } ++ args);
-        if (rc != 0) s.xd_dropped = true;
-        return rc;
+    /// live 期抑制主机侧发射；rec 期**不能**抑制（capture 靠这些发射记录节点）。
+    /// 收 `Graph.ptr` 而不是 `Graph`：seam 的结构测试把 `fn x(g: backend.Graph,`
+    /// 一律当成 op 并要求 CPU 分支有同名 stub，内部助手不该触发那条规则。
+    fn xdSuppress(ptr: ?*anyopaque) bool {
+        const p = ptr orelse return false;
+        const s: *GraphSlot = @ptrCast(@alignCast(p));
+        return s.xd_phase == .live;
     }
 
     const quantize_q8_0 = Kernels.q35_launch_quantize_q8_0;
@@ -362,33 +333,34 @@ const Launch = if (cuda_linked) struct {
     const mmq_dp4a_wants = Kernels.q35_mmq_dp4a_wants;
     const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
     fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_dequantize(ttype, d_src, d_dst, nblocks, stream);
     }
     fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_mul_mat_vec(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
     fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_mul_mat_vec_f32(d_w, d_x, d_out, rows, cols, tokens, stream);
     }
     fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_mul_mat_vec_w16(d_w, d_x, d_out, rows, cols, tokens, ttype, stream);
     }
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
     fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recScaleVec, .{ d_x, s, n }) else return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
     }
     fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_l2norm_qk_scale(d_x, nk, kd, k_offset, eps, qscale, stream);
     }
     /// Forwarders, not aliases.  `g` decides whether the launch is recorded,
@@ -396,78 +368,85 @@ const Launch = if (cuda_linked) struct {
     /// parameters are the kernel's own, so `Launch.x(a, b, c)` at a call site
     /// reads exactly like the launcher it wraps.
     fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recAddResid, .{ dst, src, n }) else return Kernels.q35_launch_add_resid(dst, src, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_add_resid(dst, src, n, stream);
     }
     fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recCopyRange, .{ d_dst, d_src, n }) else return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
     fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
     }
     fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream);
     }
     fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_chunk_dyn(d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recDeinterleaveQg, .{ d_q, d_gate, d_src, heads, hd }) else return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
     }
     fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_deinterleave_qg_strided(d_q, d_gate, d_src, heads, hd, tokens, stream);
     }
     fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recZeroBuf, .{ d_buf, n }) else return Kernels.q35_launch_zero_buf(d_buf, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_zero_buf(d_buf, n, stream);
     }
     fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recRmsnorm, .{ d_out, d_x, d_w, rows, n, eps }) else return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
     }
     fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_l2norm(d_x, rows, n, eps, stream);
     }
     fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recSilu, .{ d_x, n }) else return Kernels.q35_launch_silu(d_x, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_silu(d_x, n, stream);
     }
     fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_mul_silu(d_out, d_gate, n, stream);
     }
     fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_mul_sigmoid(d_out, d_gate, n, stream);
     }
     fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recSwiglu, .{ d_gate, d_up, n }) else return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
+        if (Launch.xdSuppress(g.ptr)) return 0;
+        return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
     }
     fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_softmax(d_x, n, stream);
     }
     fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
     fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
     }
     fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
     }
     fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_argmax_conf(d_x, n, d_out, stream);
     }
     fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
     }
     const sample_init = Kernels.q35_launch_sample_init;
@@ -475,55 +454,55 @@ const Launch = if (cuda_linked) struct {
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
     fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_decode(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_chunk(d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_max_rows = Kernels.q35_attn_chunk_max_rows;
     fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_decode_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_decode_coal(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_decode_split2(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
     fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_attn_decode_split_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
     const set_int1 = Kernels.q35_launch_set_int1;
     const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
     fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_step(d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream);
     }
     fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_step_rows(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream);
     }
     fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_step_rows_chunk(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_step_rows_snap(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_step_wy(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_gamma(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream);
     }
     // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
@@ -533,40 +512,40 @@ const Launch = if (cuda_linked) struct {
     // broke `zig build` (without -Dcuda) at LINK time on an undefined symbol -- a
     // class of failure the type errors above cannot catch.
     fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_conv_step_rows(d_conv, d_y, d_wconv, n, tokens, y_stride, stream);
     }
     fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_gdn_gamma_rows(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream);
     }
     fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_l2norm_strided(d_x, row_offset, rows, n, eps, tokens, row_stride, stream);
     }
     fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_scale_vec_strided(d_x, offset, s, n, tokens, stride, stream);
     }
     fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_rope64(d_x, heads, hd, pos, base, stream);
     }
     fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_rope64_dpos(d_x, heads, hd, d_ctl, stream);
     }
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
     fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_rope64_rows(d_x, rows, heads, hd, pos0, base, stream);
     }
     fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_rope_rows_dim(d_x, rows, heads, hd, pos0, base, rotary_dim, stream);
     }
     fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_rope64_rows_dpos(d_x, rows, heads, hd, d_ctl, stream);
     }
 } else struct {
@@ -1231,7 +1210,7 @@ const kernel_max_args: usize = 24;
 
 /// 一张 XG decode 图最多记录多少个 op。实测 27B 一个 decode token 的发射
 /// 次数约 3000（`QWEN35_PROF` 各 slot 的 calls 之和），4096 留出余量。
-const xd_max_ops: usize = 4096;
+
 
 /// One argument slot of a tracked kernel: `width` bytes of value storage, so a
 /// f32 (4) and a 64-bit pointer (8) both fit without a variant type.  Alignment
@@ -1302,19 +1281,19 @@ const GraphSlot = struct {
     // ---- 显式计算图（XG，S3c）--------------------------------------------
     //
     // 与上面那批旧机制字段并存，直到 S3d 把它们删掉。`xd_phase` 非 `.off`
-    // 时转发器走 xd 的路（`xdGate`），旧字段一律不看。
+    // 时走 XG 的路，旧字段一律不看。
     //
-    // 容量见 `xd_max_ops`；超出不是崩溃：`xd_rec_n` 停止增长、`xd_dropped`
-    // 置位，本步放弃图并退回直接发射（`dGraphEnd`），不会静默少记一个 op。
+    // 没有 op 表、没有节点列表：capture 期间 op 照常发射，CUDA 自己记录，
+    // 重放就是一次 `GraphLaunch`。这是 llama.cpp / ds4 / Strata 三者共同的
+    // 结构，也是唯一能覆盖 `matvec` 那种几何由运行时分发决定的 op 的做法。
     xd_phase: XdPhase = .off,
-    xd_rec: [xd_max_ops]xd.Node = undefined,
-    xd_rec_n: usize = 0,
-    xd_dropped: bool = false,
-    xd_graph: ?*anyopaque = null,
     xd_gexec: ?*anyopaque = null,
-    /// 本次重放是否已经把图交给 GPU。`xd_apply` 在 launch 之前跑，所以只有
-    /// 越过 launch 的失败才意味着"状态已推进、不能再重跑本步"。
+    xd_graph: ?*anyopaque = null,
+    /// 本次重放是否已经把图交给 GPU：只有越过 launch 的失败才意味着
+    /// "状态已推进、不能再重跑本步"。
     xd_launched: bool = false,
+    /// capture 已经打开、尚未关闭。防止同一调用栈里重入 `graphBegin`。
+    xd_capturing: bool = false,
 };
 
 /// XG 一张图的状态。`warm` 是"下一步录制"（`absent → warm → live`），
@@ -2459,7 +2438,17 @@ pub const CudaBackend = struct {
     /// True when a launch happening right now is being captured, i.e. when its
     /// arguments must be recorded for the per-token retarget.
     fn capturing(self: *const CudaBackend) bool {
-        return self.gs().state == .rec;
+        return self.gs().state == .rec or self.gs().xd_capturing;
+    }
+
+    /// True when this step's work is (or will be) inside a graph, i.e. the op
+    /// must take the device-control-block form so a replayed node reads fresh
+    /// per-token scalars.  Covers BOTH mechanisms: the old `state` and XG's
+    /// `xd_phase`.  Getting this wrong is silent: a node captured with a
+    /// frozen `pos`/`slot` re-runs the first token's value every replay.
+    fn graphActive(self: *const CudaBackend) bool {
+        return self.capturing() or self.gs().state == .live or
+            self.gs().xd_phase == .rec or self.gs().xd_phase == .live;
     }
 
     /// Suppress a host-side launch when the captured graph already contains it.
@@ -3725,23 +3714,25 @@ const attn_score_arity: usize = 11;
         switch (s.xd_phase) {
             .off => return g,
             .rec => {
+                // 直通图：capture 期 op 必须照常发射，CUDA 才会记录它们；
+                // 若返回带 ptr 的图，`graphGate` 会把每次发射都跳过，图就是空的。
+                //
+                // `xd_phase` 已经是 `.rec` 时**不要**再开一次：prefill 的尾巴块
+                // 只有 1 个 token 时，`forwardChunk` 会递归调用 `forwardLogits`，
+                // 于是同一个调用栈里出现两次 `graphBegin`。第二次 `StreamBeginCapture`
+                // 会被运行时拒绝（`cudaErrorStreamCaptureUnsupported` 401），而第一次
+                // 开下的 capture 就永远没人关。
+                if (s.xd_capturing) return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
                 if (!self.xdStartCapture()) return g;
                 return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
             },
             .live => {
                 if (!self.xdReplay()) {
-                    // 重放失败时**不能**退回主机侧直接发射：`GraphLaunch` 要么
-                    // 已经跑了（状态已推进一次），要么根本没跑（本步什么都没算）。
-                    // 两种情况重跑整步都会得到错数。`xdapply` 在 launch 之前，
-                    // 所以失败点只可能是 apply —— 那时图没跑，但这一 token 的
-                    // 状态也没推进，直接发射是安全的。以 `xd_apply` 是否已越过
-                    // launch 为界区分，见 `xdReplay`。
+                    // 重放失败后**不能**退回主机侧直接发射：图可能已经执行
+                    // （状态被推进一次），重跑整步会把状态推进两次。所以只有
+                    // "图没启动"这一种失败允许降级；见 `xd_launched`。
                     s.xd_phase = .off;
-                    if (s.xd_launched) {
-                        // 图已执行：本步什么都不再做，让 engine 读到错误结果
-                        // 好过叠加一层半算。仍返回 ptr，使主机侧被抑制。
-                        return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
-                    }
+                    if (s.xd_launched) return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
                     return g;
                 }
                 return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
@@ -3765,15 +3756,22 @@ const attn_score_arity: usize = 11;
             self.gs().xd_phase = .off;
             return false;
         }
+        // 先排空：capture 开始前默认流上的 embedding 拷贝必须已经落定，否则
+        // `StreamBeginCapture` 直接拒绝（实测 rc = "operation cannot be
+        // performed in the present state"）。ds4 与 Strata 也是先同步再开。
+        // 同步失败也要清掉错误状态，后面才看得懂真正的失败点。
+        if (cu.lib.StreamSynchronize(null) != cudart.cudaSuccess) _ = cu.lib.GetLastError();
         self.graphSyncFromDefault();
-        const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeThreadLocal);
+        // Global 而非 ThreadLocal：本后端在 capture 期间混用了默认流（embed 之后
+        // 的 `launchStream()` 在 `.rec` 时是 `g_stream`，但部分路径仍显式传 null），
+        // ThreadLocal 会把那些发射当成非法操作。ds4 用的是 Global。
+        const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeGlobal);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("xg: begin capture", rc);
             self.gs().xd_phase = .off;
             return false;
         }
-        self.gs().xd_rec_n = 0;
-        self.gs().xd_dropped = false;
+        self.gs().xd_capturing = true;
         return true;
     }
 
@@ -3782,13 +3780,12 @@ const attn_score_arity: usize = 11;
         const cu = &(self.cu orelse return);
         const s = self.gs();
         var graph: ?*anyopaque = null;
+        s.xd_capturing = false;
         const erc = cu.lib.StreamEndCapture(self.g_stream, &graph);
-        const dropped = s.xd_dropped;
-        if (erc != cudart.cudaSuccess or graph == null or dropped) {
+        if (erc != cudart.cudaSuccess or graph == null) {
             if (graph) |gr| _ = cu.lib.GraphDestroy(gr);
-            if (!dropped) self.ewLaunchFail("xg: end capture", erc);
+            self.ewLaunchFail("xg: end capture", erc);
             s.xd_phase = .off;
-            s.xd_rec_n = 0;
             return;
         }
         var gexec_new: ?*anyopaque = null;
@@ -3797,18 +3794,12 @@ const attn_score_arity: usize = 11;
             _ = cu.lib.GraphDestroy(graph.?);
             self.ewLaunchFail("xg: instantiate", irc);
             s.xd_phase = .off;
-            s.xd_rec_n = 0;
             return;
         }
-        // DO NOT destroy `graph` here.  Every `xd_node.gnode[]` points at a node
-        // of THIS graph, and `xd_apply` reads those nodes' params to decide which
-        // they own and to hand them new arguments.  Destroying the source graph
-        // right after instantiation leaves `gnode[]` dangling: `xd_apply` then
-        // matches zero nodes and returns `cudaErrorInvalidResourceHandle`.
-        // Measured 2026-11: the first replay produced garbled ids because the
-        // replay itself failed and the host path then ran the step a second time
-        // on state the graph had already advanced.
-        s.xd_graph = graph;
+        // 源图可以立刻销毁：本实现不保留任何节点句柄（无 op 表、无 apply），
+        // 重放只认 `gexec`。参照项目里只有 ds4 保留 `graph`，那是因为它要用
+        // `cudaGraphAddKernelNode` 手工改图。
+        _ = cu.lib.GraphDestroy(graph.?);
         s.xd_gexec = gexec_new;
         s.xd_phase = .live;
         // capture 只记录不执行：这一 token 至今没有任何 kernel 跑过，必须
@@ -3834,14 +3825,14 @@ const attn_score_arity: usize = 11;
         const cu = &(self.cu orelse return false);
         const s = self.gs();
         const gexec_live = s.xd_gexec orelse return false;
-        for (s.xd_rec[0..s.xd_rec_n]) |*node| {
-            const rc = xd.apply(node, gexec_live);
-            if (rc != 0) {
-                self.ewLaunchFail("xg: apply", rc);
-                return false;
-            }
-        }
+        // 没有 `apply`：参照项目（llama.cpp / ds4 / Strata）重放前都不改节点。
+        // 逐 token 变化的标量由设备控制块在 kernel 内读取（S3a/S3b），其余
+        // 实参在 capture 时就已固化成常量区域。
         const st = self.g_stream orelse return false;
+        // `dGraphBegin` 在本步开始时把控制块写到 DEFAULT 流上（publish 是普通
+        // kernel launch）。图在 `g_stream` 上读同一个块，两条流之间没有隐式
+        // 顺序，所以重放前必须显式对齐；否则图会读到上一 token 的 pos/slot。
+        self.graphSyncFromDefault();
         s.xd_launched = true;
         const lrc = cu.lib.GraphLaunch(gexec_live, st);
         if (lrc != cudart.cudaSuccess) {
@@ -5395,7 +5386,7 @@ const attn_score_arity: usize = 11;
         // that a replayed/recorded step takes its ROW from the control block so
         // the captured destination pointer stays a constant region base.
         if (self.kv_type == .f32) {
-            if ((self.capturing() or self.gs().state == .live) and self.ctl_dev != null) {
+            if (self.graphActive() and self.ctl_dev != null) {
                 if (dBufPtr(dst)) |pd| {
                     if (dBufPtr(src)) |ps| {
                         const n = rows * kv_dim;
@@ -6476,11 +6467,11 @@ const attn_score_arity: usize = 11;
             self.ewLaunchFail("sample", rc);
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // S2: `sample` returns the token.  On the DIRECT path the launch is on
-        // the default stream, so a blocking copy here is already ordered after
-        // it.  Inside a capture nothing can be downloaded -- this branch is
-        // unreachable until S3 makes capture real again.
-        if (self.capturing()) return 0;
+        // `sample` 返回 token，靠的是一次阻塞 D2H。capture 期间既不能做 D2H，
+        // 也不该把"读出哪个 token"录进图，所以 engine 现在把采样放在
+        // `graphEnd` 之后（见 engines/qwen35.zig 的 `forwardLogitsSampled`）。
+        // 这里保留守卫，万一有人在图内调用也不会静默污染 capture。
+        if (self.capturing() or self.gs().xd_capturing) return 0;
         return self.collectSampledToken(sp);
     }
 
@@ -7073,7 +7064,7 @@ const attn_score_arity: usize = 11;
         // `pos`/`base` are published into the same device channel the per-head
         // path uses (`ropeSetEnv` runs once per token, not once per call), so
         // the captured node reads them fresh on every replay.
-        if (self.capturing() or self.gs().state == .live) {
+        if (self.graphActive()) {
             if (self.ensureCtl()) |ctl_dev| {
                 _ = self.publishCtl(.{
                     .pos = pos,

@@ -1660,9 +1660,13 @@ pub const Engine = struct {
                 .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
-        if (sp) |sampler_obj| self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, sampler_obj);
+        // 采样在**图关闭之后**做。采样器读回 token 是一次阻塞 D2H，而 D2H 在
+        // capture 期间非法、在重放期间又会把"读出哪个 token"固化进图（实测：
+        // 每 token 都重放出同一个 id）。参照项目同样把采样留在图外
+        // （llama.cpp 的采样器在 llama_decode 之后）。
         self.exec.graphEnd(&self.graph);
         self.graph = .{};
+        if (sp) |sampler_obj| self.sampled = self.exec.sample(.{}, self.logits, self.sample_scratch, sampler_obj);
         if (prof) prof_lm += profNs(io, b);
         return self.logits;
     }
