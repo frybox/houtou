@@ -168,6 +168,10 @@ const Kernels = struct {
     /// See `caps.cu`; the sampler's control block moves into mapped host memory
     /// only when this is 1.
     extern fn q35_gpu_can_map_host() callconv(.c) c_int;
+    /// 把映射主机内存里的采样控制块搬进设备副本（图节点）。
+    extern fn q35_launch_sample_ctl_in(d_ctl: ?[*]c_int, mapped: ?*const anyopaque, stream: ?*anyopaque) void;
+    /// 采样之后把设备副本（含 token_out 与推进后的 PRNG）搬回映射主机内存。
+    extern fn q35_launch_sample_ctl_out(mapped: ?*anyopaque, d_ctl: ?[*]const c_int, stream: ?*anyopaque) void;
     extern fn q35_launch_sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void;
     extern fn q35_sample_scratch_ints() callconv(.c) c_int;
     extern fn q35_sample_ctl_ints() callconv(.c) c_int;
@@ -455,6 +459,8 @@ const Launch = if (cuda_linked) struct {
     }
     const can_map_host_raw = Kernels.q35_gpu_can_map_host;
     const sample_init = Kernels.q35_launch_sample_init;
+    const sample_ctl_in = Kernels.q35_launch_sample_ctl_in;
+    const sample_ctl_out = Kernels.q35_launch_sample_ctl_out;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
@@ -721,6 +727,12 @@ const Launch = if (cuda_linked) struct {
     }
     fn can_map_host_raw() c_int {
         return 0;
+    }
+    fn sample_ctl_in(d_ctl: ?[*]c_int, mapped: ?*const anyopaque, stream: ?*anyopaque) void {
+        _ = .{ d_ctl, mapped, stream };
+    }
+    fn sample_ctl_out(mapped: ?*anyopaque, d_ctl: ?[*]const c_int, stream: ?*anyopaque) void {
+        _ = .{ mapped, d_ctl, stream };
     }
     fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque, mapped_ctl: ?*anyopaque) callconv(.c) c_int {
         _ = mapped_ctl;
@@ -6389,9 +6401,9 @@ const attn_score_arity: usize = 11;
         const seed: u64 = sp.state;
         hc.rng_lo = @bitCast(@as(u32, @truncate(seed)));
         hc.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
-        // Mapped block: `d_sample_ctl` IS this host memory, so the stores above
-        // already published.  Nothing to copy, and therefore nothing that a
-        // capture could record with stale values.
+        // Mapped staging block: the stores above ARE the publish.  The device
+        // copy is refreshed by `k_sample_ctl_in`, a graph node that runs before
+        // the sampler on every replay (see `dSample_body`).
         if (self.sample_ctl_mapped) return true;
         const cu = &(self.cu orelse return false);
         const rc = cu.lib.MemcpyAsync(
@@ -6412,7 +6424,16 @@ const attn_score_arity: usize = 11;
         const cu = &(self.cu orelse return self.sample_token);
         const h = self.h_sample_ctl orelse return self.sample_token;
         const hc: *SampleCtl = @ptrCast(@alignCast(h));
-        if (!self.sample_ctl_mapped) {
+        if (self.sample_ctl_mapped) {
+            // Device copy -> mapped host block, then wait.  `k_sample_ctl_out`
+            // is a plain kernel, so it is safe to issue here (the graph has
+            // already been closed); the synchronise is what makes the host read
+            // below observe `token_out` and the advanced PRNG state.
+            const st = self.g_stream orelse null;
+            Launch.sample_ctl_out(self.h_sample_ctl, @ptrCast(@alignCast(self.d_sample_ctl)), st);
+            if (st) |s2| _ = cu.lib.StreamSynchronize(s2);
+            if (cu.lib.StreamSynchronize(null) != cudart.cudaSuccess) _ = cu.lib.GetLastError();
+        } else {
             // Blocking 64-byte pull (the stream already carries every dependency:
             // this runs on the DEFAULT stream, which `graphSyncToDefault` ordered
             // after the graph).  Reading the last 64 bytes of the block -- rather
@@ -6428,10 +6449,9 @@ const attn_score_arity: usize = 11;
             }
             self.stat_d2h_bytes += @sizeOf(SampleCtl);
         }
-        // Mapped block: the kernel already wrote `token_out` / `rng_out_*` into
-        // this host memory, so the fields below are simply read.  The caller is
-        // responsible for having synchronised the stream first (`dSampledToken`
-        // does); without that the read could race the kernel.
+        // Both paths land here with `hc` holding this step's result: the mapped
+        // path just copied the device block back (and waited), the other path
+        // did one blocking D2H.  The fields below are plain host reads.
         // `Sampler.sample` consumes exactly one `nextU64` per non-greedy draw
         // (sampler.zig:120 `nextF32`), and the kernel does the same, so the state
         // it wrote back IS the position the CPU reference would be at.
@@ -6536,6 +6556,13 @@ const attn_score_arity: usize = 11;
         const stream = self.launchStream(); // capture stream while recording
         if (!self.publishSampleCtl(logits.len, sp, stream)) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+        }
+        // Mapped staging: move the host-written block into the device copy.  This
+        // is a GRAPH NODE, so on every replay it re-reads whatever the host put
+        // there for that token -- which is exactly why the parameters can change
+        // between tokens while the sampler stays a captured node.
+        if (self.sample_ctl_mapped) {
+            Launch.sample_ctl_in(@ptrCast(@alignCast(self.d_sample_ctl)), self.h_sample_ctl, stream);
         }
         const rc = Launch.sample(g, 
             px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,

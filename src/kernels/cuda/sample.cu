@@ -564,48 +564,71 @@ int q35_sample_ctl_ints(void) { return CTL_INTS; }
 // Allocate both regions once.  Idempotent: a NULL input means "not allocated
 // yet".  Returns a cudaError_t value.
 //
-// `mapped_ctl` may be a DEVICE pointer into host memory (`cudaHostAlloc` with
-// `cudaHostAllocMapped` + `cudaHostGetDevicePointer`).  When it is non-NULL the
-// control block lives in host RAM and the host writes it directly: no H2D per
-// token, and the token id is published by the kernel straight into memory the
-// host then reads -- no D2H either.  That is what lets the sampler be a node of
-// the captured graph without the host needing to retarget it every token (see
-// Strata's `mapped()` staging, engine/src/core/mtp.cpp:131).
+// THE CONTROL BLOCK IS ALWAYS DEVICE MEMORY.  `mapped_ctl` is a separate block
+// of mapped host memory (`cudaHostAlloc` with `cudaHostAllocMapped` +
+// `cudaHostGetDevicePointer`) that only the two staging kernels below touch; the
+// sampler itself and every kernel it launches read and write `*d_ctl`.
 //
-// Why this matters here specifically: a control block in DEVICE memory has to be
-// refreshed with `cudaMemcpyAsync` before each replay.  Inside a capture that
-// copy becomes a node (so it replays the recorded values forever), and after the
-// graph has launched it is too late.  Mapped memory removes the question.
+// WHY THE STAGE.  A captured node keeps the arguments it was recorded with, so a
+// per-token parameter cannot be passed by value.  It has to arrive through
+// memory -- and that memory cannot be device memory refreshed from the host: the
+// refresh inside a capture becomes a node (replaying the recorded values
+// forever), and after the graph has launched it is too late.  So the block the
+// host writes is the MAPPED one, and a copy kernel inside the graph moves it
+// into device memory each replay.  Same shape as Strata
+// (`engine/src/core/mtp.cpp:131` `mapped()` + `copy_from_mapped_multi`), and the
+// same reason its copy kernel reads through `volatile`.
 //
-// `d_scratch` stays in device memory: it is a per-launch working set the host
-// never touches, so mapping it would only add PCIe traffic.
+// `d_scratch` is a per-launch working set the host never touches, so it needs no
+// staging at all.
 int q35_launch_sample_init(void **d_ctl, void **d_scratch, void *mapped_ctl) {
+    (void)mapped_ctl;   // the stage block is owned and wired up by the host
     if (d_ctl == nullptr || d_scratch == nullptr) return (int)cudaErrorInvalidValue;
     if (*d_ctl == nullptr) {
-        if (mapped_ctl != nullptr) {
-            *d_ctl = mapped_ctl;
-        } else {
-            if (cudaMalloc(d_ctl, (size_t)CTL_INTS * sizeof(int)) != cudaSuccess) {
-                *d_ctl = nullptr;
-                return (int)cudaGetLastError();
-            }
-            cudaMemset(*d_ctl, 0, (size_t)CTL_INTS * sizeof(int));
+        if (cudaMalloc(d_ctl, (size_t)CTL_INTS * sizeof(int)) != cudaSuccess) {
+            *d_ctl = nullptr;
+            return (int)cudaGetLastError();
         }
+        cudaMemset(*d_ctl, 0, (size_t)CTL_INTS * sizeof(int));
     }
     if (*d_scratch == nullptr) {
         if (cudaMalloc(d_scratch, (size_t)SCRATCH_INTS * sizeof(int)) != cudaSuccess) {
-            // Only undo a block THIS call allocated.  A mapped control block is
-            // host memory owned by the caller (`cudaHostAlloc`), and freeing it
-            // here would be an invalid free.
-            if (mapped_ctl == nullptr) {
-                cudaFree(*d_ctl);
-                *d_ctl = nullptr;
-            }
+            cudaFree(*d_ctl);
+            *d_ctl = nullptr;
             return (int)cudaGetLastError();
         }
         cudaMemset(*d_scratch, 0, (size_t)SCRATCH_INTS * sizeof(int));
     }
     return (int)cudaSuccess;
+}
+
+// ---- staging kernels: mapped host memory <-> the device control block --------
+//
+// Both are graph nodes: `in` runs before the sampler on every replay, `out`
+// after it.  `src` is read through `volatile` because the host owns that memory
+// and rewrites it between replays -- without it the compiler is free to cache
+// the load, and the graph would keep sampling with the first token's parameters.
+//
+// 16 ints = one 64-byte cache line each way, so these are one block, one warp.
+
+__global__ void k_sample_ctl_in(int *__restrict__ dst, const volatile int *src) {
+    const int i = threadIdx.x;
+    if (i < CTL_INTS) dst[i] = src[i];
+}
+
+__global__ void k_sample_ctl_out(volatile int *dst, const int *src) {
+    const int i = threadIdx.x;
+    if (i < CTL_INTS) dst[i] = src[i];
+}
+
+extern "C" void q35_launch_sample_ctl_in(int *d_ctl, const void *mapped, void *stream_v) {
+    if (d_ctl == nullptr || mapped == nullptr) return;
+    k_sample_ctl_in<<<1, 32, 0, (cudaStream_t)stream_v>>>(d_ctl, (const volatile int *)mapped);
+}
+
+extern "C" void q35_launch_sample_ctl_out(void *mapped, const int *d_ctl, void *stream_v) {
+    if (d_ctl == nullptr || mapped == nullptr) return;
+    k_sample_ctl_out<<<1, 32, 0, (cudaStream_t)stream_v>>>((volatile int *)mapped, d_ctl);
 }
 
 void q35_launch_sample_deinit(void **d_ctl, void **d_scratch) {
