@@ -455,10 +455,12 @@ const Launch = if (cuda_linked) struct {
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
     fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recArgmax, .{ d_x, n, d_out }) else return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
     }
     fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recArgmaxBatch, .{ d_x, n, rows, d_out }) else return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
     }
     fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -1310,12 +1312,15 @@ const GraphSlot = struct {
     xd_dropped: bool = false,
     xd_graph: ?*anyopaque = null,
     xd_gexec: ?*anyopaque = null,
+    /// 本次重放是否已经把图交给 GPU。`xd_apply` 在 launch 之前跑，所以只有
+    /// 越过 launch 的失败才意味着"状态已推进、不能再重跑本步"。
+    xd_launched: bool = false,
 };
 
 /// XG 一张图的状态。`warm` 是"下一步录制"（`absent → warm → live`），
 /// 与 `graph_registry.zig` 的状态机同义，但因为 `graph_registry` 的 key
 /// 是 `(signature, kind, rows)` 而 decode 只有一种，这里先用单槽状态。
-const XdPhase = enum { off, warm, rec, live };
+const XdPhase = enum { off, rec, live };
 
 pub const CudaBackend = struct {
     /// Ring size for the per-call timing events; see `ev_pool`.
@@ -2341,10 +2346,31 @@ pub const CudaBackend = struct {
     /// `graphWanted`'s memo.  Module-level (not a function-local `const S`)
     /// so `forceGraphOff` can write the same cell.
     var g_graph_cached: ?bool = null;
+    var g_xd_cached: ?bool = null;
 
     /// The graph slot currently in use.
     inline fn gs(self: anytype) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
         return &self.g_slots[self.g_cur];
+    }
+
+    /// XG（显式计算图）的 A/B 开关，**默认关闭**。见 `graphReserve` 末尾的注释：
+    /// 这条路径还在建设中，打开会让 decode 在第一个不在 `xd.cu` 表里的 op 处
+    /// 丢掉 capture。等 S3d 把表补全、端到端逐位对拍通过再改默认值。
+    fn xdWanted() bool {
+        if (g_xd_cached) |v| return v;
+        var on = false;
+        if (cudart.getenv("QWEN35_XD")) |raw| {
+            const v = mem.trim(u8, raw, " \t\r\n");
+            if (v.len != 0) {
+                on = !(mem.eql(u8, v, "0") or mem.eql(u8, v, "false") or
+                    mem.eql(u8, v, "no") or mem.eql(u8, v, "off"));
+                std.debug.print("cuda backend: explicit compute graph = {s} ($QWEN35_XD)\n", .{
+                    if (on) "on" else "off",
+                });
+            }
+        }
+        g_xd_cached = on;
+        return on;
     }
 
     fn graphWanted() bool {
@@ -2421,6 +2447,9 @@ pub const CudaBackend = struct {
     }
 
     fn launchStream(self: *CudaBackend) ?*anyopaque {
+        // XG 的录制也必须在 `g_stream` 上，否则 `xd_capture` 看到的流不在
+        // capture 状态，录制直接失败（实测：rc=1 在第一个 op）。
+        if (self.gs().xd_phase == .rec) return self.g_stream;
         return switch (self.gs().state) {
             .rec => self.g_stream,
             else => null,
@@ -2532,10 +2561,18 @@ pub const CudaBackend = struct {
         try ensureBuf(&cu.lib, &self.d_deq, &self.d_deq_bytes, max_cols * @sizeOf(f32));
         try ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, @sizeOf(c_int));
         // The reservation is what makes capture safe, so it is also what arms the
-        // feature: before this point `g_state` stays `.off` and `stepBegin` does
-        // nothing, which is right because a capture that early would have to
-        // allocate scratch inside the graph.
-        if (self.gs().state == .off and graphWanted()) self.gs().state = .warm;
+        // feature: before this point the XG phase stays `.off` because a capture
+        // that early would have to allocate scratch inside the graph.
+        //
+        // `$QWEN35_XD=1` gates it, DEFAULT OFF.  The XG path is under
+        // construction: with it on, a decode step currently loses its capture at
+        // the first op that is not in `xd.cu`'s table (measured: op #157 of the
+        // 0.8B step, right after the layer's MLP, with `cudaErrorIllegalAddress`
+        // 700 left on the stream).  Turning it on by default would mean the
+        // engine silently produced a garbled token stream -- see the "xg: replay"
+        // note on `xd_launched`.  It is armed only when explicitly asked for,
+        // so `QWEN35_CUDA_GRAPH=0` and the plain path stay the default.
+        if (self.gs().xd_phase == .off and xdWanted()) self.gs().xd_phase = .rec;
     }
 
     /// Open the capture.  `pos` and `slot` are this token's values, recorded so
@@ -3661,6 +3698,191 @@ const attn_score_arity: usize = 11;
         const ev = self.g_ev_out orelse return;
         if (cu.lib.EventRecord(ev, null) != cudart.cudaSuccess) return;
         _ = cu.lib.StreamWaitEvent(st, ev, 0);
+    }
+
+    // ==== 显式计算图（XG）的状态机 ==========================================
+    //
+    // `off → warm → rec → live`，与 `graph_registry.zig` 的语义一致：
+    //
+    //   off   直接发射，不录制。
+    //   warm  直接发射；`dGraphEnd` 把这步当作"惰性分配已稳态"的证据，转 rec。
+    //         必须走这一步：capture 内出现 `cudaMalloc` 是非法的，而首个
+    //         decode token 会分配 KV 量化缓冲等。
+    //   rec   转发器开 capture 并逐个 `xd_capture`；`dGraphEnd` 关 capture、
+    //         instantiate，然后**立刻 launch 一次**——capture 不执行 kernel，
+    //         不 launch 这一步就没有任何计算发生过。
+    //   live  每步 `apply` 全部节点 + 一次 `GraphLaunch`；转发器被 `xdGate`
+    //         抑制，主机侧不再发射。
+    //
+    // 任何一步失败都转 `off`（不是 `.failed` 的永久放弃：`warm` 期的失败
+    // 只说明"这次还不该录"，下一 token 再试一次就够；真的反复失败会表现为
+    // 每 token 重试一次 capture，用 `QWEN35_CUDA_GRAPH=0` 关掉即可）。
+
+    /// 开始/推进这一步。返回带 `ptr` 的图（`live`/`rec`）或直通图。
+    fn xdPhaseBegin(self: *CudaBackend, g: backend.Graph) backend.Graph {
+        const s = self.gs();
+        s.xd_launched = false;
+        switch (s.xd_phase) {
+            .off => return g,
+            .rec => {
+                if (!self.xdStartCapture()) return g;
+                return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+            },
+            .live => {
+                if (!self.xdReplay()) {
+                    // 重放失败时**不能**退回主机侧直接发射：`GraphLaunch` 要么
+                    // 已经跑了（状态已推进一次），要么根本没跑（本步什么都没算）。
+                    // 两种情况重跑整步都会得到错数。`xdapply` 在 launch 之前，
+                    // 所以失败点只可能是 apply —— 那时图没跑，但这一 token 的
+                    // 状态也没推进，直接发射是安全的。以 `xd_apply` 是否已越过
+                    // launch 为界区分，见 `xdReplay`。
+                    s.xd_phase = .off;
+                    if (s.xd_launched) {
+                        // 图已执行：本步什么都不再做，让 engine 读到错误结果
+                        // 好过叠加一层半算。仍返回 ptr，使主机侧被抑制。
+                        return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+                    }
+                    return g;
+                }
+                return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+            },
+        }
+    }
+
+    fn xdPhaseEnd(self: *CudaBackend) void {
+        const s = self.gs();
+        switch (s.xd_phase) {
+            .rec => self.xdFinishCapture(),
+            // `live` 的 `GraphLaunch` 已经在 `xdPhaseBegin` 里发过，没有收尾。
+            else => {},
+        }
+    }
+
+    /// 开 capture。失败返回 false，`xd_phase` 归 `.off`。
+    fn xdStartCapture(self: *CudaBackend) bool {
+        const cu = &(self.cu orelse return false);
+        if (!self.xdEnsureStream()) {
+            self.gs().xd_phase = .off;
+            return false;
+        }
+        self.graphSyncFromDefault();
+        const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeThreadLocal);
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("xg: begin capture", rc);
+            self.gs().xd_phase = .off;
+            return false;
+        }
+        self.gs().xd_rec_n = 0;
+        self.gs().xd_dropped = false;
+        return true;
+    }
+
+    /// 关 capture：实例化、launch 一次（capture 不执行 kernel）、转 `live`。
+    fn xdFinishCapture(self: *CudaBackend) void {
+        const cu = &(self.cu orelse return);
+        const s = self.gs();
+        var graph: ?*anyopaque = null;
+        const erc = cu.lib.StreamEndCapture(self.g_stream, &graph);
+        const dropped = s.xd_dropped;
+        if (erc != cudart.cudaSuccess or graph == null or dropped) {
+            if (graph) |gr| _ = cu.lib.GraphDestroy(gr);
+            if (!dropped) self.ewLaunchFail("xg: end capture", erc);
+            s.xd_phase = .off;
+            s.xd_rec_n = 0;
+            return;
+        }
+        var gexec_new: ?*anyopaque = null;
+        const irc = cu.lib.GraphInstantiate(&gexec_new, graph.?, 0);
+        if (irc != cudart.cudaSuccess or gexec_new == null) {
+            _ = cu.lib.GraphDestroy(graph.?);
+            self.ewLaunchFail("xg: instantiate", irc);
+            s.xd_phase = .off;
+            s.xd_rec_n = 0;
+            return;
+        }
+        // DO NOT destroy `graph` here.  Every `xd_node.gnode[]` points at a node
+        // of THIS graph, and `xd_apply` reads those nodes' params to decide which
+        // they own and to hand them new arguments.  Destroying the source graph
+        // right after instantiation leaves `gnode[]` dangling: `xd_apply` then
+        // matches zero nodes and returns `cudaErrorInvalidResourceHandle`.
+        // Measured 2026-11: the first replay produced garbled ids because the
+        // replay itself failed and the host path then ran the step a second time
+        // on state the graph had already advanced.
+        s.xd_graph = graph;
+        s.xd_gexec = gexec_new;
+        s.xd_phase = .live;
+        // capture 只记录不执行：这一 token 至今没有任何 kernel 跑过，必须
+        // launch 一次，否则 KV/GDN 状态都停在上一个 token。
+        const lrc = cu.lib.GraphLaunch(gexec_new, self.g_stream.?);
+        if (lrc != cudart.cudaSuccess) {
+            self.ewLaunchFail("xg: first launch", lrc);
+            s.xd_phase = .off;
+            _ = cu.lib.GraphExecDestroy(gexec_new.?);
+            s.xd_gexec = null;
+        }
+    }
+
+    /// 重放：先按序 `apply` 每个节点（刷新实参），再 launch，最后把默认流
+    /// 与图流排序。
+    ///
+    /// 收尾那一步不是可选的。`GraphLaunch` 是异步的、落在 `g_stream` 上，
+    /// 而 `launchStream()` 在图活着的时候返回默认流；图之后的所有工作
+    /// （lm_head matvec、读它结果的 argmax）因此会和图并发，除非显式排序。
+    /// 旧机制在这里踩过：`backend_cuda.zig` 的 `graphReplayInner` 注释记录了
+    /// "参数全冻结、每次跑出不同 token"，只加这一道 barrier 就逐位一致。
+    fn xdReplay(self: *CudaBackend) bool {
+        const cu = &(self.cu orelse return false);
+        const s = self.gs();
+        const gexec_live = s.xd_gexec orelse return false;
+        for (s.xd_rec[0..s.xd_rec_n]) |*node| {
+            const rc = xd.apply(node, gexec_live);
+            if (rc != 0) {
+                self.ewLaunchFail("xg: apply", rc);
+                return false;
+            }
+        }
+        const st = self.g_stream orelse return false;
+        s.xd_launched = true;
+        const lrc = cu.lib.GraphLaunch(gexec_live, st);
+        if (lrc != cudart.cudaSuccess) {
+            self.ewLaunchFail("xg: replay launch", lrc);
+            return false;
+        }
+        // 事件等待两侧都发：事件排在默认流上；`StreamWaitEvent(null, ...)`
+        // 不被支持时由 `EventSynchronize` 兜底。
+        if (self.g_ev_out) |ev| {
+            if (cu.lib.EventRecord(ev, st) == cudart.cudaSuccess) {
+                _ = cu.lib.StreamWaitEvent(null, ev, 0);
+                _ = cu.lib.EventSynchronize(ev);
+            }
+        }
+        _ = cu.lib.StreamSynchronize(st);
+        return true;
+    }
+
+    /// 图用的私有流。与旧机制共用 `g_stream`（它们不会同时活着：XG 的
+    /// `xd_phase` 非 `.off` 时旧的 `state` 恒为 `.off`）。
+    fn xdEnsureStream(self: *CudaBackend) bool {
+        const cu = &(self.cu orelse return false);
+        if (self.g_stream == null) {
+            var st: ?*anyopaque = null;
+            const rc = cu.lib.StreamCreateWithFlags(&st, cudart.StreamNonBlocking);
+            if (rc != cudart.cudaSuccess or st == null) {
+                self.ewLaunchFail("xg: stream create", rc);
+                return false;
+            }
+            self.g_stream = st;
+        }
+        if (self.g_ev_out == null) {
+            var ev: ?*anyopaque = null;
+            const erc = cu.lib.EventCreate(&ev, cudart.EventDisableTiming);
+            if (erc != cudart.cudaSuccess or ev == null) {
+                self.ewLaunchFail("xg: ordering event create", erc);
+                return false;
+            }
+            self.g_ev_out = ev;
+        }
+        return true;
     }
 
     /// The mirror image, for the END of the step: whatever the graph produced
@@ -7856,12 +8078,20 @@ const attn_score_arity: usize = 11;
         // fallback, so the step still runs (capture-unsafe, i.e. it simply will
         // not be recorded).
         _ = self.publishCtl(ctl, null, true);
-        return .{ .kind = kind, .ctl = ctl };
+        const g = backend.Graph{ .kind = kind, .ctl = ctl };
+
+        // XG 只服务 decode：prefill 的块长度是数据相关的，按形状建图会得到
+        // 最多 nbatch-1 张图（实测见 AGENTS.md 的 prefill 账本），而 prefill
+        // 的发射开销在 238 ms 的块里上界只有 6.3%。见 `xdPhaseBegin`。
+        if (kind != .decode or !graphWanted()) return g;
+        return self.xdPhaseBegin(g);
     }
 
     fn dGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
-        _ = ctx;
-        _ = g;
+        const self = self_(ctx);
+        if (g.ptr == null) return;
+        self.xdPhaseEnd();
+        g.ptr = null;
     }
 
     fn dSetThreads(ctx: *anyopaque, io: std.Io, nt: usize) void {

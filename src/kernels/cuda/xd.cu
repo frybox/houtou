@@ -55,7 +55,7 @@ typedef void (*kfn_unary)(float *, int);
 typedef void (*kfn_scale_vec)(float *, float, int);
 typedef void (*kfn_deinterleave)(float *, float *, const float *, int);
 typedef void (*kfn_argmax)(const float *, int, int *);
-typedef void (*kfn_argmax_batch)(const float *, int, int, int *);
+typedef void (*kfn_argmax_batch)(const float *, int, int *);
 typedef void (*kfn_set_int1)(int *, int);
 
 #if !defined(Q35_XD_NO_KERNELS)
@@ -74,7 +74,7 @@ XD_DECL(k_scale_vec(float *, float, int));
 XD_DECL(k_zero_buf(float *, int));
 XD_DECL(k_deinterleave_qg(float *, float *, const float *, int));
 XD_DECL(k_argmax(const float *, int, int *));
-XD_DECL(k_argmax_batch(const float *, int, int, int *));
+XD_DECL(k_argmax_batch(const float *, int, int *));
 XD_DECL(k_set_int1(int *, int));
 #undef XD_DECL
 #endif // Q35_XD_NO_KERNELS
@@ -124,9 +124,11 @@ const xd_entry kOps[] = {
           return xd_shape{cdiv((unsigned)aI(a, 1), 16u), 1, 1, kRopeThreads, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_rope64_dpos>(&k_rope64_dpos);
-          f((float *)aP(a, 0), aI(a, 1), aI(a, 2), aP(a, 3));
-          (void)s;
+          // rope.cu: k_rope64_dpos<<<blocks, kHalf*kHeadsPerBlock>>>; blocks =
+          // ceil(heads / kHeadsPerBlock).  `pos`/`base` come from slot 3's
+          // control block, not from the argument list.
+          k_rope64_dpos<<<cdiv((unsigned)aI(a, 1), 8u), kRopeThreads, 0, s>>>(
+              (float *)aP(a, 0), aI(a, 1), aI(a, 2), aP(a, 3));
       },
       XD_ONE(k_rope64_dpos) },
 
@@ -138,10 +140,10 @@ const xd_entry kOps[] = {
           return xd_shape{cdiv((unsigned)aI(a, 3) * (unsigned)aI(a, 4), 128u), 1, 1, 128, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_kv_quant_dslot>(&q35_k_kv_quant_dslot);
-          f((const float *)aP(a, 0), (unsigned char *)aP(a, 1), (const int *)aP(a, 2),
-            aI(a, 3), aI(a, 4), aI(a, 5));
-          (void)s;
+          // convert.cu: blocks = ceil(nblocks_per_row * rows_this / 128).
+          q35_k_kv_quant_dslot<<<cdiv((unsigned)(aI(a, 3) * aI(a, 4)), 128u), 128, 0, s>>>(
+              (const float *)aP(a, 0), (unsigned char *)aP(a, 1), (const int *)aP(a, 2),
+              aI(a, 3), aI(a, 4), aI(a, 5));
       },
       XD_ONE(q35_k_kv_quant_dslot) },
 
@@ -151,13 +153,13 @@ const xd_entry kOps[] = {
           return xd_shape{(unsigned)aI(a, 0), 1, 1, (unsigned)aI(a, 2), 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_gdn_step_rows>(&q35_gdn_step_rows_kernel);
-          f((float *)aP(a, 0), aI(a, 1), (const float *)aP(a, 2), aI(a, 3),
-            (const float *)aP(a, 4), aI(a, 5), (const float *)aP(a, 6), aI(a, 7),
-            (float *)aP(a, 8), (float *)aP(a, 9), (float *)aP(a, 10),
-            (const float *)aP(a, 11), (const float *)aP(a, 12),
-            aI(a, 13), aI(a, 14), aI(a, 15));
-          (void)s;
+          // gdn.cu: one block per value head, Q35_GDN_THREADS threads.
+          q35_gdn_step_rows_kernel<<<(unsigned)aI(a, 13), kGdnThreads, 0, s>>>(
+              (float *)aP(a, 0), aI(a, 1), (const float *)aP(a, 2), aI(a, 3),
+              (const float *)aP(a, 4), aI(a, 5), (const float *)aP(a, 6), aI(a, 7),
+              (float *)aP(a, 8), (float *)aP(a, 9), (float *)aP(a, 10),
+              (const float *)aP(a, 11), (const float *)aP(a, 12),
+              aI(a, 14), aI(a, 15), aI(a, 16));
       },
       XD_ONE(q35_gdn_step_rows_kernel) },
     { "gdn_gamma",
@@ -165,10 +167,10 @@ const xd_entry kOps[] = {
           return xd_shape{cdiv((unsigned)aI(a, 5), kEltThreads), 1, 1, kEltThreads, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_gdn_gamma>(&q35_gdn_gamma_kernel);
-          f((const float *)aP(a, 0), (float *)aP(a, 1), (const float *)aP(a, 2),
-            (const float *)aP(a, 3), (float *)aP(a, 4), aI(a, 5));
-          (void)s;
+          // gdn.cu: 32 threads/block, blocks = ceil(nv / 32).
+          q35_gdn_gamma_kernel<<<cdiv((unsigned)aI(a, 5), 32u), 32, 0, s>>>(
+              (const float *)aP(a, 0), (float *)aP(a, 1), (const float *)aP(a, 2),
+              (const float *)aP(a, 3), (float *)aP(a, 4), aI(a, 5));
       },
       XD_ONE(q35_gdn_gamma_kernel) },
 
@@ -178,10 +180,11 @@ const xd_entry kOps[] = {
           return xd_shape{(unsigned)aI(a, 0), 1, 1, kEltThreads, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_rmsnorm>(&k_rmsnorm);
-          f((float *)aP(a, 0), (const float *)aP(a, 1), (const float *)aP(a, 2),
-            aI(a, 3), aF(a, 4));
-          (void)s;
+          // norm.cu: k_rmsnorm<<<rows, kThreads, 0, stream>>>(...).  Slot 0 is
+          // `rows` (grid); slots 1..4 are the kernel's own arguments.
+          k_rmsnorm<<<(unsigned)aI(a, 0), kEltThreads, 0, s>>>(
+              (float *)aP(a, 1), (const float *)aP(a, 2), (const float *)aP(a, 3),
+              aI(a, 4), aF(a, 5));
       },
       XD_ONE(k_rmsnorm) },
 
@@ -189,49 +192,43 @@ const xd_entry kOps[] = {
     { "swiglu",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 2), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_binary>(&k_swiglu);
-          f((float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
-          (void)s;
+          k_swiglu<<<cdiv((unsigned)aI(a, 2), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
       },
       XD_ONE(k_swiglu) },
     { "silu",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 1), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_unary>(&k_silu);
-          f((float *)aP(a, 0), aI(a, 1));
-          (void)s;
+          k_silu<<<cdiv((unsigned)aI(a, 1), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), aI(a, 1));
       },
       XD_ONE(k_silu) },
     { "add_resid",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 2), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_binary>(&k_add_resid);
-          f((float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
-          (void)s;
+          k_add_resid<<<cdiv((unsigned)aI(a, 2), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
       },
       XD_ONE(k_add_resid) },
     { "copy_range",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 2), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_binary>(&k_copy_range);
-          f((float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
-          (void)s;
+          k_copy_range<<<cdiv((unsigned)aI(a, 2), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), (const float *)aP(a, 1), aI(a, 2));
       },
       XD_ONE(k_copy_range) },
     { "scale_vec",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 2), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_scale_vec>(&k_scale_vec);
-          f((float *)aP(a, 0), aF(a, 1), aI(a, 2));
-          (void)s;
+          k_scale_vec<<<cdiv((unsigned)aI(a, 2), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), aF(a, 1), aI(a, 2));
       },
       XD_ONE(k_scale_vec) },
     { "zero_buf",
       [](const xd_slot *a) -> xd_shape { return xd_shape{cdiv((unsigned)aI(a, 1), kEltThreads), 1, 1, kEltThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_unary>(&k_zero_buf);
-          f((float *)aP(a, 0), aI(a, 1));
-          (void)s;
+          k_zero_buf<<<cdiv((unsigned)aI(a, 1), kEltThreads), kEltThreads, 0, s>>>(
+              (float *)aP(a, 0), aI(a, 1));
       },
       XD_ONE(k_zero_buf) },
     { "deinterleave_qg",
@@ -240,9 +237,10 @@ const xd_entry kOps[] = {
           return xd_shape{(unsigned)aI(a, 0), 1, 1, hd < kEltThreads ? hd : kEltThreads, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_deinterleave>(&k_deinterleave_qg);
-          f((float *)aP(a, 0), (float *)aP(a, 1), (const float *)aP(a, 2), aI(a, 3));
-          (void)s;
+          // elementwise.cu: one block per head, min(hd, 256) threads.
+          const unsigned hd = (unsigned)aI(a, 3);
+          k_deinterleave_qg<<<(unsigned)aI(a, 0), hd < kEltThreads ? hd : kEltThreads, 0, s>>>(
+              (float *)aP(a, 1), (float *)aP(a, 2), (const float *)aP(a, 4), aI(a, 3));
       },
       XD_ONE(k_deinterleave_qg) },
 
@@ -256,17 +254,17 @@ const xd_entry kOps[] = {
           return xd_shape{cdiv((unsigned)aI(a, 1), kArgmaxThreads * 4), 1, 1, kArgmaxThreads, 1, 1, 0};
       },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_argmax>(&k_argmax);
-          f((const float *)aP(a, 0), aI(a, 1), (int *)aP(a, 2));
-          (void)s;
+          k_argmax<<<1, kArgmaxThreads, 0, s>>>(
+              (const float *)aP(a, 0), aI(a, 1), (int *)aP(a, 2));
       },
       { (void *)&k_argmax, (void *)&k_argmax_batch } },
     { "argmax_batch",
       [](const xd_slot *a) -> xd_shape { return xd_shape{(unsigned)aI(a, 2), 1, 1, kArgmaxThreads, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_argmax_batch>(&k_argmax_batch);
-          f((const float *)aP(a, 0), aI(a, 1), aI(a, 2), (int *)aP(a, 3));
-          (void)s;
+          // elementwise.cu: dim3(1, rows), 256 threads.  Slot 2 is `rows`
+          // (grid only); the kernel itself takes `(x, n, out)`.
+          k_argmax_batch<<<dim3(1, (unsigned)aI(a, 2)), kArgmaxThreads, 0, s>>>(
+              (const float *)aP(a, 0), aI(a, 1), (int *)aP(a, 3));
       },
       XD_ONE(k_argmax_batch) },
 
@@ -274,9 +272,7 @@ const xd_entry kOps[] = {
     { "set_int1",
       [](const xd_slot *) -> xd_shape { return xd_shape{1, 1, 1, 1, 1, 1, 0}; },
       [](const xd_slot *a, cudaStream_t s) {
-          auto f = reinterpret_cast<kfn_set_int1>(&k_set_int1);
-          f((int *)aP(a, 0), aI(a, 1));
-          (void)s;
+          k_set_int1<<<1, 1, 0, s>>>((int *)aP(a, 0), aI(a, 1));
       },
       XD_ONE(k_set_int1) },
 };
@@ -384,7 +380,9 @@ int xd_rec_gdn_step_rows(void *stream, xd_node *out,
                          float *d_km, float *d_delta, float *d_out,
                          const float *d_gamma, const float *d_beta,
                          int heads, int nk, int kd, int vd) {
-    Slots s(16);
+    // 17 slots: the kernel takes `nk, kd, vd` after the thirteen
+    // pointer/stride arguments, and `heads` only sizes the grid (slot 13).
+    Slots s(17);
     s.ptr(0, d_state);        s.i32v(1, state_stride);
     s.ptr(2, const_cast<void *>((const void *)d_k));  s.i32v(3, k_stride);
     s.ptr(4, const_cast<void *>((const void *)d_v));  s.i32v(5, v_stride);
@@ -392,8 +390,7 @@ int xd_rec_gdn_step_rows(void *stream, xd_node *out,
     s.ptr(8, d_km); s.ptr(9, d_delta); s.ptr(10, d_out);
     s.ptr(11, const_cast<void *>((const void *)d_gamma));
     s.ptr(12, const_cast<void *>((const void *)d_beta));
-    s.i32v(13, heads); s.i32v(14, nk); s.i32v(15, vd);
-    (void)kd;
+    s.i32v(13, heads); s.i32v(14, nk); s.i32v(15, kd); s.i32v(16, vd);
     return xd_capture((int)XD_OP_gdn_step_rows, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
 }
 
@@ -412,14 +409,14 @@ int xd_rec_gdn_gamma(void *stream, xd_node *out,
 int xd_rec_rmsnorm(void *stream, xd_node *out,
                    float *d_out, const float *d_x, const float *d_w,
                    int rows, int n, float eps) {
-    // Slot 0 is `rows` (grid only, NOT a kernel argument); slots 1..4 are the
-    // kernel's own `(x, w, n, eps)` -- see the "rmsnorm" row.
-    Slots s(5);
+    // Slot 0 is `rows` (grid only, NOT a kernel argument); 1..5 are the
+    // kernel's own `(out, x, w, n, eps)` -- see the "rmsnorm" row.
+    Slots s(6);
     s.i32v(0, rows);
-    s.ptr(1, const_cast<void *>((const void *)d_x));
-    s.ptr(2, const_cast<void *>((const void *)d_w));
-    s.i32v(3, n); s.f32v(4, eps);
-    (void)d_out;
+    s.ptr(1, d_out);
+    s.ptr(2, const_cast<void *>((const void *)d_x));
+    s.ptr(3, const_cast<void *>((const void *)d_w));
+    s.i32v(4, n); s.f32v(5, eps);
     return xd_capture((int)XD_OP_rmsnorm, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
 }
 

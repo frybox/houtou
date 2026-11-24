@@ -111,18 +111,18 @@ test "xd.Node matches xd.h's xd_node" {
     // 数组在 12 处补齐到 16。任何一边改了字段顺序，这里或那边的编译期断言就会
     // 失败——而不是等到真机上重放到「某个实参读到别的字节」。
     const N = xd.Node;
-    try std.testing.expectEqual(@as(usize, 1072), @sizeOf(N));
+    try std.testing.expectEqual(@as(usize, 1312), @sizeOf(N));
     try std.testing.expectEqual(@as(usize, 8), @alignOf(N));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(N, "op"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(N, "n"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(N, "nnodes"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(N, "gnode"));
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(N, "slots"));
-    try std.testing.expectEqual(@as(usize, 432), @offsetOf(N, "vals"));
-    try std.testing.expectEqual(@as(usize, 816), @offsetOf(N, "argv"));
-    try std.testing.expectEqual(@as(usize, 944), @offsetOf(N, "gate_argv"));
-    try std.testing.expectEqual(@as(usize, 976), @offsetOf(N, "derived"));
-    try std.testing.expectEqual(@as(usize, 1040), @offsetOf(N, "kern"));
+    try std.testing.expectEqual(@as(usize, 528), @offsetOf(N, "vals"));
+    try std.testing.expectEqual(@as(usize, 1008), @offsetOf(N, "argv"));
+    try std.testing.expectEqual(@as(usize, 1168), @offsetOf(N, "gate_argv"));
+    try std.testing.expectEqual(@as(usize, 1200), @offsetOf(N, "derived"));
+    try std.testing.expectEqual(@as(usize, 1280), @offsetOf(N, "kern"));
 }
 
 test "xd.Op ids and the table length agree" {

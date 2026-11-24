@@ -52,7 +52,7 @@ pub const Shape = extern struct {
 };
 
 /// 与 `xd.h` 的 `XD_MAX_SLOTS` / `XD_MAX_NODES` 一致。
-pub const max_slots = 16;
+pub const max_slots = 20;
 pub const max_nodes = 4;
 
 /// 一个已录制的 op，与 `xd.h` 的 `struct xd_node` 二进制一致。

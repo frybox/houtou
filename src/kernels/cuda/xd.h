@@ -51,9 +51,11 @@ struct xd_shape {
     unsigned smem;
 };
 
-// Widest recipe this table has: attn_decode_dyn's 13 + its gate launch's 3, and
-// gdn_step_rows' 16.  A node stores one array of this size.
-#define XD_MAX_SLOTS 16
+// Widest recipe this table has.  `gdn_step_rows` needs 17 (13 pointer/stride
+// arguments plus `heads` for the grid and `nk`/`kd`/`vd` for the kernel); the
+// S1 comment said 16 because that roster never carried `kd`.  20 leaves room for
+// the ops S3 adds without another ABI change.
+#define XD_MAX_SLOTS 20
 #define XD_MAX_NODES 4
 
 // One argument entry.  `src` may be NULL for a literal (then `v` is the value
@@ -131,13 +133,13 @@ static_assert(sizeof(struct xd_slot) == 24, "xd_slot layout changed; update src/
 static_assert(offsetof(struct xd_slot, kind) == 0, "xd_slot.kind moved");
 static_assert(offsetof(struct xd_slot, src) == 8, "xd_slot.src moved");
 static_assert(offsetof(struct xd_slot, v) == 16, "xd_slot.v moved");
-static_assert(sizeof(struct xd_node) == 1072, "xd_node layout changed; update src/xd.zig");
+static_assert(sizeof(struct xd_node) == 1312, "xd_node layout changed; update src/xd.zig");
 static_assert(offsetof(struct xd_node, gnode) == 16, "xd_node.gnode moved");
 static_assert(offsetof(struct xd_node, slots) == 48, "xd_node.slots moved");
-static_assert(offsetof(struct xd_node, vals) == 432, "xd_node.vals moved");
-static_assert(offsetof(struct xd_node, argv) == 816, "xd_node.argv moved");
-static_assert(offsetof(struct xd_node, gate_argv) == 944, "xd_node.gate_argv moved");
-static_assert(offsetof(struct xd_node, derived) == 976, "xd_node.derived moved");
+static_assert(offsetof(struct xd_node, vals) == 528, "xd_node.vals moved");
+static_assert(offsetof(struct xd_node, argv) == 1008, "xd_node.argv moved");
+static_assert(offsetof(struct xd_node, gate_argv) == 1168, "xd_node.gate_argv moved");
+static_assert(offsetof(struct xd_node, derived) == 1200, "xd_node.derived moved");
 
 // ---------------------------------------------------------------------------
 // The per-step control block (`cell` in plan §1.5).
