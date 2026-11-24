@@ -115,9 +115,16 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 ## 3. 构建
 
 - Zig：`0.17.0`，路径 `/home/wisedu/software/zig-x86_64-linux-0.17.0/zig`（`make` 已自动 fallback）。
-- **构建缓存必须走本地盘**：项目位于 NFS，直接 `zig build` 会偶发
-  `failed to write cache manifest: Unexpected`。用 `--cache-dir /tmp/qwen35-cache`
-  （Makefile 里的 `$(ZIGCACHE)` 已包含），不要省略。
+- **构建缓存必须放在 `/mnt/tmp/qwen35-cache`，不要用 `/tmp`**（Makefile 里的
+  `$(ZIGCACHE)` 已指向它并自动 `mkdir -p`），也不要省略 `--cache-dir`：
+  - 不能省：项目位于 NFS（`/mnt/LLMs`），直接在仓库里 `zig build` 会偶发
+    `failed to write cache manifest: Unexpected`。
+  - 不能用 `/tmp`：根文件系统只有 194 GB，长期处在 97% 满的状态；一次完整的
+    `make cuda` 会在缓存里写出约 7 GB 对象，放在 `/tmp` 会把系统盘耗尽，表现为
+    链接阶段 `LLVM ERROR: IO failure on output stream: No space left on device`
+    或 `zig terminated with signal BUS`（2026-11 实测两次）。
+  - `/mnt/tmp` 在 7 TB 的数据盘上，与 `/mnt/LLMs` 同一挂载点，余量充足。
+  - 手动跑 `zig build` / `zig build test` 时同样要带 `--cache-dir /mnt/tmp/qwen35-cache`。
 - 常用命令：
   - `make cpu` / `make`（CPU + CUDA）
   - `make cpufast`（`-Doptimize=ReleaseFast`，性能测试用这个，Debug 数值路径慢且不可比）

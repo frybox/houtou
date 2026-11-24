@@ -12,10 +12,16 @@
 # was deleted.  `--backend cuda` on the single CLI is the only CUDA path.  See
 # git history for the deleted files.
 ZIG := $(shell command -v zig || echo /home/wisedu/software/zig-x86_64-linux-0.17.0/zig)
-# Build cache on LOCAL disk: the project .zig-cache lives on NFS (/mnt/LLMs)
-# and zig intermittently fails with "failed to write cache manifest: Unexpected"
-# there. /tmp is local and fast.
-ZIGCACHE := --cache-dir /tmp/qwen35-cache
+# Build cache location.  NOT the project directory: the repo sits on NFS
+# (/mnt/LLMs) and zig intermittently fails with "failed to write cache
+# manifest: Unexpected" there.  NOT /tmp either: the root filesystem is a
+# 194 GB volume that has been at 97% full, and one full `make cuda` writes
+# ~7 GB of objects -- running it there exhausts the disk mid-link
+# ("LLVM ERROR: IO failure on output stream: No space left on device").
+# /mnt/tmp is on the 7 TB data volume with room to spare; `mkdir -p` so a
+# fresh checkout works without a manual step.
+ZIGCACHE := --cache-dir /mnt/tmp/qwen35-cache
+$(shell mkdir -p /mnt/tmp/qwen35-cache)
 
 # Long-prompt targets (`*-long`: the ~700-token tea essay prompt, 600+ chars out).
 #
