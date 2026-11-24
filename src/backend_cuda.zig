@@ -48,6 +48,7 @@
 const std = @import("std");
 const backend = @import("backend.zig");
 const graph_registry = @import("graph_registry.zig");
+const xd = @import("xd.zig");
 const cpu_mod = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
 const cudart = @import("cudart.zig");
@@ -296,9 +297,10 @@ fn stubNoCudaKernels() c_int {
 
 /// The one place that decides what a `Launch.*` call does inside a graph span.
 ///
-/// S3c step 1: always false.  `g` is threaded through every launch so step 2 can
-/// make this decision in ONE place instead of in 26 op bodies, but nothing is
-/// recorded or suppressed yet -- behaviour is exactly the pre-S3c one.
+/// S3c: this is the A/B switch only.  The per-op decision (record now / skip
+/// because the graph already replays it) lives in `xdGate`, next to the table
+/// that needs the context; keeping the two apart is what lets this function
+/// stay outside the `cuda_linked` branch and free of backend types.
 fn graphGate(g: backend.Graph) bool {
     _ = g;
     return false;
@@ -308,6 +310,52 @@ fn graphGate(g: backend.Graph) bool {
 /// each field collapses to either the extern or the stub -- no indirection at
 /// run time.
 const Launch = if (cuda_linked) struct {
+    // ---- XG 转发助手（S3c）------------------------------------------------
+    //
+    // `xdCtx` 把 `Graph.ptr`（`dGraphBegin` 放进去的 `*GraphSlot`）取出来。
+    // 直通图（`.direct`，`ptr == null`）返回 null，转发器照旧直接发射。
+    /// 收 `Graph.ptr` 而不是 `backend.Graph`：这三个是内部助手，不是 op。
+    /// seam 的结构测试把「`fn <name>(g: backend.Graph, ...)`」一律当成 op 并要求
+    /// 它在 CPU 分支有同名 stub；助手没有 stub，签名上区分开即可，不需要在
+    /// 测试里维护一份例外名单。
+    fn xdCtx(ptr: ?*anyopaque) ?*GraphSlot {
+        const p = ptr orelse return null;
+        return @ptrCast(@alignCast(p));
+    }
+
+    /// 录制 / 重放期的决策，返回 true 表示"不要按原样发射"：
+    ///   * `.live`：这台 op 已在这张图里，重放会执行它 —— 抑制主机侧发射；
+    ///   * `.rec`：这一步会由 `xd_rec_*` 发射（因此也不能再调 launcher）。
+    /// 其余（`.off` / `.warm`）返回 false，走原来的直接发射。
+    fn xdGate(ptr: ?*anyopaque) bool {
+        const s = xdCtx(ptr) orelse return false;
+        return switch (s.xd_phase) {
+            .rec, .live => true,
+            else => false,
+        };
+    }
+
+    /// 录制一个 op：占用下一个录制槽位，调用 `f(slot, stream)`（形式是
+    /// `xd.xd_rec_<op>(stream, slot, <该 op 自己的参数...>)`），失败置
+    /// `xd_dropped`。
+    ///
+    /// 用法（转发器里一行）：
+    ///   `if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recRmsnorm, .{ d_out, d_x, d_w, rows, n, eps });`
+    ///
+    /// 槽位溢出同样置 `xd_dropped`：这一步的图会被放弃，不会少记一个 op。
+    fn xdRecord(ptr: ?*anyopaque, stream: ?*anyopaque, comptime f: anytype, args: anytype) c_int {
+        const s = xdCtx(ptr) orelse return 0;
+        if (s.xd_rec_n >= xd_max_ops) {
+            s.xd_dropped = true;
+            return 0;
+        }
+        const slot = &s.xd_rec[s.xd_rec_n];
+        s.xd_rec_n += 1;
+        const rc = @call(.auto, f, .{ stream, slot } ++ args);
+        if (rc != 0) s.xd_dropped = true;
+        return rc;
+    }
+
     const quantize_q8_0 = Kernels.q35_launch_quantize_q8_0;
     const quantize_q8_k = Kernels.q35_launch_quantize_q8_K;
     const quantize_q8_k_mmq = Kernels.q35_launch_quantize_q8_K_mmq;
@@ -337,8 +385,7 @@ const Launch = if (cuda_linked) struct {
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
     fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recScaleVec, .{ d_x, s, n }) else return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
     }
     fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -349,12 +396,10 @@ const Launch = if (cuda_linked) struct {
     /// parameters are the kernel's own, so `Launch.x(a, b, c)` at a call site
     /// reads exactly like the launcher it wraps.
     fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_add_resid(dst, src, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recAddResid, .{ dst, src, n }) else return Kernels.q35_launch_add_resid(dst, src, n, stream);
     }
     fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recCopyRange, .{ d_dst, d_src, n }) else return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
     fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -371,28 +416,24 @@ const Launch = if (cuda_linked) struct {
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recDeinterleaveQg, .{ d_q, d_gate, d_src, heads, hd }) else return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
     }
     fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_deinterleave_qg_strided(d_q, d_gate, d_src, heads, hd, tokens, stream);
     }
     fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_zero_buf(d_buf, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recZeroBuf, .{ d_buf, n }) else return Kernels.q35_launch_zero_buf(d_buf, n, stream);
     }
     fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recRmsnorm, .{ d_out, d_x, d_w, rows, n, eps }) else return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
     }
     fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_l2norm(d_x, rows, n, eps, stream);
     }
     fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_silu(d_x, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recSilu, .{ d_x, n }) else return Kernels.q35_launch_silu(d_x, n, stream);
     }
     fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -403,8 +444,7 @@ const Launch = if (cuda_linked) struct {
         return Kernels.q35_launch_mul_sigmoid(d_out, d_gate, n, stream);
     }
     fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recSwiglu, .{ d_gate, d_up, n }) else return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
     }
     fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -415,12 +455,10 @@ const Launch = if (cuda_linked) struct {
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
     fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recArgmax, .{ d_x, n, d_out }) else return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
     }
     fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
-        return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
+        if (xdGate(g.ptr)) return xdRecord(g.ptr, stream, xd.recArgmaxBatch, .{ d_x, n, rows, d_out }) else return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
     }
     fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -1189,6 +1227,10 @@ const GraphState = enum { off, warm, rec, live };
 /// and costs `24 * 16` bytes per tracked node, i.e. nothing.
 const kernel_max_args: usize = 24;
 
+/// 一张 XG decode 图最多记录多少个 op。实测 27B 一个 decode token 的发射
+/// 次数约 3000（`QWEN35_PROF` 各 slot 的 calls 之和），4096 留出余量。
+const xd_max_ops: usize = 4096;
+
 /// One argument slot of a tracked kernel: `width` bytes of value storage, so a
 /// f32 (4) and a 64-bit pointer (8) both fit without a variant type.  Alignment
 /// is 8 because the widest thing stored is a pointer.
@@ -1254,7 +1296,26 @@ const GraphSlot = struct {
     capturing_step: bool = false,
     op_seen: GhOpFlags = .{},
     failed: bool = false,
+
+    // ---- 显式计算图（XG，S3c）--------------------------------------------
+    //
+    // 与上面那批旧机制字段并存，直到 S3d 把它们删掉。`xd_phase` 非 `.off`
+    // 时转发器走 xd 的路（`xdGate`），旧字段一律不看。
+    //
+    // 容量见 `xd_max_ops`；超出不是崩溃：`xd_rec_n` 停止增长、`xd_dropped`
+    // 置位，本步放弃图并退回直接发射（`dGraphEnd`），不会静默少记一个 op。
+    xd_phase: XdPhase = .off,
+    xd_rec: [xd_max_ops]xd.Node = undefined,
+    xd_rec_n: usize = 0,
+    xd_dropped: bool = false,
+    xd_graph: ?*anyopaque = null,
+    xd_gexec: ?*anyopaque = null,
 };
+
+/// XG 一张图的状态。`warm` 是"下一步录制"（`absent → warm → live`），
+/// 与 `graph_registry.zig` 的状态机同义，但因为 `graph_registry` 的 key
+/// 是 `(signature, kind, rows)` 而 decode 只有一种，这里先用单槽状态。
+const XdPhase = enum { off, warm, rec, live };
 
 pub const CudaBackend = struct {
     /// Ring size for the per-call timing events; see `ev_pool`.

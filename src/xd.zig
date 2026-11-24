@@ -125,7 +125,7 @@ const C = if (cuda_linked) struct {
     extern fn xd_rec_scale_vec(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, s: f32, n: c_int) c_int;
     extern fn xd_rec_zero_buf(stream: ?*anyopaque, out: *Node, d_buf: ?[*]f32, n: c_int) c_int;
     extern fn xd_rec_deinterleave_qg(stream: ?*anyopaque, out: *Node, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int) c_int;
-    extern fn xd_rec_argmax(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int) c_int;
+    extern fn xd_rec_argmax(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int) c_int;
     extern fn xd_rec_argmax_batch(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int) c_int;
     extern fn xd_rec_set_int1(stream: ?*anyopaque, out: *Node, d: ?[*]c_int, v: c_int) c_int;
 
@@ -215,4 +215,71 @@ pub fn setU32(s: *Slot, src: ?*const c_uint, v: c_uint) void {
 
 pub fn setPtr(s: *Slot, p: ?*anyopaque) void {
     s.* = .{ .kind = @intFromEnum(Kind.ptr), .src = .{ .p = p }, .v = .{ .u = 0 } };
+}
+
+// ==== 逐 op 录制入口（S3c）==================================================
+//
+// 参数顺序是 **kernel 自己的**，与槽位编号无关：槽位表写在 `xd.cu`，紧挨
+// 消费它的表行。CPU 构建（`cuda_linked == false`）下这些是 no-op：没有任何
+// 代码会在没有 CUDA kernel 时进入录制期。
+
+pub fn recRope64Dpos(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque) c_int {
+    if (comptime cuda_linked) return C.xd_rec_rope64_dpos(stream, out, d_x, heads, hd, d_ctl);
+    return 0;
+}
+pub fn recKvQuantDslot(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, d_out: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_kv_quant_dslot(stream, out, d_x, d_out, d_slot, nblocks_per_row, rows_this, row_bytes);
+    return 0;
+}
+pub fn recGdnStepRows(stream: ?*anyopaque, out: *Node, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_gdn_step_rows(stream, out, d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd);
+    return 0;
+}
+pub fn recGdnGamma(stream: ?*anyopaque, out: *Node, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_gdn_gamma(stream, out, d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv);
+    return 0;
+}
+pub fn recRmsnorm(stream: ?*anyopaque, out: *Node, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32) c_int {
+    if (comptime cuda_linked) return C.xd_rec_rmsnorm(stream, out, d_out, d_x, d_w, rows, n, eps);
+    return 0;
+}
+pub fn recSwiglu(stream: ?*anyopaque, out: *Node, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_swiglu(stream, out, d_gate, d_up, n);
+    return 0;
+}
+pub fn recSilu(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_silu(stream, out, d_x, n);
+    return 0;
+}
+pub fn recAddResid(stream: ?*anyopaque, out: *Node, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_add_resid(stream, out, d_dst, d_src, n);
+    return 0;
+}
+pub fn recCopyRange(stream: ?*anyopaque, out: *Node, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_copy_range(stream, out, d_dst, d_src, n);
+    return 0;
+}
+pub fn recScaleVec(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, s: f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_scale_vec(stream, out, d_x, s, n);
+    return 0;
+}
+pub fn recZeroBuf(stream: ?*anyopaque, out: *Node, d_buf: ?[*]f32, n: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_zero_buf(stream, out, d_buf, n);
+    return 0;
+}
+pub fn recDeinterleaveQg(stream: ?*anyopaque, out: *Node, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_deinterleave_qg(stream, out, d_q, d_gate, d_src, heads, hd);
+    return 0;
+}
+pub fn recArgmax(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_argmax(stream, out, d_x, n, d_out);
+    return 0;
+}
+pub fn recArgmaxBatch(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_argmax_batch(stream, out, d_x, n, rows, d_out);
+    return 0;
+}
+pub fn recSetInt1(stream: ?*anyopaque, out: *Node, d: ?[*]c_int, v: c_int) c_int {
+    if (comptime cuda_linked) return C.xd_rec_set_int1(stream, out, d, v);
+    return 0;
 }
