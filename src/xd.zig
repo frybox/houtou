@@ -108,8 +108,26 @@ const C = if (cuda_linked) struct {
     extern fn xd_op_exists(op: c_int) c_int;
     extern fn xd_op_name(op: c_int) [*:0]const u8;
     extern fn xd_launch_direct(op: c_int, a: [*]const Slot, stream: ?*anyopaque) c_int;
-    extern fn xd_capture(op: c_int, a: [*]const Slot, n: c_int, stream: ?*anyopaque, out: *Node) c_int;
+    extern fn xd_capture(op: c_int, a: [*]const Slot, n: c_int, stream: ?*anyopaque, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, smem: c_uint, out: *Node) c_int;
     extern fn xd_apply(node: *Node, gexec: ?*anyopaque) c_int;
+
+    // 逐 op 录制入口：参数表写在 `xd.cu`（与消费它的表行同一文件），Zig 侧
+    // 只按 kernel 自己的参数顺序调用，不需要知道槽位编号。
+    extern fn xd_rec_rope64_dpos(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque) c_int;
+    extern fn xd_rec_kv_quant_dslot(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, d_out: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int) c_int;
+    extern fn xd_rec_gdn_step_rows(stream: ?*anyopaque, out: *Node, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int) c_int;
+    extern fn xd_rec_gdn_gamma(stream: ?*anyopaque, out: *Node, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int) c_int;
+    extern fn xd_rec_rmsnorm(stream: ?*anyopaque, out: *Node, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32) c_int;
+    extern fn xd_rec_swiglu(stream: ?*anyopaque, out: *Node, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int) c_int;
+    extern fn xd_rec_silu(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, n: c_int) c_int;
+    extern fn xd_rec_add_resid(stream: ?*anyopaque, out: *Node, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int) c_int;
+    extern fn xd_rec_copy_range(stream: ?*anyopaque, out: *Node, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int) c_int;
+    extern fn xd_rec_scale_vec(stream: ?*anyopaque, out: *Node, d_x: ?[*]f32, s: f32, n: c_int) c_int;
+    extern fn xd_rec_zero_buf(stream: ?*anyopaque, out: *Node, d_buf: ?[*]f32, n: c_int) c_int;
+    extern fn xd_rec_deinterleave_qg(stream: ?*anyopaque, out: *Node, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int) c_int;
+    extern fn xd_rec_argmax(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int) c_int;
+    extern fn xd_rec_argmax_batch(stream: ?*anyopaque, out: *Node, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int) c_int;
+    extern fn xd_rec_set_int1(stream: ?*anyopaque, out: *Node, d: ?[*]c_int, v: c_int) c_int;
 
     fn count() usize {
         return @intCast(xd_op_count());
@@ -124,7 +142,8 @@ const C = if (cuda_linked) struct {
         return xd_launch_direct(@intFromEnum(op), slots.ptr, stream);
     }
     fn record(op: Op, slots: []const Slot, stream: ?*anyopaque, out: *Node) c_int {
-        return xd_capture(@intFromEnum(op), slots.ptr, @intCast(slots.len), stream, out);
+        // 几何传 0：`xd_capture` 用表自己的 `shape()`，见 xd.h 的说明。
+        return xd_capture(@intFromEnum(op), slots.ptr, @intCast(slots.len), stream, 0, 0, 0, 0, 0, 0, 0, out);
     }
     fn replay(node: *Node, gexec: ?*anyopaque) c_int {
         return xd_apply(node, gexec);

@@ -222,6 +222,58 @@ int xd_launch_span(int op, const xd_slot *a, void *stream,
                    unsigned gx, unsigned gy, unsigned gz,
                    unsigned bx, unsigned by, unsigned bz, unsigned smem);
 
+// ---- per-op record entry points (S3c) --------------------------------------
+//
+// WHY THESE EXIST.  A captured op must be launched from an `xd_slot` array:
+// that is what `xd_apply` refreshes at replay time.  The backend's forwarders
+// hold the kernel's OWN parameters (d_out, d_x, rows, ...), in the kernel's
+// order, not the table's slot order, and the two differ on purpose -- the table
+// also carries values that only size the grid and are not kernel arguments
+// (e.g. rmsnorm's `rows` is slot 0 and is NOT passed to `k_rmsnorm`).
+//
+// Writing the mapping in the backend would put a hand-copied slot table in 26
+// op bodies; here each mapping sits next to the table row that consumes it, and
+// the compiler checks it against the row's `launch` lambda.  One narrow function
+// per op, expanding to `xd_slot[]` + `xd_capture`.
+//
+// Each returns what `xd_capture` returns: 0 on success; anything else is a
+// cudaError_t AND the launch is already part of the capture, so the caller must
+// abandon it (it does: `graphAbandon`).
+//
+// `out` is the node the recorder stores; `stream` must be the capture stream.
+int xd_rec_rope64_dpos(void *stream, xd_node *out,
+                       float *d_x, int heads, int hd, const void *d_ctl);
+int xd_rec_kv_quant_dslot(void *stream, xd_node *out,
+                          const float *d_x, void *d_out, const int *d_slot,
+                          int nblocks_per_row, int rows_this, int row_bytes);
+int xd_rec_gdn_step_rows(void *stream, xd_node *out,
+                         float *d_state, int state_stride,
+                         const float *d_k, int k_stride,
+                         const float *d_v, int v_stride,
+                         const float *d_q, int q_stride,
+                         float *d_km, float *d_delta, float *d_out,
+                         const float *d_gamma, const float *d_beta,
+                         int heads, int nk, int kd, int vd);
+int xd_rec_gdn_gamma(void *stream, xd_node *out,
+                     const float *d_a_raw, float *d_b_raw,
+                     const float *d_ssm_a, const float *d_dt_bias,
+                     float *d_gamma, int nv);
+int xd_rec_rmsnorm(void *stream, xd_node *out,
+                   float *d_out, const float *d_x, const float *d_w,
+                   int rows, int n, float eps);
+int xd_rec_swiglu(void *stream, xd_node *out, float *d_gate, const float *d_up, int n);
+int xd_rec_silu(void *stream, xd_node *out, float *d_x, int n);
+int xd_rec_add_resid(void *stream, xd_node *out, float *d_dst, const float *d_src, int n);
+int xd_rec_copy_range(void *stream, xd_node *out, float *d_dst, const float *d_src, int n);
+int xd_rec_scale_vec(void *stream, xd_node *out, float *d_x, float s, int n);
+int xd_rec_zero_buf(void *stream, xd_node *out, float *d_buf, int n);
+int xd_rec_deinterleave_qg(void *stream, xd_node *out,
+                           float *d_q, float *d_gate, const float *d_src,
+                           int heads, int hd);
+int xd_rec_argmax(void *stream, xd_node *out, const float *d_x, int n, int *d_out);
+int xd_rec_argmax_batch(void *stream, xd_node *out, const float *d_x, int n, int rows, int *d_out);
+int xd_rec_set_int1(void *stream, xd_node *out, int *d, int v);
+
 #ifdef __cplusplus
 }
 #endif

@@ -328,6 +328,165 @@ int xd_launch_direct(int op, const xd_slot *a, void *stream) {
     return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Per-op record entry points (xd.h, S3c).
+//
+// Each fills the op's `xd_slot` array in the order that row's `launch` lambda
+// reads it, then hands it to `xd_capture`.  The geometry is the table's own
+// (`xd_capture` ignores the caller's copy), because every row in this roster
+// derives its grid from pure-function arguments -- the same formulas the eager
+// launchers use.
+//
+// The slot order is the row's contract; it is written ONCE here and consumed
+// once there, in the same file, so a mismatch is a compile error rather than a
+// silent wrong launch.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Zero the array then fill `n` slots; sets pointer slots from the pointers and
+// immediate slots as literals (src = null).  Immediates that are per-step and
+// should be refreshed at replay use the `i32Cell`/`f32Cell` variants instead.
+struct Slots {
+    xd_slot a[XD_MAX_SLOTS];
+    int n = 0;
+
+    explicit Slots(int count) : a{}, n(count) {}
+
+    void ptr(int i, void *p) { xd_set_ptr(&a[i], p); }
+    void i32v(int i, int v) { xd_set_i32(&a[i], nullptr, v); }
+    void f32v(int i, float v) { xd_set_f32(&a[i], nullptr, v); }
+};
+
+} // namespace
+
+int xd_rec_rope64_dpos(void *stream, xd_node *out,
+                       float *d_x, int heads, int hd, const void *d_ctl) {
+    Slots s(4);
+    s.ptr(0, d_x); s.i32v(1, heads); s.i32v(2, hd); s.ptr(3, const_cast<void *>(d_ctl));
+    return xd_capture((int)XD_OP_rope64_dpos, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_kv_quant_dslot(void *stream, xd_node *out,
+                          const float *d_x, void *d_out, const int *d_slot,
+                          int nblocks_per_row, int rows_this, int row_bytes) {
+    Slots s(6);
+    s.ptr(0, const_cast<void *>((const void *)d_x)); s.ptr(1, d_out);
+    s.ptr(2, const_cast<void *>((const void *)d_slot));
+    s.i32v(3, nblocks_per_row); s.i32v(4, rows_this); s.i32v(5, row_bytes);
+    return xd_capture((int)XD_OP_kv_quant_dslot, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_gdn_step_rows(void *stream, xd_node *out,
+                         float *d_state, int state_stride,
+                         const float *d_k, int k_stride,
+                         const float *d_v, int v_stride,
+                         const float *d_q, int q_stride,
+                         float *d_km, float *d_delta, float *d_out,
+                         const float *d_gamma, const float *d_beta,
+                         int heads, int nk, int kd, int vd) {
+    Slots s(16);
+    s.ptr(0, d_state);        s.i32v(1, state_stride);
+    s.ptr(2, const_cast<void *>((const void *)d_k));  s.i32v(3, k_stride);
+    s.ptr(4, const_cast<void *>((const void *)d_v));  s.i32v(5, v_stride);
+    s.ptr(6, const_cast<void *>((const void *)d_q));  s.i32v(7, q_stride);
+    s.ptr(8, d_km); s.ptr(9, d_delta); s.ptr(10, d_out);
+    s.ptr(11, const_cast<void *>((const void *)d_gamma));
+    s.ptr(12, const_cast<void *>((const void *)d_beta));
+    s.i32v(13, heads); s.i32v(14, nk); s.i32v(15, vd);
+    (void)kd;
+    return xd_capture((int)XD_OP_gdn_step_rows, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_gdn_gamma(void *stream, xd_node *out,
+                     const float *d_a_raw, float *d_b_raw,
+                     const float *d_ssm_a, const float *d_dt_bias,
+                     float *d_gamma, int nv) {
+    Slots s(6);
+    s.ptr(0, const_cast<void *>((const void *)d_a_raw)); s.ptr(1, d_b_raw);
+    s.ptr(2, const_cast<void *>((const void *)d_ssm_a));
+    s.ptr(3, const_cast<void *>((const void *)d_dt_bias));
+    s.ptr(4, d_gamma); s.i32v(5, nv);
+    return xd_capture((int)XD_OP_gdn_gamma, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_rmsnorm(void *stream, xd_node *out,
+                   float *d_out, const float *d_x, const float *d_w,
+                   int rows, int n, float eps) {
+    // Slot 0 is `rows` (grid only, NOT a kernel argument); slots 1..4 are the
+    // kernel's own `(x, w, n, eps)` -- see the "rmsnorm" row.
+    Slots s(5);
+    s.i32v(0, rows);
+    s.ptr(1, const_cast<void *>((const void *)d_x));
+    s.ptr(2, const_cast<void *>((const void *)d_w));
+    s.i32v(3, n); s.f32v(4, eps);
+    (void)d_out;
+    return xd_capture((int)XD_OP_rmsnorm, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_swiglu(void *stream, xd_node *out, float *d_gate, const float *d_up, int n) {
+    Slots s(3);
+    s.ptr(0, d_gate); s.ptr(1, const_cast<void *>((const void *)d_up)); s.i32v(2, n);
+    return xd_capture((int)XD_OP_swiglu, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_silu(void *stream, xd_node *out, float *d_x, int n) {
+    Slots s(2);
+    s.ptr(0, d_x); s.i32v(1, n);
+    return xd_capture((int)XD_OP_silu, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_add_resid(void *stream, xd_node *out, float *d_dst, const float *d_src, int n) {
+    Slots s(3);
+    s.ptr(0, d_dst); s.ptr(1, const_cast<void *>((const void *)d_src)); s.i32v(2, n);
+    return xd_capture((int)XD_OP_add_resid, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_copy_range(void *stream, xd_node *out, float *d_dst, const float *d_src, int n) {
+    Slots s(3);
+    s.ptr(0, d_dst); s.ptr(1, const_cast<void *>((const void *)d_src)); s.i32v(2, n);
+    return xd_capture((int)XD_OP_copy_range, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_scale_vec(void *stream, xd_node *out, float *d_x, float s_v, int n) {
+    Slots s(3);
+    s.ptr(0, d_x); s.f32v(1, s_v); s.i32v(2, n);
+    return xd_capture((int)XD_OP_scale_vec, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_zero_buf(void *stream, xd_node *out, float *d_buf, int n) {
+    Slots s(2);
+    s.ptr(0, d_buf); s.i32v(1, n);
+    return xd_capture((int)XD_OP_zero_buf, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_deinterleave_qg(void *stream, xd_node *out,
+                           float *d_q, float *d_gate, const float *d_src,
+                           int heads, int hd) {
+    // Slot contract: 0 = heads (grid), 1 = q, 2 = gate, 3 = hd, 4 = src.
+    Slots s(5);
+    s.i32v(0, heads); s.ptr(1, d_q); s.ptr(2, d_gate); s.i32v(3, hd);
+    s.ptr(4, const_cast<void *>((const void *)d_src));
+    return xd_capture((int)XD_OP_deinterleave_qg, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_argmax(void *stream, xd_node *out, const float *d_x, int n, int *d_out) {
+    Slots s(3);
+    s.ptr(0, const_cast<void *>((const void *)d_x)); s.i32v(1, n); s.ptr(2, d_out);
+    return xd_capture((int)XD_OP_argmax, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_argmax_batch(void *stream, xd_node *out, const float *d_x, int n, int rows, int *d_out) {
+    Slots s(4);
+    s.ptr(0, const_cast<void *>((const void *)d_x)); s.i32v(1, n); s.i32v(2, rows); s.ptr(3, d_out);
+    return xd_capture((int)XD_OP_argmax_batch, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
+int xd_rec_set_int1(void *stream, xd_node *out, int *d, int v) {
+    Slots s(2);
+    s.ptr(0, d); s.i32v(1, v);
+    return xd_capture((int)XD_OP_set_int1, s.a, s.n, stream, 0, 0, 0, 0, 0, 0, 0, out);
+}
+
 } // extern "C"
 
 // ---------------------------------------------------------------------------
@@ -486,6 +645,7 @@ int xd_apply(xd_node *node, void *gexec_v) {
     }
     return applied == 0 ? (int)cudaErrorInvalidResourceHandle : (int)cudaSuccess;
 }
-
 } // extern "C"
+
+
 #endif // Q35_XD_NO_KERNELS
