@@ -563,19 +563,44 @@ int q35_sample_ctl_ints(void) { return CTL_INTS; }
 
 // Allocate both regions once.  Idempotent: a NULL input means "not allocated
 // yet".  Returns a cudaError_t value.
-int q35_launch_sample_init(void **d_ctl, void **d_scratch) {
+//
+// `mapped_ctl` may be a DEVICE pointer into host memory (`cudaHostAlloc` with
+// `cudaHostAllocMapped` + `cudaHostGetDevicePointer`).  When it is non-NULL the
+// control block lives in host RAM and the host writes it directly: no H2D per
+// token, and the token id is published by the kernel straight into memory the
+// host then reads -- no D2H either.  That is what lets the sampler be a node of
+// the captured graph without the host needing to retarget it every token (see
+// Strata's `mapped()` staging, engine/src/core/mtp.cpp:131).
+//
+// Why this matters here specifically: a control block in DEVICE memory has to be
+// refreshed with `cudaMemcpyAsync` before each replay.  Inside a capture that
+// copy becomes a node (so it replays the recorded values forever), and after the
+// graph has launched it is too late.  Mapped memory removes the question.
+//
+// `d_scratch` stays in device memory: it is a per-launch working set the host
+// never touches, so mapping it would only add PCIe traffic.
+int q35_launch_sample_init(void **d_ctl, void **d_scratch, void *mapped_ctl) {
     if (d_ctl == nullptr || d_scratch == nullptr) return (int)cudaErrorInvalidValue;
     if (*d_ctl == nullptr) {
-        if (cudaMalloc(d_ctl, (size_t)CTL_INTS * sizeof(int)) != cudaSuccess) {
-            *d_ctl = nullptr;
-            return (int)cudaGetLastError();
+        if (mapped_ctl != nullptr) {
+            *d_ctl = mapped_ctl;
+        } else {
+            if (cudaMalloc(d_ctl, (size_t)CTL_INTS * sizeof(int)) != cudaSuccess) {
+                *d_ctl = nullptr;
+                return (int)cudaGetLastError();
+            }
+            cudaMemset(*d_ctl, 0, (size_t)CTL_INTS * sizeof(int));
         }
-        cudaMemset(*d_ctl, 0, (size_t)CTL_INTS * sizeof(int));
     }
     if (*d_scratch == nullptr) {
         if (cudaMalloc(d_scratch, (size_t)SCRATCH_INTS * sizeof(int)) != cudaSuccess) {
-            cudaFree(*d_ctl);
-            *d_ctl = nullptr;
+            // Only undo a block THIS call allocated.  A mapped control block is
+            // host memory owned by the caller (`cudaHostAlloc`), and freeing it
+            // here would be an invalid free.
+            if (mapped_ctl == nullptr) {
+                cudaFree(*d_ctl);
+                *d_ctl = nullptr;
+            }
             return (int)cudaGetLastError();
         }
         cudaMemset(*d_scratch, 0, (size_t)SCRATCH_INTS * sizeof(int));

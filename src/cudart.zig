@@ -122,6 +122,11 @@ pub const StreamNonBlocking: c_uint = 0x1;
 /// `cudaEventDisableTiming`.  The decode graph's ordering event has no use for
 /// timestamps, and without the flag every record costs a clock read.
 pub const EventDisableTiming: c_uint = 0x2;
+/// `cudaHostAllocMapped`: the host block can be reached by a device pointer
+/// (`HostGetDevicePointer`), so a kernel reads and writes host memory directly
+/// and no copy is needed in either direction.  Requires
+/// `cudaDevAttrCanMapHostMemory` (compute capability >= 1.1).
+pub const HostAllocMapped: c_uint = 0x2;
 
 /// `cudaStreamCaptureMode`.  `Global` is the most restrictive mode: it refuses/// *any* unsafe call (a legacy-default-stream launch, a synchronous memcpy, a
 /// stream sync) for the whole process while the capture is open, not just for

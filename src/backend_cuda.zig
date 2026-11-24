@@ -163,7 +163,11 @@ const Kernels = struct {
     // graph node never needs its parameters retargeted.  `n` (vocab) is a launch
     // argument because it decides the grid shape and never changes.
     extern fn q35_launch_sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque, mapped_ctl: ?*anyopaque) callconv(.c) c_int;
+    /// 1 when the device can map host memory (`cudaDevAttrCanMapHostMemory`).
+    /// See `caps.cu`; the sampler's control block moves into mapped host memory
+    /// only when this is 1.
+    extern fn q35_gpu_can_map_host() callconv(.c) c_int;
     extern fn q35_launch_sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void;
     extern fn q35_sample_scratch_ints() callconv(.c) c_int;
     extern fn q35_sample_ctl_ints() callconv(.c) c_int;
@@ -449,6 +453,7 @@ const Launch = if (cuda_linked) struct {
         if (Launch.xdSuppress(g.ptr)) return 0;
         return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
     }
+    const can_map_host_raw = Kernels.q35_gpu_can_map_host;
     const sample_init = Kernels.q35_launch_sample_init;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
@@ -714,7 +719,11 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_logits, n, d_ctl, d_scratch, stream };
         return stubNoCudaKernels();
     }
-    fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int {
+    fn can_map_host_raw() c_int {
+        return 0;
+    }
+    fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque, mapped_ctl: ?*anyopaque) callconv(.c) c_int {
+        _ = mapped_ctl;
         _ = .{ d_ctl, d_scratch };
         return stubNoCudaKernels();
     }
@@ -1707,6 +1716,10 @@ pub const CudaBackend = struct {
     // because `cudaMalloc` is illegal inside a capture interval.
     d_sample_ctl: ?*anyopaque = null,
     d_sample_scratch: ?*anyopaque = null,
+    /// `d_sample_ctl` points into mapped HOST memory (`h_sample_ctl`) rather
+    /// than a `cudaMalloc` block.  When true the per-token publish is a plain
+    /// host store and the token id is read straight out of host memory.
+    sample_ctl_mapped: bool = false,
     /// Host row for the `$QWEN35_CUDA_SAMPLE_CPU` A/B, grown on demand.
     h_sample_ab: ?[]f32 = null,
     /// Host scratch for the same A/B: the CPU sampler sorts through it.
@@ -6263,13 +6276,32 @@ const attn_score_arity: usize = 11;
         return true;
     }
 
-    /// Allocate (once) the device control block, its pinned host mirror, and
-    /// the kernel scratch.  Must run BEFORE any capture opens: `cudaMalloc`
-    /// inside a capture interval is illegal, and the sampler's very first launch
-    /// would land there.
+    /// Allocate (once) the sampler's control block and kernel scratch.  Must run
+    /// BEFORE any capture opens: `cudaMalloc` inside a capture interval is
+    /// illegal, and the sampler's very first launch would land there.
+    ///
+    /// THE CONTROL BLOCK LIVES IN HOST MEMORY, MAPPED.  Every per-token sampler
+    /// input (temperature / top_k / top_p / PRNG state) is written by the host
+    /// into that block, and the token id is written back by the kernel into the
+    /// same memory -- so a captured sampler node reads fresh values with no
+    /// `SetParams`, and the host reads the id with no D2H.  This is Strata's
+    /// shape (`engine/src/core/mtp.cpp:131` `mapped()`); it is what makes
+    /// "sampler inside the graph, copy outside" unnecessary -- there is no copy.
+    ///
+    /// Without `cudaDevAttrCanMapHostMemory` the block falls back to device
+    /// memory plus the historical `cudaMemcpyAsync` publish (`publishSampleCtl`
+    /// on the default stream) and the D2H in `dSampledToken`.  The capability
+    /// needs compute capability >= 1.1, i.e. everything from Tesla on, so the
+    /// fallback is for exotic setups rather than for old consumer cards.
     fn ensureSampleBufs(self: *CudaBackend) bool {
+        const cu = &(self.cu orelse return false);
         if (self.d_sample_ctl == null or self.d_sample_scratch == null) {
-            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch);
+            var mapped_dev: ?*anyopaque = null;
+            // Host mirror doubles as the mapped block itself when mapping works.
+            if (self.h_sample_ctl == null and Launch.can_map_host_raw() != 0) {
+                if (self.allocMappedSampleCtl(&cu.lib)) |dev| mapped_dev = dev;
+            }
+            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch, mapped_dev);
             if (rc != cudart.cudaSuccess) {
                 self.ewLaunchFail("sample init", rc);
                 return false;
@@ -6278,9 +6310,10 @@ const attn_score_arity: usize = 11;
         if (self.h_sample_ctl == null) {
             var p: ?*anyopaque = null;
             const n: usize = @intCast(@max(Launch.sample_ctl_ints(), 16));
-            // flags 0 = plain pinned memory: page-locked but not mapped, which
-            // is all `cudaMemcpyAsync` H2D needs to stay a true async copy.
-            const hrc = (&(self.cu orelse return false)).lib.HostAlloc(&p, n * @sizeOf(c_int), 0);
+            // Plain pinned memory: page-locked but not mapped, which is all
+            // `cudaMemcpyAsync` H2D needs to stay a true async copy.  Only the
+            // non-mapping fallback gets here.
+            const hrc = cu.lib.HostAlloc(&p, n * @sizeOf(c_int), 0);
             if (hrc != cudart.cudaSuccess or p == null) {
                 self.ewLaunchFail("sample ctl host alloc", hrc);
                 return false;
@@ -6290,6 +6323,30 @@ const attn_score_arity: usize = 11;
             self.h_sample_ctl = p;
         }
         return true;
+    }
+
+    /// `cudaHostAlloc(..., Mapped)` + `cudaHostGetDevicePointer` for the sampler
+    /// control block.  Records both pointers; returns the device one (which
+    /// `sample_init` stores in `d_sample_ctl`).
+    fn allocMappedSampleCtl(self: *CudaBackend, cu: *cudart.Lib) ?*anyopaque {
+        const n: usize = @intCast(@max(Launch.sample_ctl_ints(), 16));
+        var h: ?*anyopaque = null;
+        const hrc = cu.HostAlloc(&h, n * @sizeOf(c_int), cudart.HostAllocMapped);
+        if (hrc != cudart.cudaSuccess or h == null) {
+            self.ewLaunchFail("sample ctl mapped host alloc", hrc);
+            return null;
+        }
+        var d: ?*anyopaque = null;
+        const drc = cu.HostGetDevicePointer(&d, h, 0);
+        if (drc != cudart.cudaSuccess or d == null) {
+            self.ewLaunchFail("sample ctl host get device pointer", drc);
+            return null;
+        }
+        const hc: [*]c_int = @ptrCast(@alignCast(h.?));
+        @memset(hc[0..n], 0);
+        self.h_sample_ctl = h;
+        self.sample_ctl_mapped = true;
+        return d;
     }
 
     /// Mirror of `q35_sample_ctl` in `src/kernels/cuda/sample.cu`.  Field order
@@ -6332,6 +6389,10 @@ const attn_score_arity: usize = 11;
         const seed: u64 = sp.state;
         hc.rng_lo = @bitCast(@as(u32, @truncate(seed)));
         hc.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
+        // Mapped block: `d_sample_ctl` IS this host memory, so the stores above
+        // already published.  Nothing to copy, and therefore nothing that a
+        // capture could record with stale values.
+        if (self.sample_ctl_mapped) return true;
         const cu = &(self.cu orelse return false);
         const rc = cu.lib.MemcpyAsync(
             self.d_sample_ctl, @ptrCast(h), @sizeOf(SampleCtl), cudart.MemcpyHostToDevice, stream,
@@ -6351,20 +6412,26 @@ const attn_score_arity: usize = 11;
         const cu = &(self.cu orelse return self.sample_token);
         const h = self.h_sample_ctl orelse return self.sample_token;
         const hc: *SampleCtl = @ptrCast(@alignCast(h));
-        // Blocking 64-byte pull (the stream already carries every dependency:
-        // this runs on the DEFAULT stream, which `graphSyncToDefault` ordered
-        // after the graph).  Reading the last 64 bytes of the block -- rather
-        // than only `token_out` -- also brings back the advanced PRNG state, so
-        // the next token's `publishSampleCtl` continues the same stream without
-        // a second copy.  Cost is the same: one D2H of one cache line.
-        const rc = cu.lib.Memcpy(
-            @ptrCast(h), self.d_sample_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost,
-        );
-        if (rc != cudart.cudaSuccess) {
-            self.ewLaunchFail("sample token download", rc);
-            return self.sample_token;
+        if (!self.sample_ctl_mapped) {
+            // Blocking 64-byte pull (the stream already carries every dependency:
+            // this runs on the DEFAULT stream, which `graphSyncToDefault` ordered
+            // after the graph).  Reading the last 64 bytes of the block -- rather
+            // than only `token_out` -- also brings back the advanced PRNG state, so
+            // the next token's `publishSampleCtl` continues the same stream without
+            // a second copy.  Cost is the same: one D2H of one cache line.
+            const rc = cu.lib.Memcpy(
+                @ptrCast(h), self.d_sample_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost,
+            );
+            if (rc != cudart.cudaSuccess) {
+                self.ewLaunchFail("sample token download", rc);
+                return self.sample_token;
+            }
+            self.stat_d2h_bytes += @sizeOf(SampleCtl);
         }
-        self.stat_d2h_bytes += @sizeOf(SampleCtl);
+        // Mapped block: the kernel already wrote `token_out` / `rng_out_*` into
+        // this host memory, so the fields below are simply read.  The caller is
+        // responsible for having synchronised the stream first (`dSampledToken`
+        // does); without that the read could race the kernel.
         // `Sampler.sample` consumes exactly one `nextU64` per non-greedy draw
         // (sampler.zig:120 `nextF32`), and the kernel does the same, so the state
         // it wrote back IS the position the CPU reference would be at.

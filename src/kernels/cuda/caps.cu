@@ -27,6 +27,12 @@ struct q35GpuCaps {
     int max_threads_per_block;
     int max_threads_per_sm;
     int max_blocks_per_sm;
+    /// `cudaDevAttrCanMapHostMemory`: 能否把 `cudaHostAlloc(..., Mapped)` 的
+    /// 主机内存映射进 CUDA 地址空间（`cudaHostGetDevicePointer`）。
+    /// 架构要求是 compute capability >= 1.1，2060（7.5）与 4090（8.9）都满足；
+    /// 探测而不是假定的理由是不支持的设备上 `HostGetDevicePointer` 会失败，
+    /// 而那发生在一次分配里，报错位置离真正的原因很远。
+    int can_map_host;
     char name[256];
 };
 static q35GpuCaps q35_caps;
@@ -49,6 +55,7 @@ static void q35_caps_probe(void) {
     q35_caps.max_threads_per_block = p.maxThreadsPerBlock;
     q35_caps.max_threads_per_sm = p.maxThreadsPerMultiProcessor;
     q35_caps.max_blocks_per_sm = p.maxBlocksPerMultiProcessor;
+    q35_caps.can_map_host = p.canMapHostMemory;
     snprintf(q35_caps.name, sizeof(q35_caps.name), "%s", p.name);
 }
 
@@ -64,6 +71,13 @@ extern "C" int q35_gpu_cc(void) {
 extern "C" int q35_gpu_sm_count(void) {
     q35_caps_probe();
     return q35_caps.sm_count;
+}
+
+// 1 when this device can map host memory (`cudaHostAlloc` + `cudaHostGetDevicePointer`),
+// 0 otherwise or when the probe found no device.  See `q35GpuCaps.can_map_host`.
+extern "C" int q35_gpu_can_map_host(void) {
+    q35_caps_probe();
+    return q35_caps.can_map_host;
 }
 
 // Device name of device 0 ("unknown" when the probe found no device).
