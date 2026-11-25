@@ -1,25 +1,24 @@
-//! Qwen3.5 CPU scalar inference engine (Q8_0 GGUF only).
+//! Qwen3.5 推理引擎（架构层：不碰任何硬件细节）。
 //!
-//! Linear weights stay in their native Q8_0 blocks (zero-copy views into the
-//! mmapped GGUF); matvecs quantize the activation on the fly and accumulate
-//! per-block dot products in i32. Norms and elementwise ops stay f32.
+//! 这里的代码只描述 Qwen3.5 的模型结构与执行顺序；每个算子经 `backend.Exec`
+//! 落到具体后端（CPU 标量/ SIMD，或 CUDA）。权重以 GGUF 原生块格式零拷贝常驻
+//! （mmap），激活按需量化，逐块点积在 i32 上累加；norm 与 elementwise 保持 f32。
 //!
-//! Numerics follow ref/docs/SPEC.md (authoritative) and ref/docs/GDN_IMPL.md;
-//! control flow mirrors ref/c/qwen35_engine.c. GGUF-specific notes:
-//!   - GGUF tensor layout differs from the C ref's safetensors (see briefing):
-//!     linear layers have attn_qkv [hidden, nk*kd|nk*kd|nv*kd] = [Q|K|V],
-//!     attn_gate [hidden, nv*kd] (= z), ssm_alpha [hidden, nv], ssm_beta
-//!     [hidden, nk], ssm_a [nv] is already -exp(A_log) (negative values,
-//!     verified numerically against SPEC A7's A_log.exp() list), ssm_conv1d
-//!     is F32 [4, conv_dim] channel-major taps.
-//!     0.8B: hidden=1024, nv=nk=16, kd=128 (conv_dim 6144); 4B: hidden=2560,
-//!     nv=32, nk=16, kd=128 (conv_dim 8192).
-//!   - GGUF Qwen3_5RMSNorm weights are already (1+w) folded at conversion time
-//!     (verified: blk.0.attn_norm[0] == 2.0, q_norm mean ~ 1.4), so they are
-//!     applied directly; the gated ssm_norm (Qwen3_5RMSNormGated) is also
-//!     pre-folded and applied directly.
-//!   - llama.cpp conversion (conversion/qwen.py:394-404) fixes +1 for all
-//!     Qwen3_5RMSNorm-family weights and stores ssm_a = -A_log.exp().
+//! 数值规范以 ref/docs/SPEC.md（权威）与 ref/docs/GDN_IMPL.md 为准；控制流
+//! 对齐 ref/c/qwen35_engine.c。GGUF 相关的差异：
+//!   - GGUF 张量布局与 C 参照的 safetensors 不同（见简报）：
+//!     线性层是 attn_qkv [hidden, nk*kd|nk*kd|nv*kd] = [Q|K|V]，
+//!     attn_gate [hidden, nv*kd]（即 z），ssm_alpha [hidden, nv]，
+//!     ssm_beta [hidden, nk]，ssm_a [nv] 已经是 -exp(A_log)（负值，已按
+//!     SPEC A7 的 A_log.exp() 数值核对过），ssm_conv1d 是 F32 [4, conv_dim]
+//!     的通道优先抽头。
+//!     0.8B：hidden=1024，nv=nk=16，kd=128（conv_dim 6144）；4B：hidden=2560，
+//!     nv=32，nk=16，kd=128（conv_dim 8192）。
+//!   - GGUF 里的 Qwen3_5RMSNorm 权重在转换时已经折入了 (1+w)
+//!     （已核对：blk.0.attn_norm[0] == 2.0，q_norm 均值约 1.4），所以直接使用；
+//!     带门的 ssm_norm（Qwen3_5RMSNormGated）同样已预折叠，直接使用。
+//!   - llama.cpp 的转换脚本（conversion/qwen.py:394-404）为所有
+//!     Qwen3_5RMSNorm 家族权重固定加 1，并存储 ssm_a = -A_log.exp()。
 
 const std = @import("std");
 
@@ -30,9 +29,9 @@ pub var spec_fast_rollback = true;
 /// `$QWEN35_SPEC_RBDBG`：打印快速回滚路径的决策与状态比对。
 pub var cudart_debug_rollback = false;
 
-/// `$QWEN35_SPEC_DUMMYALLOC`: DIAGNOSTIC.  Allocates one throwaway device
-/// region during speculative setup, to test whether the MTP path's output
-/// depends on the device allocator's layout (it should not).
+/// `$QWEN35_SPEC_DUMMYALLOC`：**诊断用**。在推测解码的准备阶段多分配一块用完
+/// 即弃的设备区域，用来检验 MTP 路径的输出是否依赖于设备分配器的布局（理应不
+/// 依赖）。
 pub var spec_dummy_alloc = false;
 const gguf = @import("../gguf.zig");
 const backend = @import("../backend.zig");
@@ -40,11 +39,11 @@ const backend_cpu = @import("../backend_cpu.zig");
 const sampler = @import("../sampler.zig");
 const Io = std.Io;
 
-/// The engine hands backend-owned activation regions to every op.  It wraps its
-/// host slices here (CPU path); a device backend resolves its own base.
+/// 引擎把后端拥有的激活区域交给每个算子。CPU 路径在这里包装主机切片；设备后端
+/// 自己解析基址。
 const Buf = backend.Buf;
 
-/// Re-export so the CPU and CUDA hosts share one sampler implementation.
+/// 再导出，好让 CPU 与 CUDA 两个宿主共用同一份采样器实现。
 pub const Sampler = sampler.Sampler;
 
 pub const Config = struct {
@@ -58,15 +57,15 @@ pub const Config = struct {
     rms_eps: f32 = 1e-6,
     vocab: u32 = 248320,
     rope_freq_base: f32 = 1e7,
-    /// B9/B10: [11,11,10] mrope sections on 32 freq pairs (rotary_dim=64);
-    /// 4th section 0 = padding to 64 dims. Pure text => all three grids equal.
+    /// B9/B10：[11,11,10] 的 mrope 分段，作用在 32 对频率上（rotary_dim=64）；
+    /// 第 4 段为 0，是把维度补到 64 的填充。纯文本时三组网格相同。
     rope_sections: [4]u32 = .{ 11, 11, 10, 0 },
-    /// rotary_dim = head_dim * 0.25 = 64 (un-rotated tail = 192).
+    /// rotary_dim = head_dim * 0.25 = 64（不旋转的尾部是 192）。
     rotary_dim: u32 = 64,
     // GDN
     gdn_n_heads: u32 = 16, // linear_num_value_heads (0.8B: 16, 4B: 32)
-    /// k/q head count (ssm.group_count); v-head h uses k-head h / (nv/nk).
-    /// 0.8B: 16 (nv == nk), 4B: 16 (nv/nk = 2).
+    /// k/q 的头数（ssm.group_count）；v 头 h 使用 k 头 h / (nv/nk)。
+    /// 0.8B：16（nv == nk），4B：16（nv/nk = 2）。
     gdn_num_k_heads: u32 = 16,
     gdn_head_dim: u32 = 128,
     conv_kernel: u32 = 4,
@@ -79,12 +78,11 @@ pub const Config = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Scalar math (f32; SPEC C15: all norms computed in f32)
+// 标量数学（f32；SPEC C15：所有 norm 都用 f32 计算）
 // ---------------------------------------------------------------------------
 
-/// RMSNorm, out = x * rsqrt(mean(x^2) + eps) * w. eps inside the sum (SPEC).
-/// The sum of squares stays scalar (exact order); the elementwise scale is
-/// vectorized.
+/// RMSNorm，out = x * rsqrt(mean(x^2) + eps) * w。eps 加在平方和里面（SPEC）。
+/// 平方和保持标量（顺序精确）；逐元素的缩放做向量化。
 pub fn rmsNorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
     std.debug.assert(out.len == x.len and out.len == w.len);
     var ss: f32 = 0;
@@ -105,7 +103,7 @@ pub fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-/// Elementwise sigmoid over a whole slice (bit-identical to the scalar form).
+/// 对整个切片做逐元素 sigmoid（与标量形式逐位相同）。
 fn sigmoidVec(x: []f32) void {
     const one: @Vector(GV, f32) = @splat(1.0);
     const p: [*]f32 = x.ptr;
@@ -115,7 +113,7 @@ fn sigmoidVec(x: []f32) void {
     }
 }
 
-/// out[i] *= silu(g[i]) for the whole slice.
+/// 对整个切片做 out[i] *= silu(g[i])。
 fn mulSiluVec(out: []f32, gate: []const f32) void {
     const one: @Vector(GV, f32) = @splat(1.0);
     const op: [*]f32 = out.ptr;
@@ -131,7 +129,7 @@ pub fn silu(x: f32) f32 {
     return x / (1.0 + @exp(-x));
 }
 
-/// torch F.softplus default beta=1, threshold=20 (SPEC A4.4).
+/// 与 torch 的 F.softplus 默认参数一致：beta=1、threshold=20（SPEC A4.4）。
 pub fn softplus(x: f32) f32 {
     return if (x > 20.0) x else std.math.log1p(@exp(x));
 }
@@ -147,8 +145,8 @@ pub fn softmax(x: []f32) void {
     for (x) |*v| v.* /= sum;
 }
 
-/// FLA l2norm (SPEC A3): x * rsqrt(sum(x^2) + eps), eps inside the sum.
-/// Sum of squares stays scalar (exact order); the scale is vectorized.
+/// FLA 的 l2norm（SPEC A3）：x * rsqrt(sum(x^2) + eps)，eps 加在求和里面。
+/// 平方和保持标量（顺序精确）；缩放做向量化。
 pub fn l2norm(x: []f32) void {
     var ss: f32 = 0;
     for (x) |v| ss += v * v;
@@ -157,15 +155,13 @@ pub fn l2norm(x: []f32) void {
 }
 
 // ---------------------------------------------------------------------------
-// GDN delta-rule state kernels, @Vector-ized (SPEC A4)
+// GDN delta-rule 的状态 kernel，已用 @Vector 向量化（SPEC A4）
 // ---------------------------------------------------------------------------
 //
-// The state is [nv, kd, vd] row-major with kd == vd == 128, so every row is
-// an exact number of 16-element f32 vectors.  All four per-head operations
-// (decay, S^T k, outer-product update, S^T q) are written as @Vector(16, f32)
-// loads/stores; the accumulation order per output element is unchanged from
-// the scalar version, so results are bit-identical.  Loads/stores are
-// unaligned because the state buffer is only 4-byte aligned.
+// 状态是 [nv, kd, vd] 行优先，且 kd == vd == 128，所以每一行正好是整数个
+// 16 元素 f32 向量。每个 head 的四步操作（decay、S^T k、外积更新、S^T q）都写成
+// @Vector(16, f32) 的 load/store；每个输出元素的累加顺序与标量版一致，所以结果
+// 逐位相同。load/store 是不对齐的，因为状态缓冲只有 4 字节对齐。
 
 inline fn vloadF32(comptime N: usize, p: [*]const f32) @Vector(N, f32) {
     const ptr: *align(1) const [N]f32 = @ptrCast(p);
@@ -179,7 +175,7 @@ inline fn vstoreF32(comptime N: usize, p: [*]f32, v: @Vector(N, f32)) void {
 
 const GV = 16; // f32 lanes per vector used by the GDN kernels
 
-/// Elementwise x *= s (order-preserving, bit-identical to the scalar loop).
+/// 逐元素 x *= s（保持顺序，与标量循环逐位相同）。
 fn scaleVec(x: []f32, s: f32) void {
     const sv: @Vector(GV, f32) = @splat(s);
     const p: [*]f32 = x.ptr;
@@ -190,7 +186,7 @@ fn scaleVec(x: []f32, s: f32) void {
     for (x.len - x.len % GV..x.len) |i| x[i] *= s;
 }
 
-/// (1) S *= gamma.
+/// (1) S *= gamma。
 fn gdnDecay(sh: []f32, gamma: f32) void {
     const g: @Vector(GV, f32) = @splat(gamma);
     const p: [*]f32 = sh.ptr;
@@ -201,8 +197,8 @@ fn gdnDecay(sh: []f32, gamma: f32) void {
     for (sh.len - sh.len % GV..sh.len) |i| sh[i] *= gamma;
 }
 
-/// (2) km[j] = sum_i sh[i*vd + j] * k[i].  km must be vd long; vd % GV == 0.
-/// Accumulates in place in km (same per-element order as the scalar loop).
+/// (2) km[j] = sum_i sh[i*vd + j] * k[i]。km 必须长为 vd；vd % GV == 0。
+/// 就地累加到 km（每个元素的累加顺序与标量循环相同）。
 fn gdnKvMem(sh: []const f32, k: []const f32, km: []f32, vd: usize) void {
     std.debug.assert(vd % GV == 0 and km.len == vd);
     @memset(km, 0);
@@ -218,7 +214,7 @@ fn gdnKvMem(sh: []const f32, k: []const f32, km: []f32, vd: usize) void {
     }
 }
 
-/// (3) delta = beta * (v - km);  S += k (outer) delta.
+/// (3) delta = beta * (v - km)；S += k ⊗ delta（外积）。
 fn gdnOuter(sh: []f32, k: []const f32, v: []const f32, km: []const f32, delta: []f32, beta: f32, vd: usize) void {
     const b16: @Vector(GV, f32) = @splat(beta);
     const vp: [*]const f32 = v.ptr;
@@ -239,8 +235,8 @@ fn gdnOuter(sh: []f32, k: []const f32, v: []const f32, km: []const f32, delta: [
     }
 }
 
-/// (4) out[j] = sum_i sh[i*vd + j] * q[i]  (row-wise accumulation, same order
-/// as the scalar column loop).  Accumulates in place in out.
+/// (4) out[j] = sum_i sh[i*vd + j] * q[i]（按行累加，顺序与标量的按列循环
+/// 相同）。就地累加到 out。
 fn gdnStateOut(sh: []const f32, q: []const f32, out: []f32, vd: usize) void {
     std.debug.assert(vd % GV == 0 and out.len == vd);
     @memset(out, 0);
@@ -256,13 +252,12 @@ fn gdnStateOut(sh: []const f32, q: []const f32, out: []f32, vd: usize) void {
     }
 }
 
-/// Fused GDN state update: (1) decay + (2) kv-mem in ONE pass over the state,
-/// then (3) delta + outer-update and (4) S^T q in a SECOND pass.  Semantically
-/// the same as gdnDecay; gdnKvMem; gdnOuter; gdnStateOut back to back, but the
-/// 128x128 (2.1 MB) state is traversed twice instead of four times, and km/out
-/// are accumulated in vector registers rather than load/store'd per row.
-/// Fast path requires vd == 128 (all Qwen3.5 variants); otherwise it falls back
-/// to the four separate kernels.
+/// 融合的 GDN 状态更新：(1) decay + (2) kv-mem 合成一次状态遍历，随后
+/// (3) delta + 外积更新 与 (4) S^T q 合成第二次遍历。语义上与依次调用
+/// gdnDecay; gdnKvMem; gdnOuter; gdnStateOut 完全相同，但那个 128x128（2.1 MB）
+/// 的状态只遍历两次而不是四次，且 km/out 在向量寄存器里累加，而不是逐行
+/// load/store。快速路径要求 vd == 128（所有 Qwen3.5 变体都满足）；否则回退到
+/// 那四个独立 kernel。
 inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32, km: []f32, delta: []f32, out: []f32, gamma: f32, beta: f32, vd: usize) void {
     std.debug.assert(k.len == q.len and km.len == vd and out.len == vd and delta.len == vd);
     if (vd != 128) {
@@ -278,8 +273,8 @@ inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32, km
     const op: [*]f32 = out.ptr;
     const g: @Vector(32, f32) = @splat(gamma);
 
-    // Pass 1: read-only sweep, km += (S[i] * gamma) * k[i], accumulated in
-    // registers.  The decayed rows are NOT stored: pass 2 recomputes them.
+    // 第 1 遍：只读扫描，km += (S[i] * gamma) * k[i]，在寄存器里累加。衰减后的
+    // 行**不**写回：第 2 遍会重新算一遍。
     var acc: [W]@Vector(32, f32) = undefined;
     for (0..W) |b| acc[b] = @splat(@as(f32, 0.0));
     for (0..k.len) |i| {
@@ -287,8 +282,8 @@ inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32, km
         const ki: @Vector(32, f32) = @splat(k[i]);
         for (0..W) |b| acc[b] += vloadF32(32, row + b * 32) * ki;
     }
-    // km is stored already decayed (S is overwritten below), so callers that
-    // read km afterwards see the same value as gdnKvMem after gdnDecay.
+    // km 写出的已经是衰减后的值（S 稍后会被覆盖），所以事后读 km 的调用方看到
+    // 的与"先 gdnDecay 再 gdnKvMem"一致。
     for (0..W) |b| {
         acc[b] *= g;
         vstoreF32(32, gp + b * 32, acc[b]);
