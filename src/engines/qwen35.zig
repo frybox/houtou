@@ -1561,33 +1561,28 @@ pub const Engine = struct {
             prof_emb = 0;
         }
         const te = Io.Clock.Timestamp.now(io, .awake);
-        // embedding lookup: dequantize the token row straight into x
+        // embedding 查表：把该 token 那一行直接反量化进 x
         self.embedTo(token, self.x.span(0, hidden));
         if (prof) prof_emb += profNs(io, te);
 
-        // One decode step, from the first layer to the logits, is the only
-        // stretch of this engine whose kernels are known before they run: the
-        // weights are resident, every shape is fixed, and `pos`/`slot` are the
-        // only arguments that move.  A device backend can therefore record it
-        // once and replay it, and it needs to be told where the stretch starts
-        // and ends -- it never sees the model's control flow, only single ops.
+        // 一次 decode 步骤 —— 从第一层到 logits —— 是整个引擎里唯一一段"kernel
+        // 在跑之前就已知"的区间：权重已常驻、每个形状固定、只有 `pos`/`slot` 在动。
+        // 所以设备后端可以把它录一次、之后重放，而它需要被告知这段区间的起止 ——
+        // 它看不到模型的控制流，只看得到单个算子。
         //
-        // The boundary STARTS AFTER the embedding lookup on purpose: that lookup
-        // picks its row on the HOST (`base + token * row_bytes`), so a captured
-        // dequantize node would re-read the first token's row forever.  One
-        // dequantize row is a few microseconds, so keeping it out of the graph
-        // costs nothing measurable and removes a whole class of staleness.
+        // 边界的**起点刻意放在 embedding 查表之后**：那次查表在**主机**上选行
+        // （`base + token * row_bytes`），被捕获的 dequantize 节点会永远重读第一个
+        // token 那一行。反量化一行只要几微秒，把它挡在图外没有可测量的代价，却
+        // 消掉了一整类陈旧数据问题。
         //
-        // The boundary ENDS at `graphEnd` below.  When the caller asks for
-        // sampling (`forwardLogitsSampled`), the sampler runs as the LAST op
-        // inside the span -- that is what lets a device backend put it in the
-        // captured graph (llama.cpp keeps the sampler as a node of the model
-        // graph) instead of paying a launch + full-vocabulary D2H afterwards.
+        // 边界的**终点**是下面的 `graphEnd`。当调用方要求采样
+        // （`forwardLogitsSampled`）时，采样器作为区间内的**最后一个**算子运行 ——
+        // 这才让设备后端能把它放进捕获下来的图（llama.cpp 也把采样器当作模型图
+        // 的一个节点），而不是事后再付一次发射 + 全词表 D2H。
         //
-        // Open this pass's graph.  Everything from here to `graphEnd` is one
-        // replayable unit: same weights, same buffers, `pos` the only moving
-        // scalar.  A backend that cannot (or will not) record returns the
-        // pass-through graph and every op runs exactly as before.
+        // 打开这一趟的图。从这里到 `graphEnd` 是一个可重放单元：同样的权重、
+        // 同样的缓冲，`pos` 是唯一会动的标量。不能（或不愿）录制的后端返回直通图，
+        // 于是每个算子都照原样执行。
         // `rope_base_bits` 在这里就给真值。它是**模型常量**（不是逐 token 的
         // 量），所以放进控制块完全安全；不给的话 `rope64Rows` 每次都会因为
         // "值变了"而再发一次 H2D —— 而那次拷贝落在 capture 区间内，会被录成
@@ -1600,9 +1595,9 @@ pub const Engine = struct {
             .attn_slot = pos,
             .rows = 1,
         });
-        // `self.layers` has one extra slot when the model ships a nextn block
-        // (see `nSlots`); a normal forward must stop at the decoder layers, or
-        // it would run the drafter as layer 64 of every token.
+        // 模型带 nextn 块时 `self.layers` 会多出一个槽（见 `nSlots`）；普通的
+        // 前向必须停在 decoder 层，否则每个 token 都会把草稿头当作第 64 层再跑
+        // 一遍。
         for (self.layers[0..self.cfg.n_layers], 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
                 const a = Io.Clock.Timestamp.now(io, .awake);
@@ -1617,15 +1612,14 @@ pub const Engine = struct {
             self.forwardMlp(lw);
             if (prof) prof_mlp += profNs(io, a);
 
-            // Speculative tap, single-token form: row 0 of the plane.  Written
-            // after the MLP's residual add, which is the layer's output -- the
-            // value `forwardChunk` copies too (`Engine.tap_hidden` layout).
+            // 推测解码抽头的单 token 形式：用平面的第 0 行。在 MLP 的残差相加之后
+            // 写出 —— 那正是该层的输出，也是 `forwardChunk` 拷的值（`tap_hidden`
+            // 的布局）。
             //
-            // This is what lets a spec round reuse the hidden states the TARGET
-            // already computed during ordinary decode / verification instead of
-            // re-forwarding its context window every round.  At 16 rows that
-            // re-forward cost 16 x the target's per-token work per round, which
-            // measured 651 s for 32 tokens before this existed.
+            // 正是这一点让每一轮推测可以复用**目标模型**在普通 decode / 验证时
+            // 已经算出来的 hidden state，而不必每轮把它的上下文窗口重新前向一遍。
+            // 按 16 行算，那次重前向每轮要付 16 倍的目标逐 token 工作量；在它存在
+            // 之前，32 个 token 实测耗时 651 秒。
             if (self.tap_hidden.len != 0) {
                 for (self.tap_layers, 0..) |tl, ti| {
                     if (tl == li) {
@@ -1641,14 +1635,14 @@ pub const Engine = struct {
         const b = Io.Clock.Timestamp.now(io, .awake);
 
         self.exec.rmsnorm(self.graph, self.x1, self.x, self.output_norm, c.rms_eps);
-        // lm_head: untied `output.weight` when present, else tied token_embd.
-        // Both are [vocab, hidden] row-major.
+        // lm_head：有独立的 `output.weight` 就用它，否则用共享的 token_embd。
+        // 两者都是 [vocab, hidden] 行优先。
         if (self.output_weight) |ow| {
             switch (ow) {
                 .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
             }
         } else {
-            // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
+            // 共享 lm_head：logits = W_emb @ x1，W_emb 为 [vocab, hidden] 行优先
             switch (self.token_embd) {
                 .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
                 .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
@@ -1673,31 +1667,27 @@ pub const Engine = struct {
         std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{ prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6 });
     }
 
-    /// Forward + sample one token.  Greedy (argmax) when the sampler's
-    /// temperature is 0 — the historical default.
+    /// 前向 + 采样一个 token。采样器的 temperature 为 0 时就是 greedy（argmax）
+    /// —— 历史默认行为。
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
-        // One decode step, from the embedding lookup to the logits, is the only
-        // stretch of this engine whose kernels are known before they run: weights
-        // are resident, every shape is fixed, and `pos`/`slot` are the only
-        // arguments that move.  A device backend can therefore record it once and
-        // replay it, and it needs to be told where the stretch starts and ends --
-        // it never sees the model's control flow, only individual ops.
+        // 一次 decode 步骤 —— 从 embedding 查表到 logits —— 是整个引擎里唯一
+        // 一段"kernel 在跑之前就已知"的区间：权重已常驻、每个形状固定，只有
+        // `pos`/`slot` 在动。所以设备后端可以录一次、之后重放，而它需要被告知
+        // 这段区间的起止 —— 它看不到模型的控制流，只看得到单个算子。
         //
-        // The sampler runs INSIDE the span (last node of the graph); for the CPU
-        // backend it is an ordinary call and `sampled` is its result.
+        // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是一
+        // 次普通调用，`sampled` 就是它的结果。
         _ = self.forwardLogitsSampled(token, pos, &self.sampler);
         return self.sampled;
     }
 
-    /// Dequantize the embedding row of `token` into `dst` (hidden wide).
+    /// 把 `token` 的 embedding 行反量化进 `dst`（宽度为 hidden）。
     fn embedTo(self: *Engine, token: u32, dst: Buf) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len == hidden);
-        // Expanding one row to f32 is the one place the model needs *values*
-        // rather than a dot product, so it is a backend call: which
-        // dequantizer runs (Zig reference on CPU, a device kernel on GPU) is
-        // the backend's business.  Q8_0's 32-element framing is handled
-        // there rather than special-cased here.
+        // 把一行展开成 f32 是模型里唯一需要**具体数值**（而不是点积）的地方，
+        // 所以它是一次后端调用：用哪个反量化器（CPU 上是 Zig 参照、GPU 上是设备
+        // kernel）是后端的事。Q8_0 的 32 元素分帧也在那里处理，不在这里特判。
         switch (self.token_embd) {
             .f32 => |m| self.exec.copyRange(self.graph, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
             .quant => |qrow| self.exec.dequantRow(self.graph, dst, qrow, token),
@@ -1705,17 +1695,16 @@ pub const Engine = struct {
     }
 
     // -----------------------------------------------------------------
-    // K-token batched prefill chunk
+    // K-token 批量 prefill 块
     // -----------------------------------------------------------------
 
-    /// Run `tokens.len` (<= K) tokens of prefill starting at position `pos0`
-    /// and return the logits of the LAST token.  Every weight-reading linear
-    /// projection (qkv / gate / alpha-beta / q / k / v / out-proj / ffn
-    /// gate-up-down) is executed ONCE per chunk as a K-token batched matvec,
-    /// so each layer's weight bytes pass through cache once for K tokens; the
-    /// state kernels (GDN conv + 128x128 state, full-attention scores, KV
-    /// cache writes) run token-by-token in exactly the serial order, so the
-    /// KV cache and GDN state end up bit-identical to the serial prefill.
+    /// 从位置 `pos0` 开始跑 `tokens.len`（<= K）个 token 的 prefill，返回**最后
+    /// 一个** token 的 logits。每个读权重的线性投影（qkv / gate / alpha-beta /
+    /// q / k / v / out-proj / ffn gate-up-down）每块只执行**一次** K-token 批量
+    /// matvec，于是每层的权重字节为 K 个 token 只过一遍 cache；状态 kernel
+    /// （GDN 的 conv + 128x128 状态、full-attention 打分、KV cache 写入）仍按
+    /// 完全串行的顺序逐 token 跑，所以 KV cache 与 GDN 状态与串行 prefill 逐位
+    /// 相同。
     pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) Buf {
         const k = tokens.len;
         std.debug.assert(k > 0 and k <= self.nbatch);
@@ -2408,52 +2397,46 @@ pub const Engine = struct {
 
         self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
-        // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
+        // q_proj [1024, 4096]：先 view(8, 512) 再切块 -> 每头的 [q|gate]
         const qg = self.qkv.span(0, 2 * q_dim);
         self.exec.matvec(self.graph, qg, lw.attn_q.?, self.x1);
         const q = self.q.span(0, q_dim);
         const gate = self.z.span(0, q_dim);
-        // Batched split (see `forwardFullCore`): the GGUF `attn_q` rows are
-        // `[h][q_head | gate_head]`, and `q`/`gate` are both consumed per head,
-        // so this is a layout change no single memcpy can express -- the slot
-        // just does it in one launch instead of `2*heads`.
+        // 批量拆分（见 `forwardFullCore`）：GGUF 的 `attn_q` 行是
+        // `[h][q_head | gate_head]`，而 `q`/`gate` 都按 head 消费，所以这是一次
+        // 任何单个 memcpy 都表达不了的布局变换 —— 这个 slot 一次发射就做完，而不是
+        // `2*heads` 次。
         self.exec.deinterleaveQG(self.graph, q, gate, qg, heads, hd);
         self.exec.matvec(self.graph, self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
         self.exec.matvec(self.graph, self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 
-        // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
+        // q_norm/k_norm 在 RoPE **之前**（B12）；GGUF 权重已预折叠 (1+w)。
         //
-        // ONE `rmsnormRows` for all heads, not one `rmsnorm` per head.  Head h
-        // of q occupies [h*hd, (h+1)*hd), so the heads are contiguous and the
-        // row-batched slot is exactly the loop it replaces -- on the CPU oracle
-        // it is *literally* that loop (`vRmsnormRows`), so this cannot change a
-        // single value.  On CUDA `rmsnormRows` is capture-safe (no graph gate),
-        // so the decode graph sees one node here instead of `heads` of them.
-        //
-        // RoPE stays per head on purpose: `dRope64_body` reads {pos, base} from
-        // a device buffer so its nodes need no retargeting, but `rope64_rows`
-        // launches a different kernel with no host-stub identity for the graph
-        // to match.  See `dRope64Rows_body`'s capture guard.
+        // 所有 head 共用**一次** `rmsnormRows`，而不是每 head 一次 `rmsnorm`。
+        // q 的第 h 个 head 占 [h*hd, (h+1)*hd)，所以各 head 是连续的，按行批量的
+        // slot 正好就是它替代的那个循环 —— 在 CPU 参照上它**就是**那个循环
+        // （`vRmsnormRows`），所以不可能改变任何一个数值。在 CUDA 上
+        // `rmsnormRows` 是 capture 安全的（不受图门控），所以 decode 图在这里
+        // 只看到一个节点，而不是 `heads` 个。
         self.exec.rmsnormRows(self.graph, q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
         self.exec.rmsnormRows(self.graph, self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
-        // RoPE on first 64 dims of each q/k head -- ONE call per tensor, not
-        // one per head.  `rope64Rows(x, 1, heads, hd)` is literally the
-        // per-head loop it replaces (`k_rope64_rows` rotates row r at `pos+r`,
-        // and here rows == 1), and the CUDA backend now has a
-        // device-position twin of that kernel (`k_rope64_rows_dpos`) whose
-        // host-stub address the decode graph recognises, so batching survives
-        // the capture.
+        // 对每个 q/k head 的前 64 个分量做 RoPE —— 每个张量**一次**调用，而不是
+        // 每 head 一次。`rope64Rows(x, 1, heads, hd)` 正好就是它替代的逐 head
+        // 循环（`k_rope64_rows` 让第 r 行在 `pos+r` 处旋转，而这里 rows == 1），
+        // 且 CUDA 后端现在有这个 kernel 的设备位置孪生版
+        // （`k_rope64_rows_dpos`），其 host-stub 地址能被 decode 图识别，所以
+        // 批量发射在捕获下依然成立。
         //
-        // MEASURED (27B IQ3_XXS decode, ncu): one launch per head meant
-        // 40 + 8 = 48 rope launches per full-attn layer, 768 per token, and
-        // `k_rope64_dpos` was 12.84 ms / 6188 calls over 20 tokens -- 2.07 us
-        // per launch for 64 cos+sin, and 27.9% of all non-matvec kernel time.
+        // 实测（27B IQ3_XXS decode，ncu）：每 head 一次发射意味着每个 full-attn
+        // 层 40 + 8 = 48 次 rope 发射、每 token 768 次，而 `k_rope64_dpos` 在 20
+        // 个 token 里花了 12.84 ms / 6188 次调用 —— 每次调用 2.07 us 只为算 64 个
+        // cos+sin，占全部非 matvec kernel 时间的 27.9%。
         self.exec.rope64Rows(self.graph, q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
         self.exec.rope64Rows(self.graph, self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
 
-        // KV cache: quantize this token's rows into the cache (the backend
-        // strides its own layout; `slot` is the per-token row the decode
-        // graph retargets, exactly as it did for the old copy append).
+        // KV cache：把这个 token 的行量化进 cache（后端自己按它的布局定步长；
+        // `slot` 是逐 token 的行号，decode 图不再重定向节点，而是让 kernel 从
+        // 设备控制块读它）。
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
