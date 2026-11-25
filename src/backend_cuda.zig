@@ -2304,12 +2304,17 @@ pub const CudaBackend = struct {
         return &self.g_slots[self.g_cur];
     }
 
-    /// XG（显式计算图）的 A/B 开关，**默认关闭**。见 `graphReserve` 末尾的注释：
-    /// 这条路径还在建设中，打开会让 decode 在第一个不在 `xd.cu` 表里的 op 处
-    /// 丢掉 capture。等 S3d 把表补全、端到端逐位对拍通过再改默认值。
+    /// XG（显式计算图）的开关，**默认开启**。`$QWEN35_XD=0` 退回旧机制
+    /// （`GraphSlot` 的 `rec`/`live` + `GraphExecKernelNodeSetParams`），
+    /// 那是 A/B 与排障用的对照路径，S6 会删掉。
+    ///
+    /// 默认值是怎么定的（2026-11 实测，27B IQ3_XXS / 0.8B Q8_0，64 token）：
+    /// 图内 1573 个节点、**0 个非 kernel 节点**，token 流与旧机制逐位一致，
+    /// 27B decode 51.7 → 54.2 tok/s（+4.8%）。旧机制每 token 要按节点重建
+    /// 实参，XG 一次 `GraphLaunch` 即可，省下的是纯主机侧开销。
     fn xdWanted() bool {
         if (g_xd_cached) |v| return v;
-        var on = false;
+        var on = true;
         if (cudart.getenv("QWEN35_XD")) |raw| {
             const v = mem.trim(u8, raw, " \t\r\n");
             if (v.len != 0) {
