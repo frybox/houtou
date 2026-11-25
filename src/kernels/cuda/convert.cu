@@ -777,7 +777,7 @@ extern "C" __global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
                                      unsigned char *__restrict__ out_base,
                                      const int *__restrict__ d_slot,
                                      int nblocks_per_row, int rows_this,
-                                     int row_bytes)
+                                     int row_bytes, int kind)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = nblocks_per_row * rows_this;
@@ -787,19 +787,63 @@ extern "C" __global__ void q35_k_kv_quant_dslot(const float *__restrict__ x,
     // `d_slot` 指向每步控制块（xd.h），读到的是本步的 KV 起始行。
     const int slot = d_slot[XD_CTL_KV_SLOT] + row;
     const float *xb = x + (size_t)b * Q35_QK8_0;
-    unsigned char *ob = out_base + (size_t)slot * row_bytes + (size_t)bi * 64;
-    // 块内算术逐字照抄 `q35_k_kv_quant` 的 kind==0 分支。
+    // 块字节数随 kind 变（f16 64 / q8_0 34 / q4_0 18），所以先按 `bi` 定位
+    // 块内偏移，再按 kind 决定块的写法；算术逐字照抄 `q35_k_kv_quant`。
+    const int blk_bytes = (kind == 0) ? 64 : (kind == 1) ? 34 : 18;
+    unsigned char *ob = out_base + (size_t)slot * row_bytes + (size_t)bi * blk_bytes;
+    if (kind == 0) {
+#pragma unroll
+        for (int k = 0; k < Q35_QK8_0; ++k) {
+            const unsigned short h = q35_st_scale_bits(xb[k]);
+            ob[2 * k] = (unsigned char)(h & 0xffu);
+            ob[2 * k + 1] = (unsigned char)(h >> 8);
+        }
+        return;
+    }
+    float amax = 0.0f;
 #pragma unroll
     for (int k = 0; k < Q35_QK8_0; ++k) {
-        const unsigned short h = q35_st_scale_bits(xb[k]);
-        ob[2 * k] = (unsigned char)(h & 0xffu);
-        ob[2 * k + 1] = (unsigned char)(h >> 8);
+        const float a = fabsf(xb[k]);
+        if (a > amax) amax = a;
+    }
+    if (kind == 1) {
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+        const float inv = amax > 0.0f ? 1.0f / scale : 0.0f;
+        q35_store_scale(ob, scale);
+        signed char *qs = (signed char *)(ob + 2);
+#pragma unroll
+        for (int k = 0; k < Q35_QK8_0; ++k) {
+            const float v = xb[k] * inv;
+            int q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            qs[k] = (signed char)q;
+        }
+        return;
+    }
+    // kind == 2, block_q4_0.
+    {
+        const float scale = amax > 0.0f ? amax / 8.0f : 1.0f;
+        const float inv = amax > 0.0f ? 1.0f / scale : 0.0f;
+        q35_store_scale(ob, scale);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float v0 = xb[k] * inv;
+            const float v1 = xb[16 + k] * inv;
+            int q0 = (int)(v0 + (v0 >= 0.0f ? 0.5f : -0.5f)) + 8;
+            int q1 = (int)(v1 + (v1 >= 0.0f ? 0.5f : -0.5f)) + 8;
+            if (q0 > 15) q0 = 15;
+            if (q0 < 0) q0 = 0;
+            if (q1 > 15) q1 = 15;
+            if (q1 < 0) q1 = 0;
+            ob[2 + k] = (unsigned char)(q0 | (q1 << 4));
+        }
     }
 }
 
 extern "C" int q35_launch_kv_quant_dslot(const float *d_x, void *d_out_base,
                                          const int *d_slot, int nblocks_per_row,
-                                         int rows_this, int row_bytes,
+                                         int rows_this, int row_bytes, int kind,
                                          void *stream_v)
 {
     if (nblocks_per_row <= 0 || rows_this <= 0) return (int)cudaSuccess;
@@ -808,7 +852,7 @@ extern "C" int q35_launch_kv_quant_dslot(const float *d_x, void *d_out_base,
     const int blocks = (total + threads - 1) / threads;
     q35_k_kv_quant_dslot<<<blocks, threads, 0, (cudaStream_t)stream_v>>>(
         d_x, (unsigned char *)d_out_base, d_slot, nblocks_per_row, rows_this,
-        row_bytes);
+        row_bytes, kind);
     return (int)cudaGetLastError();
 }
 

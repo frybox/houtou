@@ -163,15 +163,7 @@ const Kernels = struct {
     // graph node never needs its parameters retargeted.  `n` (vocab) is a launch
     // argument because it decides the grid shape and never changes.
     extern fn q35_launch_sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
-    extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque, mapped_ctl: ?*anyopaque) callconv(.c) c_int;
-    /// 1 when the device can map host memory (`cudaDevAttrCanMapHostMemory`).
-    /// See `caps.cu`; the sampler's control block moves into mapped host memory
-    /// only when this is 1.
-    extern fn q35_gpu_can_map_host() callconv(.c) c_int;
-    /// 把映射主机内存里的采样控制块搬进设备副本（图节点）。
-    extern fn q35_launch_sample_ctl_in(d_ctl: ?[*]c_int, mapped: ?*const anyopaque, stream: ?*anyopaque) void;
-    /// 采样之后把设备副本（含 token_out 与推进后的 PRNG）搬回映射主机内存。
-    extern fn q35_launch_sample_ctl_out(mapped: ?*anyopaque, d_ctl: ?[*]const c_int, stream: ?*anyopaque) void;
+    extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void;
     extern fn q35_sample_scratch_ints() callconv(.c) c_int;
     extern fn q35_sample_ctl_ints() callconv(.c) c_int;
@@ -239,7 +231,7 @@ const Kernels = struct {
     extern fn q35_func_kv_quant() callconv(.c) ?*anyopaque;
     extern fn q35_launch_attn_chunk_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_attn_chunk_dyn_smem(hd: c_int, kv_kind: c_int) callconv(.c) c_ulonglong;
-    extern fn q35_launch_kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_kv_quant_dslot(d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_kv_quant_dslot() callconv(.c) ?*anyopaque;
 };
 
@@ -377,9 +369,9 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
     }
-    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
-        return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream);
+        return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, kind, stream);
     }
     fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -447,10 +439,7 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
     }
-    const can_map_host_raw = Kernels.q35_gpu_can_map_host;
     const sample_init = Kernels.q35_launch_sample_init;
-    const sample_ctl_in = Kernels.q35_launch_sample_ctl_in;
-    const sample_ctl_out = Kernels.q35_launch_sample_ctl_out;
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
@@ -637,9 +626,9 @@ const Launch = if (cuda_linked) struct {
         _ = .{ hd, kv_kind };
         return 0;
     }
-    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
-        _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, stream };
+        _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, kind, stream };
         return stubNoCudaKernels();
     }
     fn func_kv_quant_dslot() callconv(.c) ?*anyopaque {
@@ -715,17 +704,7 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_logits, n, d_ctl, d_scratch, stream };
         return stubNoCudaKernels();
     }
-    fn can_map_host_raw() c_int {
-        return 0;
-    }
-    fn sample_ctl_in(d_ctl: ?[*]c_int, mapped: ?*const anyopaque, stream: ?*anyopaque) void {
-        _ = .{ d_ctl, mapped, stream };
-    }
-    fn sample_ctl_out(mapped: ?*anyopaque, d_ctl: ?[*]const c_int, stream: ?*anyopaque) void {
-        _ = .{ mapped, d_ctl, stream };
-    }
-    fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque, mapped_ctl: ?*anyopaque) callconv(.c) c_int {
-        _ = mapped_ctl;
+    fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int {
         _ = .{ d_ctl, d_scratch };
         return stubNoCudaKernels();
     }
@@ -1718,10 +1697,6 @@ pub const CudaBackend = struct {
     // because `cudaMalloc` is illegal inside a capture interval.
     d_sample_ctl: ?*anyopaque = null,
     d_sample_scratch: ?*anyopaque = null,
-    /// `d_sample_ctl` points into mapped HOST memory (`h_sample_ctl`) rather
-    /// than a `cudaMalloc` block.  When true the per-token publish is a plain
-    /// host store and the token id is read straight out of host memory.
-    sample_ctl_mapped: bool = false,
     /// Host row for the `$QWEN35_CUDA_SAMPLE_CPU` A/B, grown on demand.
     h_sample_ab: ?[]f32 = null,
     /// Host scratch for the same A/B: the CPU sampler sorts through it.
@@ -1730,11 +1705,6 @@ pub const CudaBackend = struct {
     /// device's own logits, so the two samplers can be compared without the
     /// matvec divergence in the way.  Debug only; default off.
     sample_cpu_ab: bool = false,
-    /// Pinned HOST mirror of the first `SampleCtl.host_ints` ints of
-    /// `d_sample_ctl`.  Pinned so the per-token H2D is an async copy of a small
-    /// constant address rather than a pageable one (pageable H2D inside a
-    /// capture is rejected outright).
-    h_sample_ctl: ?*anyopaque = null,
     /// The token `sample` produced on the current step, collected by
     /// `sampledToken` after `stepEnd` has done the download.  The split exists
     /// because the download cannot be captured but the sampler must be.
@@ -1806,6 +1776,9 @@ pub const CudaBackend = struct {
     ctl_host: backend.GraphCtl = .{},
     /// True once `ctl_host` matches what is in the device block.
     ctl_valid: bool = false,
+    /// 上一次 `sample` 的 logits 长度。`dGraphBegin` 在 XG 重放前要用它发布
+    /// 采样参数，而那时引擎还没调用本步的 `sample`。
+    sample_vocab: usize = 0,
 
 
     d_kv_slot: ?*anyopaque = null,
@@ -2126,6 +2099,21 @@ pub const CudaBackend = struct {
     fn ensureCtl(self: *CudaBackend) ?*anyopaque {
         if (self.ctl_dev) |p| return p;
         const cu = &(self.cu orelse return null);
+        // 只有设备块。主机侧没有暂存块，也不做 pinned 分配：发布走一次阻塞
+        // `Memcpy`（见 `publishCtl`），源就是调用栈上的一个局部结构体。
+        //
+        // 为什么不需要 pinned：pinned 只对 `MemcpyAsync` 有意义（运行时不保证
+        // pageable 内存的异步性，会退化成内部暂存 + 隐式同步）。这里这次 H2D
+        // 的下游就是紧随其后的图重放，没有任何能与它重叠的工作，异步省不下
+        // 时间，却要多一块常驻的 page-locked 内存和它的清理。
+        //
+        // 也不用 mapped 内存：GPU 读映射主机内存可能命中 GPU 侧陈旧缓存，而
+        // `pos`/`kv_slot` 必须每步读到当步的值。
+        //
+        // 发布必须发生在 capture 打开**之前**：图里的 kernel 只读这块设备内存，
+        // 不再有任何搬运节点。历史教训：早先用 `k_xd_ctl_publish` 发布，它在
+        // capture 期被录成节点，重放时把录制那一步的 pos 写回（实测每步都退回
+        // 17）；后来换成 capture 内的 `MemcpyAsync`，同样被录成 memcpy 节点。
         var p: ?*anyopaque = null;
         // cudaMalloc inside a capture is illegal, so a capture must not get here.
         // Every caller runs at `stepBegin`/`graphBegin`, i.e. before any capture.
@@ -2147,21 +2135,25 @@ pub const CudaBackend = struct {
     /// re-publish even if the values happen to repeat, because the graph's other
     /// nodes may read them before `rope64` is reached).
     fn publishCtl(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
+        _ = stream;
         if (!force and self.ctl_valid and std.meta.eql(self.ctl_host, ctl)) return true;
         const p = self.ensureCtl() orelse return false;
-        const rc = Launch.xd_ctl_publish(
-            p,
-            @bitCast(ctl.pos),
-            ctl.rope_base_bits,
-            @bitCast(ctl.kv_slot),
-            @bitCast(ctl.attn_slot),
-            @bitCast(ctl.rows),
-            stream,
-        );
+        const cu = &(self.cu orelse return false);
+        // 一次阻塞 H2D，源是调用栈上的局部结构体。
+        //
+        // 为什么是阻塞而不是 `MemcpyAsync`：这次拷贝的下游就是紧接着的
+        // `GraphLaunch`（图里的 kernel 立刻要读这块设备内存），中间没有任何
+        // 能与它重叠的工作。异步既省不下时间，又强制源内存必须 page-locked
+        // —— 那是 `cudaMemcpyAsync` 的 API 要求，不是 GPU 在跑这段拷贝。
+        //
+        // 为什么这里不发 kernel：一个 `k_xd_ctl_publish` 节点在 capture 期会被
+        // 录进图，重放时把录制那一步的值写回设备（实测 `pos` 每步都退回 17）。
+        const rc = cu.lib.Memcpy(p, @ptrCast(&ctl), @sizeOf(backend.GraphCtl), cudart.MemcpyHostToDevice);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("ctl publish", rc);
             return false;
         }
+        self.stat_h2d_bytes += @sizeOf(backend.GraphCtl);
         self.ctl_host = ctl;
         self.ctl_valid = true;
         return true;
@@ -2626,6 +2618,17 @@ pub const CudaBackend = struct {
                 return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
             },
             .live => {
+                // `$QWEN35_XD_NOREPLAY=1`：每一步都重新录制而不是重放。调试用，
+                // 用来把"图的内容错"与"重放这个动作错"分开。
+                if (cudart.getenv("QWEN35_XD_NOREPLAY") != null) {
+                    if (self.gs().xd_gexec) |e| {
+                        if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
+                        s.xd_gexec = null;
+                    }
+                    s.xd_phase = .rec;
+                    if (!self.xdStartCapture()) return g;
+                    return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+                }
                 if (!self.xdReplay()) {
                     // 重放失败后**不能**退回主机侧直接发射：图可能已经执行
                     // （状态被推进一次），重跑整步会把状态推进两次。所以只有
@@ -2639,6 +2642,7 @@ pub const CudaBackend = struct {
                 return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s), .replayed = true };
             },
         }
+        return g;
     }
 
     fn xdPhaseEnd(self: *CudaBackend) void {
@@ -2666,6 +2670,9 @@ pub const CudaBackend = struct {
         // Global 而非 ThreadLocal：本后端在 capture 期间混用了默认流（embed 之后
         // 的 `launchStream()` 在 `.rec` 时是 `g_stream`，但部分路径仍显式传 null），
         // ThreadLocal 会把那些发射当成非法操作。ds4 用的是 Global。
+        // Global 而非 ThreadLocal：本后端在 capture 期间混用了默认流（embed 之后
+        // 的 `launchStream()` 在 `.rec` 时是 `g_stream`，但部分路径仍显式传 null），
+        // ThreadLocal 会把那些发射当成非法操作。ds4 用的是 Global。
         const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeGlobal);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("xg: begin capture", rc);
@@ -2677,9 +2684,49 @@ pub const CudaBackend = struct {
     }
 
     /// 关 capture：实例化、launch 一次（capture 不执行 kernel）、转 `live`。
+    /// `$QWEN35_XD_NODES`: 打印录进图的 kernel 节点分布（按 `func` 地址聚合）。
+    ///
+    /// 用途是把"图里到底有什么"变成可读的事实。重放输出异常时，第一个要
+    /// 问的问题是"图里是不是混进了不该有的节点"或"某个节点少了"，而这在
+    /// 主机侧只看得到地址；把次数和 PROF 的发射次数对照即可判断。
+    fn dumpGraphNodes(cu: *cudart.Open, graph: *anyopaque) void {
+        var n: usize = 0;
+        if (cu.lib.GraphGetNodes(graph, null, &n) != cudart.cudaSuccess or n == 0) return;
+        const alloc = std.heap.page_allocator;
+        const nodes = alloc.alloc(?*anyopaque, n) catch return;
+        defer alloc.free(nodes);
+        var got: usize = n;
+        if (cu.lib.GraphGetNodes(graph, nodes.ptr, &got) != cudart.cudaSuccess) return;
+
+        const Key = usize;
+        var counts = std.AutoHashMap(Key, usize).init(alloc);
+        defer counts.deinit();
+        var non_kernel: usize = 0;
+        for (nodes[0..got]) |nd| {
+            var ty: c_int = 0;
+            if (cu.lib.GraphNodeGetType(nd, &ty) != cudart.cudaSuccess) continue;
+            if (ty != 0) { // cudaGraphNodeTypeKernel == 0
+                non_kernel += 1;
+                continue;
+            }
+            var p: cudart.KernelNodeParams = undefined;
+            if (cu.lib.GraphKernelNodeGetParams(nd, &p) != cudart.cudaSuccess) continue;
+            const k: Key = @intFromPtr(p.func);
+            const gop = counts.getOrPut(k) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+        std.debug.print("[xg] graph has {d} nodes ({d} non-kernel kernels, {d} distinct funcs)\n", .{
+            got, non_kernel, counts.count(),
+        });
+    }
+
     fn xdFinishCapture(self: *CudaBackend) void {
         const cu = &(self.cu orelse return);
         const s = self.gs();
+        if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
+            std.debug.print("[xg] finish capture, phase={s}\n", .{@tagName(s.xd_phase)});
+        }
         var graph: ?*anyopaque = null;
         s.xd_capturing = false;
         const erc = cu.lib.StreamEndCapture(self.g_stream, &graph);
@@ -2691,12 +2738,14 @@ pub const CudaBackend = struct {
         }
         var gexec_new: ?*anyopaque = null;
         const irc = cu.lib.GraphInstantiate(&gexec_new, graph.?, 0);
+        std.debug.print("[xg] instantiate rc={d} err={s}\n", .{ irc, cu.lib.GetErrorString(cu.lib.GetLastError()) });
         if (irc != cudart.cudaSuccess or gexec_new == null) {
             _ = cu.lib.GraphDestroy(graph.?);
             self.ewLaunchFail("xg: instantiate", irc);
             s.xd_phase = .off;
             return;
         }
+        if (cudart.getenv("QWEN35_XD_NODES") != null) dumpGraphNodes(cu, graph.?);
         // 源图可以立刻销毁：本实现不保留任何节点句柄（无 op 表、无 apply），
         // 重放只认 `gexec`。参照项目里只有 ds4 保留 `graph`，那是因为它要用
         // `cudaGraphAddKernelNode` 手工改图。
@@ -2730,6 +2779,11 @@ pub const CudaBackend = struct {
         // 逐 token 变化的标量由设备控制块在 kernel 内读取（S3a/S3b），其余
         // 实参在 capture 时就已固化成常量区域。
         const st = self.g_stream orelse return false;
+        if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
+            std.debug.print("[xg] replay pos={d} kv={d} attn={d} rows={d}\n", .{
+                self.ctl_host.pos, self.ctl_host.kv_slot, self.ctl_host.attn_slot, self.ctl_host.rows,
+            });
+        }
         // `dGraphBegin` 在本步开始时把控制块写到 DEFAULT 流上（publish 是普通
         // kernel launch）。图在 `g_stream` 上读同一个块，两条流之间没有隐式
         // 顺序，所以重放前必须显式对齐；否则图会读到上一 token 的 pos/slot。
@@ -4111,18 +4165,25 @@ pub const CudaBackend = struct {
         // `slot` is `slot * row_bytes` bytes past the base.
         const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst.ptr));
         const out_ptr: [*]u8 = dst_bytes + slot * row_bytes;
-        // While a graph is LIVE (replay), the row number comes from the device
-        // so the captured pointers stay valid.  During CAPTURE we must NOT use
-        // this path: the H2D below would itself be recorded into the graph and
-        // replayed with a stale value.  Capture keeps the historical
-        // `out_ptr` + retargeting route instead.
-        if (self.gs().state == .live and self.kv_type == .f16 and rows == 1 and self.ctl_dev != null) {
-            // The row comes from the shared per-step block; `graphReplay` does
-            // not touch it, `graphBegin` already published it for this step.
+        // 行号一律从**设备控制块**读（`XD_CTL_KV_SLOT`），capture 与 replay 都走
+        // 这条路。控制块是映射主机内存（见 `ensureCtl`），节点实参固定、内容
+        // 每步刷新，所以录进图的 `k_kv_quant_dslot` 在重放时读到的是**当步**
+        // 的行号。
+        //
+        // 旧的 `out_ptr = base + slot * row_bytes` 写法只在 `state == .live`
+        // 时才切到设备行号，capture 期把录制那一步的指针固化进图 —— 实测：
+        // 每次重放都往 KV[17] 覆盖写，attn 读 0..pos 拿到旧行，第二次重放起
+        // logits 全错。
+        // 所有量化 KV 类型（f16 / q8_0 / q4_0）都走这条路：行号在 kernel 内从
+        // 控制块读，节点实参固定。以前只有 f16 走，q8_0/q4_0 会落回下面的
+        // `kv_quant(..., out_ptr, ...)` —— 那个 `out_ptr` 在主机侧算好，捕获后
+        // 永远是录制那一步的行（实测：`--kv-type q8_0` 时 XG 与直接发射从第
+        // 十几个 token 起分叉，f32/f16 已经完全一致）。
+        if (rows == 1 and self.ctl_dev != null) {
             const nbp = @as(c_int, @intCast(kv_dim / 32));
             const rc0 = Launch.kv_quant_dslot(g, src.ptr, @ptrCast(dst_bytes),
                 @ptrCast(@alignCast(self.ctl_dev.?)), nbp, 1,
-                @intCast(row_bytes), self.launchStream());
+                @intCast(row_bytes), kind, self.launchStream());
             if (rc0 == cudart.cudaSuccess) return;
             self.ewLaunchFail("kv_quant_dslot", rc0);
         }
@@ -4926,81 +4987,36 @@ pub const CudaBackend = struct {
         return true;
     }
 
-    /// Allocate (once) the sampler's control block and kernel scratch.  Must run
-    /// BEFORE any capture opens: `cudaMalloc` inside a capture interval is
-    /// illegal, and the sampler's very first launch would land there.
+    /// 分配（一次）采样控制块与 kernel scratch。必须在任何 capture 打开**之前**
+    /// 跑：capture 区间内 `cudaMalloc` 非法，而采样 kernel 的第一次发射就会落在
+    /// 那里。
     ///
-    /// THE CONTROL BLOCK LIVES IN HOST MEMORY, MAPPED.  Every per-token sampler
-    /// input (temperature / top_k / top_p / PRNG state) is written by the host
-    /// into that block, and the token id is written back by the kernel into the
-    /// same memory -- so a captured sampler node reads fresh values with no
-    /// `SetParams`, and the host reads the id with no D2H.  This is Strata's
-    /// shape (`engine/src/core/mtp.cpp:131` `mapped()`); it is what makes
-    /// "sampler inside the graph, copy outside" unnecessary -- there is no copy.
+    /// 控制块是**设备常驻**的，由两次重放之间一次普通 H2D 刷新。采样 kernel 在
+    /// 执行时从它读 temperature / top_k / top_p / PRNG 种子，并把选中的 token id
+    /// 写回同一块，所以捕获下来的采样节点永远不需要 `SetParams`。
     ///
-    /// Without `cudaDevAttrCanMapHostMemory` the block falls back to device
-    /// memory plus the historical `cudaMemcpyAsync` publish (`publishSampleCtl`
-    /// on the default stream) and the D2H in `dSampledToken`.  The capability
-    /// needs compute capability >= 1.1, i.e. everything from Tesla on, so the
-    /// fallback is for exotic setups rather than for old consumer cards.
+    /// 刷新刻意**不**发生在 capture 之内（那会被录成节点，重放时永远用录制那
+    /// 一步的值），也**不**发生在图 launch 之后（那时采样已经跑完）。它在
+    /// `graphBegin` 里发到图自己的流上，也就是下一次 `cudaGraphLaunch` 之前 ——
+    /// 正是"主机在两次重放之间写、图在重放期间读"这个窗口。
+    ///
+    /// 主机侧没有常驻缓冲：发布/读回都直接对着设备块做一次阻塞 `Memcpy`，
+    /// 源/目标是栈上的局部结构体。这样既不需要 pinned 分配，也就不存在
+    /// "GPU 读到映射内存陈旧副本"这一类问题。
     fn ensureSampleBufs(self: *CudaBackend) bool {
-        const cu = &(self.cu orelse return false);
+        if (self.cu == null) return false;
         if (self.d_sample_ctl == null or self.d_sample_scratch == null) {
-            var mapped_dev: ?*anyopaque = null;
-            // Host mirror doubles as the mapped block itself when mapping works.
-            if (self.h_sample_ctl == null and Launch.can_map_host_raw() != 0) {
-                if (self.allocMappedSampleCtl(&cu.lib)) |dev| mapped_dev = dev;
-            }
-            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch, mapped_dev);
+            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch);
             if (rc != cudart.cudaSuccess) {
                 self.ewLaunchFail("sample init", rc);
                 return false;
             }
         }
-        if (self.h_sample_ctl == null) {
-            var p: ?*anyopaque = null;
-            const n: usize = @intCast(@max(Launch.sample_ctl_ints(), 16));
-            // Plain pinned memory: page-locked but not mapped, which is all
-            // `cudaMemcpyAsync` H2D needs to stay a true async copy.  Only the
-            // non-mapping fallback gets here.
-            const hrc = cu.lib.HostAlloc(&p, n * @sizeOf(c_int), 0);
-            if (hrc != cudart.cudaSuccess or p == null) {
-                self.ewLaunchFail("sample ctl host alloc", hrc);
-                return false;
-            }
-            const hc: [*]c_int = @ptrCast(@alignCast(p.?));
-            @memset(hc[0..n], 0);
-            self.h_sample_ctl = p;
-        }
         return true;
     }
 
-    /// `cudaHostAlloc(..., Mapped)` + `cudaHostGetDevicePointer` for the sampler
-    /// control block.  Records both pointers; returns the device one (which
-    /// `sample_init` stores in `d_sample_ctl`).
-    fn allocMappedSampleCtl(self: *CudaBackend, cu: *cudart.Lib) ?*anyopaque {
-        const n: usize = @intCast(@max(Launch.sample_ctl_ints(), 16));
-        var h: ?*anyopaque = null;
-        const hrc = cu.HostAlloc(&h, n * @sizeOf(c_int), cudart.HostAllocMapped);
-        if (hrc != cudart.cudaSuccess or h == null) {
-            self.ewLaunchFail("sample ctl mapped host alloc", hrc);
-            return null;
-        }
-        var d: ?*anyopaque = null;
-        const drc = cu.HostGetDevicePointer(&d, h, 0);
-        if (drc != cudart.cudaSuccess or d == null) {
-            self.ewLaunchFail("sample ctl host get device pointer", drc);
-            return null;
-        }
-        const hc: [*]c_int = @ptrCast(@alignCast(h.?));
-        @memset(hc[0..n], 0);
-        self.h_sample_ctl = h;
-        self.sample_ctl_mapped = true;
-        return d;
-    }
-
-    /// Mirror of `q35_sample_ctl` in `src/kernels/cuda/sample.cu`.  Field order
-    /// is the WIRE FORMAT of the 64-byte H2D -- change both files or neither.
+    /// `q35_sample_ctl`（`src/kernels/cuda/sample.cu`）的镜像。字段顺序就是那次
+    /// 64 字节 H2D 的线格式——两边要么一起改，要么都不改。
     const SampleCtl = extern struct {
         vocab: c_int = 0,
         temperature_bits: c_int = 0,
@@ -5029,9 +5045,10 @@ pub const CudaBackend = struct {
     /// `sp.state` when it collects the token).  Publishing `state` here is what
     /// makes a replayed stream continue instead of restarting.
     fn publishSampleCtl(self: *CudaBackend, logits_len: usize, sp: *const sampler.Sampler, stream: ?*anyopaque) bool {
-        const h = self.h_sample_ctl orelse return false;
-        const hc: *SampleCtl = @ptrCast(@alignCast(h));
-        hc.* = .{};
+        _ = stream;
+        const cu = &(self.cu orelse return false);
+        const d_ctl = self.d_sample_ctl orelse return false;
+        var hc: SampleCtl = .{};
         hc.vocab = @intCast(logits_len);
         hc.temperature_bits = @bitCast(sp.temperature);
         hc.top_k = @intCast(sp.top_k);
@@ -5039,14 +5056,17 @@ pub const CudaBackend = struct {
         const seed: u64 = sp.state;
         hc.rng_lo = @bitCast(@as(u32, @truncate(seed)));
         hc.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
-        // Mapped staging block: the stores above ARE the publish.  The device
-        // copy is refreshed by `k_sample_ctl_in`, a graph node that runs before
-        // the sampler on every replay (see `dSample_body`).
-        if (self.sample_ctl_mapped) return true;
-        const cu = &(self.cu orelse return false);
-        const rc = cu.lib.MemcpyAsync(
-            self.d_sample_ctl, @ptrCast(h), @sizeOf(SampleCtl), cudart.MemcpyHostToDevice, stream,
-        );
+        // 一 次 64 字节阻塞 H2D，源是栈上的局部结构体。
+        //
+        // 与 `publishCtl` 同理：拷贝的下游就是图 launch（采样 kernel 是图的
+        // 最后一个节点），没有可重叠的工作，用 `MemcpyAsync` 只会强制源内存
+        // 必须 page-locked（那是 `cudaMemcpyAsync` 的 API 要求，不是"拷贝在
+        // GPU 上跑"）。
+        //
+        // 但时机比形态更要紧：这条拷贝必须发生在 capture 打开之前。落在
+        // capture 内会被录成 memcpy 节点，重放时永远用录制那一步的参数；
+        // 落在 `GraphLaunch` 之后又太晚（采样已经跑完）。
+        const rc = cu.lib.Memcpy(d_ctl, @ptrCast(&hc), @sizeOf(SampleCtl), cudart.MemcpyHostToDevice);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("sample ctl publish", rc);
             return false;
@@ -5055,41 +5075,21 @@ pub const CudaBackend = struct {
         return true;
     }
 
-    /// Read back the 4-byte token and the advanced PRNG state, and hand the
-    /// token to the engine.  Called from `stepEnd` (outside any capture) and, on
-    /// the un-captured path, directly from `dSample_body`.
+    /// 把采样 kernel 写进设备常驻块的结果读回主机：token id 与推进后的 PRNG。
+    ///
+    /// 一次 64 字节阻塞 D2H（一个 cache line）。读回整块而不只读 token id，
+    /// 是为了顺带拿到 `rng_out_*` —— 下一个 token 的 `publishSampleCtl` 才能
+    /// 从同一个 PRNG 位置继续。
     fn collectSampledToken(self: *CudaBackend, sp: *sampler.Sampler) u32 {
         const cu = &(self.cu orelse return self.sample_token);
-        const h = self.h_sample_ctl orelse return self.sample_token;
-        const hc: *SampleCtl = @ptrCast(@alignCast(h));
-        if (self.sample_ctl_mapped) {
-            // Device copy -> mapped host block, then wait.  `k_sample_ctl_out`
-            // is a plain kernel, so it is safe to issue here (the graph has
-            // already been closed); the synchronise is what makes the host read
-            // below observe `token_out` and the advanced PRNG state.
-            const st = self.g_stream orelse null;
-            Launch.sample_ctl_out(self.h_sample_ctl, @ptrCast(@alignCast(self.d_sample_ctl)), st);
-            if (st) |s2| _ = cu.lib.StreamSynchronize(s2);
-            if (cu.lib.StreamSynchronize(null) != cudart.cudaSuccess) _ = cu.lib.GetLastError();
-        } else {
-            // Blocking 64-byte pull (the stream already carries every dependency:
-            // this runs on the DEFAULT stream, which `graphSyncToDefault` ordered
-            // after the graph).  Reading the last 64 bytes of the block -- rather
-            // than only `token_out` -- also brings back the advanced PRNG state, so
-            // the next token's `publishSampleCtl` continues the same stream without
-            // a second copy.  Cost is the same: one D2H of one cache line.
-            const rc = cu.lib.Memcpy(
-                @ptrCast(h), self.d_sample_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost,
-            );
-            if (rc != cudart.cudaSuccess) {
-                self.ewLaunchFail("sample token download", rc);
-                return self.sample_token;
-            }
-            self.stat_d2h_bytes += @sizeOf(SampleCtl);
+        const d_ctl = self.d_sample_ctl orelse return self.sample_token;
+        var hc: SampleCtl = .{};
+        const rc = cu.lib.Memcpy(@ptrCast(&hc), d_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost);
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("sample token download", rc);
+            return self.sample_token;
         }
-        // Both paths land here with `hc` holding this step's result: the mapped
-        // path just copied the device block back (and waited), the other path
-        // did one blocking D2H.  The fields below are plain host reads.
+        self.stat_d2h_bytes += @sizeOf(SampleCtl);
         // `Sampler.sample` consumes exactly one `nextU64` per non-greedy draw
         // (sampler.zig:120 `nextF32`), and the kernel does the same, so the state
         // it wrote back IS the position the CPU reference would be at.
@@ -5185,24 +5185,31 @@ pub const CudaBackend = struct {
         if (replayed) {
             return self.collectSampledToken(sp);
         }
+        // XG 重放：图已在 `graphBegin` 里 launch 完，采样参数也已经在那里发布
+        // 到映射块（见 `xdPhaseBegin`）。这里**什么都不能再写** —— 尤其不能再
+        // `publishSampleCtl`，那条路径会把映射块整体重置，正好覆盖图刚写下的
+        // `CTL_FLAGS` 与 `CTL_TOKEN_OUT`（实测：重放后 token 永远读回 0）。
+        if (g.replayed) {
+            self.sample_sp = sp;
+            self.sample_vocab = logits.len;
+            return 0;
+        }
         if (!self.ensureSampleBufs()) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
         const px = dBufPtr(logits) orelse
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         self.sample_sp = sp;
+        self.sample_vocab = logits.len;
         const stream = self.launchStream(); // capture stream while recording
-        if (!self.publishSampleCtl(logits.len, sp, stream)) {
+        // 录制期不再从这里发布：`cudaMemcpyAsync` 落在 capture 区间内会被录成
+        // 一个 **memcpy 节点**，重放时把录制那一步的参数写回设备块（实测：
+        // `QWEN35_XD_NODES` 报出 1 个 non-kernel 节点，正是它）。参数已由
+        // `dGraphBegin` 在图外、图 launch 之前发布好，这里只负责把 kernel 录进去。
+        if (!self.capturing() and !self.publishSampleCtl(logits.len, sp, stream)) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // Mapped staging: move the host-written block into the device copy.  This
-        // is a GRAPH NODE, so on every replay it re-reads whatever the host put
-        // there for that token -- which is exactly why the parameters can change
-        // between tokens while the sampler stays a captured node.
-        if (self.sample_ctl_mapped) {
-            Launch.sample_ctl_in(@ptrCast(@alignCast(self.d_sample_ctl)), self.h_sample_ctl, stream);
-        }
-        const rc = Launch.sample(g, 
+        const rc = Launch.sample(g,
             px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,
         );
         if (rc != cudart.cudaSuccess) {
@@ -5530,8 +5537,13 @@ pub const CudaBackend = struct {
                                     // kernel time.  The scalar-`slot` form stays for
                                     // the direct path, where there is no node to
                                     // retarget and the smaller shared block is free.
+                                    // 判定必须覆盖**两套**机制：旧的 `state` 与
+                                    // XG 的 `xd_phase`。只认 `state` 时，XG 的
+                                    // `.live` 重放会落进标量 `slot` 分支 —— 那一
+                                    // 分支把 slot 当 kernel 实参，录进图后每次重放
+                                    // 都按录制那一步的 KV 长度算 attention。
                                     const want_dyn = graphWanted() and
-                                        (self.gs().state == .live or self.gs().state == .rec or self.capturing());
+                                        (self.gs().state == .live or self.gs().state == .rec or self.graphActive());
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
                                             // DO NOT publish `slot` here.  During
@@ -6812,8 +6824,34 @@ pub const CudaBackend = struct {
         // XG 只服务 decode：prefill 的块长度是数据相关的，按形状建图会得到
         // 最多 nbatch-1 张图（实测见 AGENTS.md 的 prefill 账本），而 prefill
         // 的发射开销在 238 ms 的块里上界只有 6.3%。见 `xdPhaseBegin`。
+        if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
+            std.debug.print("[xg] graphBegin kind={s} phase={s}\n", .{ @tagName(kind), @tagName(self.gs().xd_phase) });
+        }
         if (kind != .decode or !graphWanted()) return g;
-        return self.xdPhaseBegin(g);
+        // 采样参数在**图 launch 之前**拷进设备常驻控制块。这是整个重放循环里
+        // 唯一正确的位置：
+        //   * 图里的 `k_plan` / `k_draw` / `k_coin` 在重放时从该块读
+        //     temperature / top_k / top_p / PRNG，读的必须是**这一步**的值；
+        //   * 而 `sample` 这个 op 的调用点在图 launch 之后（`dSample_body`
+        //     那时再写就晚了 —— 会把图刚写下的 `CTL_FLAGS`/`CTL_TOKEN_OUT`
+        //     整体重置，实测读回永远是 0）；
+        //   * 写进 capture 区间更不行，那会被录成节点，重放永远用录制值。
+        // 所以就是用户定的形态：两次重放之间 host H2D 一次，重放期间图只读。
+        //
+        // 拷贝发到 `g_stream`（图所在流）而不是默认流：图 launch 也在这条流
+        // 上，先入先出保证它读到的是这次写进去的值。
+        //
+        // 引擎每步传的是同一个 `*Sampler`（`dSample_body` 里记下的
+        // `sample_sp`），所以这里拿到的 temperature/top-k/top-p/PRNG 就是当步的。
+        if (self.gs().xd_phase == .live) {
+            if (self.sample_sp) |sp| {
+                if (self.d_sample_ctl != null) {
+                    _ = self.publishSampleCtl(self.sample_vocab, sp, self.g_stream);
+                }
+            }
+        }
+        const out = self.xdPhaseBegin(g);
+        return out;
     }
 
     fn dGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {

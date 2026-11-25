@@ -1605,7 +1605,18 @@ pub const Engine = struct {
         // replayable unit: same weights, same buffers, `pos` the only moving
         // scalar.  A backend that cannot (or will not) record returns the
         // pass-through graph and every op runs exactly as before.
-        self.graph = self.exec.graphBegin(.decode, .{ .pos = pos, .kv_slot = pos, .attn_slot = pos, .rows = 1 });
+        // `rope_base_bits` 在这里就给真值。它是**模型常量**（不是逐 token 的
+        // 量），所以放进控制块完全安全；不给的话 `rope64Rows` 每次都会因为
+        // "值变了"而再发一次 H2D —— 而那次拷贝落在 capture 区间内，会被录成
+        // 图里的一个 memcpy 节点，重放时把录制那一步的 ctl 内容写回设备块。
+        // 实测：`QWEN35_XD_NODES` 报出 2 个 non-kernel 节点，正是它。
+        self.graph = self.exec.graphBegin(.decode, .{
+            .pos = pos,
+            .rope_base_bits = @bitCast(c.rope_freq_base),
+            .kv_slot = pos,
+            .attn_slot = pos,
+            .rows = 1,
+        });
         // `self.layers` has one extra slot when the model ships a nextn block
         // (see `nSlots`); a normal forward must stop at the decoder layers, or
         // it would run the drafter as layer 64 of every token.

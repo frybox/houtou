@@ -865,8 +865,8 @@ pub const Exec = struct {
     pub fn copyFromHost(self: Exec, g: Graph, dst: Buf, src: []const f32) void {
         self.vtable.copyFromHost(g, self.ptr, dst, src);
     }
-    pub fn copyToHost(self: Exec, dst: []f32, src: Buf) void {
-        self.vtable.copyToHost(self.ptr, dst, src);
+    pub fn copyToHost(self: Exec, g: Graph, dst: []f32, src: Buf) void {
+        self.vtable.copyOut(g, self.ptr, dst, src);
     }
     pub fn zeroBuf(self: Exec, g: Graph, buf: Buf) void {
         self.vtable.zeroBuf(g, self.ptr, buf);

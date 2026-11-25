@@ -402,13 +402,15 @@ int q35_launch_kv_quant(const float *d_x, void *d_out, int nblocks, int kind,
 void *q35_func_kv_quant(void);
 
 // `q35_launch_kv_quant` 的变体：目标行号从 DEVICE 读（`d_slot`，一个 int），
-// 输出基址固定。只支持 kind == 0（f16）。
+// 输出基址固定，行号在 kernel 内从控制块读。`kind` 与 `q35_launch_kv_quant`
+// 同义：0 = f16，1 = q8_0，2 = q4_0。
 //
 // 用途是 CUDA graph：把"写到第几行"从捕获时固化的 host 地址里挪出来，重放才
 // 能把每个 token 写到自己的行上。见 convert.cu 里的注释。
 int q35_launch_kv_quant_dslot(const float *d_x, void *d_out_base,
                               const int *d_slot, int nblocks_per_row,
-                              int rows_this, int row_bytes, void *stream);
+                              int rows_this, int row_bytes, int kind,
+                              void *stream);
 void *q35_func_kv_quant_dslot(void);
 
 // --- Full-attention decode -------------------------------------------------
