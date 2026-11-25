@@ -1,49 +1,42 @@
-//! GPU backend: every numeric kernel in the forward pass runs on the device.
+//! GPU 后端：前向通路里的每一个数值 kernel 都在设备上跑。
 //!
-//! Why this file exists at all (rather than a CUDA build of `backend_cpu`): the
-//! same `zig-out/bin/qwen35` binary has to run on hosts with no CUDA install.
-//! Two different mechanisms keep that true, and they must not be confused:
+//! 为什么要有这个文件（而不是做一个 `backend_cpu` 的 CUDA 版本）：同一个
+//! `zig-out/bin/qwen35` 二进制必须能在**没有装 CUDA** 的主机上跑起来。两套
+//! 机制共同保证这一点，二者不能混为一谈：
 //!
-//!   * **The kernels are linked in.**  `src/kernels/cuda/*.cu` are compiled by
-//!     `zig build -Dcuda=true` into objects that are linked into the executable;
-//!     every entry point below is a top-level `extern fn q35_launch_*` that the
-//!     linker resolves at build time.  There is no kernel `.so`, no `dlopen`, and
-//!     no symbol lookup here.  A plain CPU build simply never references them
-//!     (nothing calls this backend, see `main.zig`'s `--backend` parsing), and
-//!     the objects are not on the link line either.
-//!   * **libcudart is dlopen'd** (`cudart.zig`), so a CPU-only host never needs a
-//!     DT_NEEDED on it.  That is the only run-time library dependency left, and
-//!     `--backend cpu` still works on a host without any CUDA install.
+//!   * **kernel 是链接进来的。** `src/kernels/cuda/*.cu` 由
+//!     `zig build -Dcuda=true` 编成目标文件，链接进可执行文件；下面每个入口
+//!     都是一个顶层的 `extern fn q35_launch_*`，由链接器在构建期解析。这里
+//!     没有 kernel 的 `.so`、没有 `dlopen`、也没有运行期符号查找。纯 CPU 构建
+//!     根本不会引用它们（没有东西调用这个后端，见 `main.zig` 的 `--backend`
+//!     解析），那些目标文件也不在链接命令行上。
+//!   * **libcudart 是 dlopen 的**（`cudart.zig`），所以纯 CPU 主机从不需要对它
+//!     的 DT_NEEDED。那是唯一剩下的运行期库依赖，而 `--backend cpu` 在任何
+//!     没装 CUDA 的主机上照样能跑。
 //!
-//! Division of labour with `backend_cpu` (deliberate, see AGENTS.md §1.1):
+//! 与 `backend_cpu` 的分工（刻意如此，见 AGENTS.md §1.1）：
 //!
-//!   * The embedded `CpuBackend` stays authoritative for *metadata* work:
-//!     resolving the GGUF tensor, building the `QuantRow` view, and the geometry
-//!     it validates at load time.  That is startup work over the mmap, not a
-//!     forward-pass computation.  Only `.f32` tensors are widened; f16/bf16
-//!     weights stay in their native 2-byte form (see `loadLinear` in
-//!     `backend_cpu.zig`) and are uploaded 2 B/elem, widened inside the kernel
-//!     by `mmvq.cu`'s w16 family.
-//!   * Every *numeric* operation the engine asks for -- matvec, K-token batched
-//!     matvec, row dequantization, and the activation scratch those need -- is
-//!     done on the device by the kernels in `src/kernels/cuda`.  There is no CPU
-//!     arithmetic fallback here: mixing backends per tensor makes a divergence
-//!     impossible to attribute and every profile meaningless.
+//!   * 内嵌的 `CpuBackend` 仍然是**元数据**工作的权威：解析 GGUF 张量、构建
+//!     `QuantRow` 视图、以及它在加载期校验的几何。那是发生在 mmap 上的启动
+//!     期工作，不是前向计算。只有 `.f32` 张量会被拓宽成 f32；f16/bf16 权重
+//!     保持它们原生的 2 字节形态（见 `backend_cpu.zig` 的 `loadLinear`），按
+//!     每元素 2 B 上传，在 kernel 内部由 `mmvq.cu` 的 w16 系列拓宽。
+//!   * 引擎要求的每一个**数值**操作 —— matvec、K-token 批量 matvec、按行
+//!     反量化、以及它们需要的激活 scratch —— 都由 `src/kernels/cuda` 里的
+//!     kernel 在设备上完成。这里**没有** CPU 算术兜底：按张量混用后端会让
+//!     数值分歧无法归因，也让每次 profile 失去意义。
 //!
-//! Weight residency: `loadLinear` uploads *all* `LinearW.quant` types that the
-//! CPU loader accepts (f16/bf16 included, at 2 B/elem) plus the `.f32` tensors,
-//! and records the device pointer in
-//! `dev_rows`.  A failed upload is a hard load error, never a silent CPU retreat
-//! -- `--backend cuda` must mean what it says.
+//! 权重驻留：`loadLinear` 上传 CPU 加载器接受的所有 `LinearW.quant` 类型
+//! （含 f16/bf16，按 2 B/elem）以及 `.f32` 张量，并把设备指针记进
+//! `dev_rows`。上传失败是**硬性**加载错误，绝不会静默退回 CPU ——
+//! `--backend cuda` 必须名副其实。
 //!
-//! Memory budget: the backend does not try to outsmart the driver.  A failed
-//! `cudaMalloc` is reported with the tensor name, its type, the byte count and
-//! the device's remaining free memory (`cudaMemGetInfo`), then turned into
-//! `error.OutOfMemory` from `loadLinear`, so the load aborts instead of
-//! continuing on a mixed CPU/GPU path (slow *and* silently different in
-//! attribution).  A model that does not fit needs `--backend cpu` or a smaller
-//! quant; `$QWEN35_CUDA_MAX_DEV_MIB` caps uploads so the failure lands early and
-//! is attributable to the budget rather than to a transient allocation.
+//! 内存预算：后端不去"智胜"驱动。`cudaMalloc` 失败时会连同张量名、类型、
+//! 字节数和设备剩余空闲内存（`cudaMemGetInfo`）一起报出来，然后从
+//! `loadLinear` 转成 `error.OutOfMemory`，于是加载中止，而不是继续走一条
+//! CPU/GPU 混合路径（既慢，归因又静默地不同）。装不下的模型需要
+//! `--backend cpu` 或更小的量化；`$QWEN35_CUDA_MAX_DEV_MIB` 给上传设上限，
+//! 让失败尽早发生、并可归因到预算而不是某次瞬时分配。
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -54,78 +47,72 @@ const gguf = @import("gguf.zig");
 const cudart = @import("cudart.zig");
 const sampler = @import("sampler.zig");
 
-/// Build-time facts injected by `build.zig` (`addOptions("build_options")`).
-/// `cuda_linked` is the *same* `-Dcuda` value that gates whether
-/// `src/kernels/cuda/*.cu` are put on the executable's link line.
+/// `build.zig` 注入的构建期事实（`addOptions("build_options")`）。
+/// `cuda_linked` 就是那个控制 "`src/kernels/cuda/*.cu` 是否进可执行文件的链接
+/// 命令行" 的 `-Dcuda` 值。
 const build_options = @import("build_options");
 
 const mem = std.mem;
 const Io = std.Io;
 
-// ==== link-time kernel bindings =============================================
+// ==== 链接期的 kernel 绑定 ===================================================
 //
-// One `extern` per entry point in src/kernels/cuda/api.h, with the header's name
-// and signature.  `zig build -Dcuda=true` puts the `.cu` objects on the link
-// line, so a missing or mismatched launcher is a **build** error instead of a
-// run-time `MissingSymbol` -- which is the whole point of linking them in rather
-// than dlopen'ing a `.so`.  Nothing can be rebound at run time, so these
-// declarations must track api.h by hand; the comments below restate the header's
-// contract so a change in one is visible in the other.
+// src/kernels/cuda/api.h 里每个入口对应一个 `extern`，名字与签名照抄头文件。
+// `zig build -Dcuda=true` 把那些 `.cu` 目标文件放上链接命令行，所以缺一个或
+// 签名对不上的 launcher 是**构建期**错误，而不是运行期的 `MissingSymbol` ——
+// 这正是"链接进来"而非"dlopen 一个 .so"的全部意义。运行期无法重新绑定，因此
+// 这些声明必须手工跟随 api.h；下面的注释复述了头文件的契约，好让任何一边的
+// 改动在另一边看得见。
 //
-// ABI mapping: `int` -> `c_int`, `const void *` -> `?*const anyopaque`,
-// `void *` -> `?*anyopaque`, `float *` -> `?[*]f32`, `const float *` ->
-// `?[*]const f32`, `unsigned long long` -> `c_ulonglong`.
+// ABI 对应关系：`int` -> `c_int`，`const void *` -> `?*const anyopaque`，
+// `void *` -> `?*anyopaque`，`float *` -> `?[*]f32`，`const float *` ->
+// `?[*]const f32`，`unsigned long long` -> `c_ulonglong`。
 //
-// Call sites go through the `Kernels` namespace below (`const kern = Launch;`)
-// purely so the launch sites keep reading like `kern.mul_mat_vec(...)`; it holds
-// no state and compiles to a direct call.
+// 调用点统一走下面的 `Kernels` 命名空间（`const kern = Launch;`），纯粹是为了
+// 让发射点读起来仍是 `kern.mul_mat_vec(...)`；它不持有状态，编译成直接调用。
 const Kernels = struct {
-    /// `nblocks` counts 32-ELEMENT blocks (api.h Q35_API_QK8_0).
+    /// `nblocks` 以 **32 元素**块为单位计数（api.h 的 Q35_API_QK8_0）。
     extern fn q35_launch_quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// `nblocks` counts 256-ELEMENT blocks.
+    /// `nblocks` 以 **256 元素**块为单位计数。
     extern fn q35_launch_quantize_q8_K(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Same, and additionally writes the `block_q8_1_mmq` reshape (288 B per
-    /// 256-element block) that the dp4a prefill kernel reads.  See
-    /// `q35_k_quantize_q8_K` in mmvq.cu.
+    /// 同上，另外还写出 dp4a prefill kernel 读取的 `block_q8_1_mmq` 重排
+    /// （每 256 元素块 288 B）。见 mmvq.cu 的 `q35_k_quantize_q8_K`。
     extern fn q35_launch_quantize_q8_K_mmq(d_x: ?[*]const f32, d_out: ?*anyopaque, d_mmq: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// 1 when the prefill matvec for this type runs on the dp4a kernel, which
-    /// needs the mmq activation layout rather than q8_K.
+    /// 该类型在 prefill 下的 matvec 走 dp4a kernel 时返回 1 —— 那条路需要 mmq
+    /// 激活布局，而不是 q8_K。
     extern fn q35_mmq_dp4a_wants(ttype: c_int) c_int;
-    /// Bytes per 256-element block of the mmq activation layout (288).
+    /// mmq 激活布局下每个 256 元素块的字节数（288）。
     extern fn q35_mmq_act_block_bytes() c_int;
 
-    /// Whole-tensor dequantization; `nblocks` is in the type's NATIVE blocks.
+    /// 整张量反量化；`nblocks` 按该类型**原生**块计数。
     extern fn q35_launch_dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// One row of `cols` elements.  The row offset is device-side pointer
-    /// arithmetic by the caller (see `vDequantRow`), so only `cols` is needed.
+    /// 一行，共 `cols` 个元素。行偏移由调用方在设备侧做指针算术完成（见
+    /// `vDequantRow`），所以这里只需要 `cols`。
     extern fn q35_launch_dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
-    /// Table-driven quantized matvec: `d_out[t*rows + r] = W[r] . act_t`.
-    /// Argument order is api.h's: rows, cols, tokens, **then** ttype.
+    /// 表驱动的量化 matvec：`d_out[t*rows + r] = W[r] . act_t`。
+    /// 实参顺序照 api.h：rows、cols、tokens，**然后**才是 ttype。
     extern fn q35_launch_mul_mat_vec(d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Same shape for an f32 weight matrix (embedding / norms).
+    /// f32 权重矩阵（embedding / norm）的同形状版本。
     extern fn q35_launch_mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// f16/bf16 weights in their native 2-byte form x f32 activation.
-    /// `d_w` is rows*cols u16 (2 B/elem) -- NO f32 copy on the device; the
-    /// dequant happens inside the kernel (mmvq.cu's w16 header).
+    /// f16/bf16 权重保持原生 2 字节形态，乘 f32 激活。
+    /// `d_w` 是 rows*cols 个 u16（每元素 2 B）—— 设备上**没有** f32 副本，反量化
+    /// 在 kernel 内部完成（mmvq.cu 的 w16 头部）。
     extern fn q35_launch_mul_mat_vec_w16(d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
-    /// Upload the twelve IQ codebooks to the device (src/kernels/cuda/
-    /// iq_tables.cu).  MUST succeed before any kernel that touches an IQ type:
-    /// those read the tables through `__device__` pointers that only this call
-    /// fills in, so a skipped or failed upload makes IQ matvecs index garbage
-    /// (silently wrong output, not a crash).  Idempotent; returns a cudaError_t.
+    /// 把十二张 IQ 码本上传到设备（src/kernels/cuda/iq_tables.cu）。在任何触及
+    /// IQ 类型的 kernel 之前**必须**成功：那些 kernel 通过只有本调用才会填的
+    /// `__device__` 指针读表，所以漏掉或失败的上传会让 IQ matvec 索引到垃圾
+    /// （输出静默错误，而不是崩溃）。幂等；返回 cudaError_t。
     extern fn q35_launch_init_tables(stream: ?*anyopaque) callconv(.c) c_int;
-    /// Release the device copy of the codebooks (process-wide, so it lives as
-    /// long as the backend does).
+    /// 释放码本的设备副本（进程级，寿命与后端相同）。
     extern fn q35_launch_deinit_tables() callconv(.c) void;
-    /// Bytes of codebook resident on the device (0 before a successful upload).
+    /// 驻留在设备上的码本字节数（成功上传之前为 0）。
     extern fn q35_iq_tables_bytes() callconv(.c) c_ulonglong;
 
-    /// Pure elementwise activations (src/kernels/cuda/elementwise.cu).  `n` is an
-    /// ELEMENT count of f32, the buffers are contiguous, and all four are
-    /// bit-exact with the CPU implementations -- see the file's comment for why
-    /// that must stay true.
+    /// 纯 elementwise 激活（src/kernels/cuda/elementwise.cu）。`n` 是 f32 的
+    /// **元素**个数，缓冲区连续，这四个都与 CPU 实现逐位相同 —— 为什么必须保持
+    /// 这一点见该文件的注释。
     extern fn q35_launch_scale_vec(d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -134,14 +121,12 @@ const Kernels = struct {
     extern fn q35_launch_deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
-    /// Norms (src/kernels/cuda/norm.cu), activations + conv
-    /// (src/kernels/cuda/act.cu) and rotary (src/kernels/cuda/rope.cu).
+    /// Norm（src/kernels/cuda/norm.cu）、激活 + conv（src/kernels/cuda/act.cu）
+    /// 以及 rotary（src/kernels/cuda/rope.cu）。
     ///
-    /// `rows` blocks of `n` f32; `d_w`/`d_wconv` are length-`n` per-layer
-    /// weights reused for every row.  NONE of these is bit-exact with the CPU:
-    /// the reductions use a block tree and the transcendentals are the device
-    /// runtime's, not glibc's.  Per-kernel measured error is in api.h and in
-    /// each file's header.
+    /// `rows` 个 `n` 元素的 f32 块；`d_w`/`d_wconv` 是长度 `n` 的逐层权重，每一行
+    /// 复用同一份。这些**都不是**与 CPU 逐位相同的：归约用块树，超越函数来自
+    /// 设备运行时而非 glibc。逐 kernel 的实测误差见 api.h 与各文件头部。
     extern fn q35_launch_rmsnorm(d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_l2norm(d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_silu(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -150,26 +135,25 @@ const Kernels = struct {
     extern fn q35_launch_swiglu(d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_softmax(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Index of the largest logit; first index wins on ties.
+    /// 最大 logit 的下标；并列时取第一个下标。
     extern fn q35_launch_argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_argmax_batch(d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// `argmax` plus the winner's logit and the row's `sum(exp(x - max))`, for
-    /// the MTP drafter's confidence early stop (see api.h).
+    /// `argmax` 之外还给出胜出者的 logit 与该行的 `sum(exp(x - max))`，供 MTP
+    /// 草稿头的置信度提前停止使用（见 api.h）。
     extern fn q35_launch_argmax_conf(d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
-    // Device sampler (sample.cu).  The per-token parameters -- temperature,
-    // top_k, top_p, PRNG state -- travel through `d_ctl`, a RESIDENT device
-    // control block rewritten by a 64-byte H2D before each replay, so a captured
-    // graph node never needs its parameters retargeted.  `n` (vocab) is a launch
-    // argument because it decides the grid shape and never changes.
+    // 设备采样器（sample.cu）。逐 token 的参数 —— temperature、top_k、top_p、
+    // PRNG 状态 —— 经 `d_ctl` 传递：一块**常驻**设备控制块，每次重放之前由一个
+    // 64 字节 H2D 重写，所以捕获下来的图节点永远不需要重定向它的参数。
+    // `n`（vocab）是发射实参，因为它决定网格形状且从不改变。
     extern fn q35_launch_sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void;
     extern fn q35_sample_scratch_ints() callconv(.c) c_int;
     extern fn q35_sample_ctl_ints() callconv(.c) c_int;
 
-    // P2c: the two state machines.  One launch per value head for gdn_step,
-    // one launch (block per head) for attn_decode; see the kernel headers.
+    // P2c：两个状态机。gdn_step 每个 value head 一次发射，attn_decode 一次发射
+    // （每 head 一个 block）；见各自的 kernel 头部。
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -177,11 +161,10 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step_rows_snap(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
-    // Prefill (batched) twins of conv_step / gdn_gamma / l2norm / scale_vec.
-    // These exist only to collapse the per-token GDN prelude into a handful of
-    // launches per chunk -- they are NOT part of the decode graph (prefill never
-    // captures), so they are called directly and deliberately kept out of
-    // `Launch`.  Each one is bit-identical to the per-token kernel it replaces.
+    // conv_step / gdn_gamma / l2norm / scale_vec 的 prefill（批量）孪生版本。
+    // 它们存在只为把逐 token 的 GDN 前奏压缩成每块少数几次发射 —— 它们**不属于**
+    // decode 图（prefill 从不捕获），所以是直接调用、刻意不放进 `Launch`。
+    // 每一个都与它所替代的逐 token kernel 逐位相同。
     extern fn q35_launch_conv_step_rows(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma_rows(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -189,7 +172,7 @@ const Kernels = struct {
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_attn_chunk_max_rows(slot0: c_int, hd: c_int, kv_kind: c_int) callconv(.c) c_int;
-    /// Warp-tiled / split decode attention (see api.h for the measurements).
+    /// warp 分块 / 切分的 decode attention（实测数字见 api.h）。
     extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_attn_score_split_dyn() callconv(.c) ?*anyopaque;
@@ -197,31 +180,29 @@ const Kernels = struct {
     extern fn q35_func_attn_softmax_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_reduce() callconv(.c) ?*anyopaque;
     extern fn q35_launch_attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Device-`slot` form of the same kernel; see `dAttnDecode_body`.
+    /// 同一 kernel 的"设备 `slot`"形态；见 `dAttnDecode_body`。
     extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Write one int32 from a 1-thread kernel (graph-safe per-token scalar).
+    /// 用单线程 kernel 写一个 int32（图安全的逐 token 标量）。
     extern fn q35_launch_set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_copy_range_dslot(dst_base: ?[*]f32, stride: c_int, src: ?[*]const f32, rows: c_int, n: c_int, ctl: ?[*]const c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_xd_ctl_publish(d_ctl: ?*anyopaque, pos: c_int, base_bits: c_int, kv_slot: c_int, attn_slot: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
+    /// 对 `heads` 个长度为 `hd` 的头做 rope64（只有前 64 个分量旋转）。
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_setenv(d_dyn: ?*anyopaque, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Row-batched rope64: `rows` tokens `pos0..pos0+rows-1`, each `heads * hd`
-    /// floats wide.  PREFILL ONLY (see the note on `VTable.rope64Rows`).
+    /// 按行批量的 rope64：`rows` 个 token（`pos0..pos0+rows-1`），每个宽
+    /// `heads * hd` 个 float。**仅 prefill 使用**（见 `VTable.rope64Rows` 的说明）。
     extern fn q35_launch_rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
-    /// Rotary embedding with a runtime rotary width (Qwen3 rotates the whole
-    /// head; Qwen3.5/3.8 rotate 64 of 256).  See `api.h`.
+    /// 转子嵌入，旋转宽度运行期可设（Qwen3 旋转整个头；Qwen3.5/3.8 旋 256 中的
+    /// 64 个）。见 `api.h`。
     extern fn q35_launch_rope_rows_dim(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_func_rope64_rows_dpos() callconv(.c) ?*anyopaque;
-    /// Host-stub address of the device kernel `q35_launch_rope64` launches.  A
-    /// captured graph node reports exactly this value as `KernelNodeParams.func`,
-    /// so comparing against it is how the decode-graph path finds the node whose
-    /// `pos` it has to update every token.  Reading the argument values instead
-    /// is not equivalent: a node's `kernelParams` array has no length, so
-    /// probing it reads past the end of kernels with fewer arguments and
-    /// segfaults (observed).
+    /// `q35_launch_rope64` 所发射的那个设备 kernel 的 host-stub 地址。捕获下来
+    /// 的图节点会把这个值原样报在 `KernelNodeParams.func` 里，所以拿它做比较
+    /// 就是 decode 图路径"找出每 token 需要更新 `pos` 的那个节点"的办法。
+    /// 改读实参值并不等价：节点的 `kernelParams` 数组没有长度，探测它会读过
+    /// 实参较少的 kernel 的末尾并触发段错误（实测）。
     extern fn q35_func_rope64() callconv(.c) ?*anyopaque;
     extern fn q35_func_rope64_dpos() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_decode() callconv(.c) ?*anyopaque;
@@ -235,20 +216,18 @@ const Kernels = struct {
     extern fn q35_func_kv_quant_dslot() callconv(.c) ?*anyopaque;
 };
 
-/// Row-range split factor for decode attention.  `0` disables it (one block per
-/// head, the pre-2026-11 behaviour), `2..16` divides BOTH row walks of every
-/// head across that many blocks.
+/// decode attention 的行区间切分因子。`0` 关闭（每 head 一个 block，2026-11 之前
+/// 的行为），`2..16` 把每个 head 的**两条**行遍历都摊到这么多 block 上。
 ///
-/// Default is `16` because it is a strict win and it does not change any result:
-/// the score sum keeps the serial `j` order, the softmax keeps the CPU's
-/// max/serial-sum/div order, and the PV t-sum is the only 2-level tree -- and
-/// even that came out bit-identical on the probe (`mismatched=0 worst=0` against
-/// the one-block reference for every head and slot 0/5/63/300/516-519/530/700/
-/// 1023).  A single block per head is 24 blocks on this GPU's 114 SMs (21%
-/// occupancy) and every lane then walks all `n` rows of a KV cache that does not
-/// fit in L2, which measured **33 GB/s**; splitting reaches **325 GB/s**.
+/// 默认 `16`，因为它是纯收益且不改变任何结果：score 求和保持串行的 `j` 顺序，
+/// softmax 保持 CPU 的 max/串行求和/相除顺序，PV 的 t 求和是唯一的二级树 ——
+/// 而连它在探针上也是逐位相同的（每个 head、slot 0/5/63/300/516-519/530/700/
+/// 1023 对单 block 参照均为 `mismatched=0 worst=0`）。每 head 单 block 在这块
+/// 114 SM 的 GPU 上是 24 个 block（21% 占用率），此时每个 lane 要串行走完一个
+/// 放不进 L2 的 KV cache 的 `n` 全部行，实测 **33 GB/s**；切分后达到
+/// **325 GB/s**。
 ///
-/// `$QWEN35_CUDA_ATTN_SPLIT` overrides it (0 to turn it off for A/B).
+/// `$QWEN35_CUDA_ATTN_SPLIT` 可以覆盖它（置 0 关闭，用于 A/B）。
 fn attnSplitFromEnv() usize {
     const v = cudart.getenv("QWEN35_CUDA_ATTN_SPLIT") orelse return 16;
     const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return 16;
@@ -256,46 +235,43 @@ fn attnSplitFromEnv() usize {
 }
 
 
-// ==== link-time vs. CPU-only build =========================================
+// ==== 链接进来 vs 纯 CPU 构建 ===============================================
 //
-// The launchers above only exist in a `-Dcuda=true` build (it is that build that
-// puts `src/kernels/cuda/*.cu` on the link line).  A plain `zig build` still
-// compiles this file -- `engine.zig` instantiates `CudaBackend` for
-// `--backend cuda` unconditionally, and the CLI advertises that flag either way
-// -- so on a CPU-only build every launch site would be an undefined symbol.
+// 上面那些 launcher 只存在于 `-Dcuda=true` 的构建里（正是那种构建把
+// `src/kernels/cuda/*.cu` 放上链接命令行的）。普通的 `zig build` 仍然会编译
+// 本文件 —— `engine.zig` 会为 `--backend cuda` 无条件实例化 `CudaBackend`，而
+// CLI 无论哪种构建都会宣传这个开关 —— 于是在纯 CPU 构建里，每个发射点都会成为
+// 未定义符号。
 //
-// The discriminator is a BUILD-TIME CONSTANT, not a symbol probe: `build.zig`
-// passes `-Dcuda` to the Zig code as `build_options.cuda_linked` (the same
-// `cuda_enabled` variable that decides whether the nvcc objects are handed to
-// `exe.root_module.addObjectFile`).  The `else` branch is a stub that reports
-// the situation instead of calling into nothing; the choice is comptime, so a
-// CPU-only binary has no dangling call to the launchers either.
+// 判别依据是**构建期常量**，不是符号探测：`build.zig` 把 `-Dcuda` 以
+// `build_options.cuda_linked` 传给 Zig 代码（与决定 nvcc 目标文件是否交给
+// `exe.root_module.addObjectFile` 的是同一个 `cuda_enabled` 变量）。`else`
+// 分支是一个 stub，它把情况报出来，而不是调用一片虚无；这个选择是 comptime
+// 的，所以纯 CPU 二进制里也不会留下对 launcher 的悬空调用。
 //
-// Probing for symbol existence does NOT work here, and must not be reintroduced.
-// `@hasDecl(Kernels, "q35_launch_mul_mat_vec")` looks like it answers "was this
-// linked in?" but it does not: the `fn`s above are *declarations inside the
-// `Kernels` struct*, and `@hasDecl` only reports whether that struct has such a
-// member.  Measured (2026-10): it is `false` even when the C definition is
-// linked into the very same executable, so `Launch` collapsed to the stub branch
-// in every build -- `-Dcuda=true` included -- and `--backend cuda` printed "this
-// executable was built without CUDA kernels" while `nm` showed all nine
-// `T q35_launch_*` present.  A true link-time check would have to ask the
-// linker (e.g. a weak reference), which Zig does not expose at comptime; the
-// build flag is exact, cheap, and single-sourced with the link itself.
+// 符号存在性探测在这里**不管用**，也不得再引入。
+// `@hasDecl(Kernels, "q35_launch_mul_mat_vec")` 看起来能回答"这个链接进来了吗"，
+// 其实不能：上面的 `fn` 是 **`Kernels` 结构体内部的声明**，而 `@hasDecl` 只报告
+// 那个结构体有没有这个成员。实测（2026-10）：即使 C 定义已经链接进同一个可执行
+// 文件，它依然是 `false`，于是 `Launch` 在所有构建里（**包括** `-Dcuda=true`）
+// 都塌到 stub 分支 —— `--backend cuda` 打印"这个可执行文件没带 CUDA kernel"，
+// 而 `nm` 明明列着九个 `T q35_launch_*`。真正的链接期检查必须去问链接器
+// （例如弱引用），而 Zig 在 comptime 不暴露这个能力；构建标志精确、便宜，且与
+// 链接本身同源。
 const cuda_linked = build_options.cuda_linked;
 
-/// Reason reported by every stub on a CPU-only build.  Deliberately points at
-/// the build flag, because that is the only thing that can fix it.
+/// 纯 CPU 构建下每个 stub 报出的原因。刻意指向构建开关，因为那是唯一能修好它
+/// 的东西。
 const no_cuda_kernels_msg = "cuda backend: this executable was built without CUDA kernels (rebuild with -Dcuda=true, or use --backend cpu)";
 
 fn stubNoCudaKernels() c_int {
     std.debug.print("error: {s}\n", .{no_cuda_kernels_msg});
-    // Non-zero (cudaErrorInvalidDeviceFunction), so callers' `rc != cudaSuccess`
-    // paths fire and surface the message instead of carrying on with garbage.
+    // 返回非零（cudaErrorInvalidDeviceFunction），好让调用方的 `rc != cudaSuccess`
+    // 分支触发、把消息暴露出来，而不是带着垃圾继续跑。
     return 98;
 }
 
-/// The one place that decides what a `Launch.*` call does inside a graph span.
+/// 决定 `Launch.*` 调用在图的范围内该做什么的唯一一处。
 ///
 /// 语义只有一条：**`g.ptr` 非空表示"这一步由图在跑，主机侧不要再发射"**。
 ///
@@ -313,8 +289,8 @@ fn graphGate(g: backend.Graph) bool {
     return g.replayed;
 }
 
-/// Compile-time-resolved launcher table.  `cuda_linked` is comptime-known, so
-/// each field collapses to either the extern or the stub -- no indirection at
+/// 编译期解析的 launcher 表。`cuda_linked` 是 comptime 已知的，所以每个字段都
+/// 塌成 extern 或 stub 之一 —— 运行期没有间接跳转
 /// run time.
 const Launch = if (cuda_linked) struct {
     const quantize_q8_0 = Kernels.q35_launch_quantize_q8_0;
