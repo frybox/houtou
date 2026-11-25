@@ -329,10 +329,9 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_l2norm_qk_scale(d_x, nk, kd, k_offset, eps, qscale, stream);
     }
-    /// Forwarders, not aliases.  `g` decides whether the launch is recorded,
-    /// replayed or executed directly (see `graphDispatch`); the remaining
-    /// parameters are the kernel's own, so `Launch.x(a, b, c)` at a call site
-    /// reads exactly like the launcher it wraps.
+    /// 是转发器，不是别名。`g` 决定这次发射是被录制、被重放还是直接执行（见
+    /// `graphDispatch`）；其余参数就是 kernel 自己的参数，所以调用点上的
+    /// `Launch.x(a, b, c)` 读起来和它包装的 launcher 一模一样。
     fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_add_resid(dst, src, n, stream);
@@ -471,12 +470,11 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_gdn_gamma(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream);
     }
-    // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
-    // the same order) so `Launch` is the only seam between a launcher and its
-    // no-CUDA fallback: the `dGdnPrefillCore` call sites used to name
-    // `Kernels.q35_launch_*` directly, which made those 4 stubs dead code and
-    // broke `zig build` (without -Dcuda) at LINK time on an undefined symbol -- a
-    // class of failure the type errors above cannot catch.
+    // 仅 prefill 使用的按行/跨步孪生版本。列在这里（并在 stub 分支里以同样顺序
+    // 列出），好让 `Launch` 成为 launcher 与它"无 CUDA"回退之间唯一的接缝：
+    // `dGdnPrefillCore` 的调用点曾直接写 `Kernels.q35_launch_*`，那让这 4 个 stub
+    // 变成死代码，并让 `zig build`（不带 -Dcuda）在**链接期**因未定义符号失败
+    // —— 这类失败是上面的类型错误抓不到的。
     fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_conv_step_rows(d_conv, d_y, d_wconv, n, tokens, y_stride, stream);
@@ -527,14 +525,14 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, d_out, d_mmq, nblocks, stream };
         return stubNoCudaKernels();
     }
-    /// No CUDA kernels means no dp4a kernel either, so the caller keeps the
-    /// plain q8_K path.  0 is the answer that requires no second buffer.
+    /// 没有 CUDA kernel 也就没有 dp4a kernel，所以调用方保持普通 q8_K 路径。
+    /// 返回 0 是不需要第二块缓冲的那个答案。
     fn mmq_dp4a_wants(ttype: c_int) c_int {
         _ = ttype;
         return 0;
     }
-    /// Never used (mmq_dp4a_wants is always 0 here) but kept so `Launch` has the
-    /// same shape in both branches.
+    /// 从不使用（这里 `mmq_dp4a_wants` 恒为 0），保留是为了让 `Launch` 在两个
+    /// 分支里形状一致。
     fn mmq_act_block_bytes() c_int {
         return 288;
     }
@@ -568,7 +566,7 @@ const Launch = if (cuda_linked) struct {
         return stubNoCudaKernels();
     }
     fn deinit_tables() callconv(.c) void {
-        // Already reported by the failed `init_tables`; stay silent.
+        // `init_tables` 失败时已经报过了，这里保持安静。
     }
     fn tables_bytes() callconv(.c) c_ulonglong {
         return 0;
@@ -703,10 +701,9 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    /// No chunk kernel means no chunking: 0 tells `dAttnChunk` to leave
-    /// `maxrows` at zero and skip the sliced path entirely.  Returning a
-    /// positive number here would be the dangerous answer -- the slice loop
-    /// would then call the stubbed `attn_chunk` above.
+    /// 没有 chunk kernel 就不分块：返回 0 让 `dAttnChunk` 把 `maxrows` 留成 0、
+    /// 完全跳过按片路径。在这里返回正数才是危险的答案 —— 分片循环接下来就会去
+    /// 调上面那个被 stub 掉的 `attn_chunk`。
     fn attn_chunk_max_rows(slot0: c_int, hd: c_int, kv_kind: c_int) c_int {
         _ = .{ slot0, hd, kv_kind };
         return 0;
@@ -716,11 +713,10 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_q, d_gate, d_src, heads, hd, tokens, stream };
         return stubNoCudaKernels();
     }
-    // Same order and same signatures as the `Kernels` aliases above: every
-    // launcher the CUDA branch exposes must have a member here, or any call site
-    // added later breaks `zig build` (no -Dcuda) with `no member named ...` --
-    // which is exactly how `set_int1` and the three `attn_decode_*` variants got
-    // away: they were aliased and called long after this struct was last read.
+    // 顺序与签名都和上面 `Kernels` 的别名一致：CUDA 分支暴露的每个 launcher 在
+    // 这里都必须有对应成员，否则以后新加的调用点会让 `zig build`（不带 -Dcuda）
+    // 报 `no member named ...` —— `set_int1` 和三个 `attn_decode_*` 变体正是这样
+    // 漏过去的：它们被起了别名、被调用，而这个结构体已经很久没人读了。
     fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
@@ -783,8 +779,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
-    // Prefill-only twins, now reached through `Launch` like every other launcher
-    // (see the note in the CUDA branch: they used to bypass the seam).
+    // 仅 prefill 使用的孪生版本，现在和其它 launcher 一样经 `Launch` 到达
+    // （见 CUDA 分支里的说明：它们曾绕过这条接缝）。
     fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_conv, d_y, d_wconv, n, tokens, y_stride, stream };
@@ -841,23 +837,22 @@ const Launch = if (cuda_linked) struct {
     }
 };
 
-// ==== activation geometry ====================================================
+// ==== 激活的几何 =============================================================
 
-/// Activation block size (in *elements*) a matvec against `ttype` needs.
+/// 针对 `ttype` 的 matvec 所需要的激活块大小（以**元素**计）。
 ///
-/// Two formats, not one, because a quantized matvec is table-driven per weight
-/// type and the activation block must match the weight block:
-///   * Q8_0 weights use 32-element blocks -> Q8_0 activations (34 B / 32).
-///   * BF16/F16 weights (one element per 2-byte block, framed into 256-element
-///     GGUF row-blocks) are dotted by the Q8_0 family too -- see
-///     `backend_cpu.actFamily`, which is the single source for this.
-///   * Every other packed type this backend loads uses 256-element blocks
-///     (Q4_K/Q6_K/IQ*/... all consume Q8_K) -> Q8_K (292 B / 256).
+/// 有两种格式而不是一种，因为量化 matvec 是按权重类型表驱动的，激活块必须与
+/// 权重块匹配：
+///   * Q8_0 权重用 32 元素块 -> Q8_0 激活（34 B / 32）。
+///   * BF16/F16 权重（每元素一个 2 字节块，被框架成 256 元素的 GGUF row-block）
+///     同样由 Q8_0 家族做点积 —— 见 `backend_cpu.actFamily`，那是这件事的唯一
+///     来源。
+///   * 本后端加载的其它打包类型一律用 256 元素块（Q4_K/Q6_K/IQ*/... 全都消费
+///     Q8_K）-> Q8_K（292 B / 256）。
 ///
-/// Keying on `gguf.blockElems` alone was a live bug: BF16/F16 have
-/// `blockElems == 1`, so they fell into the Q8_K family and the launcher
-/// sized their activation as 292 B / 256 elements while the weight dot reads
-/// Q8_0 blocks.
+/// 只按 `gguf.blockElems` 分支曾是一个真实 bug：BF16/F16 的 `blockElems == 1`，
+/// 于是它们落进 Q8_K 家族，launcher 把激活按 292 B / 256 元素分配，而权重点积
+/// 读的是 Q8_0 块。
 fn actBlockElems(ttype: gguf.TensorType) usize {
     return if (cpu_mod.actFamily(ttype) == .q8_0)
         gguf.blockElems(.q8_0)
@@ -865,7 +860,7 @@ fn actBlockElems(ttype: gguf.TensorType) usize {
         gguf.blockElems(.q8_k);
 }
 
-/// Packed bytes of one activation block for `ttype`'s matvec input.
+/// `ttype` 的 matvec 输入下，一个激活块的打包字节数。
 fn actBlockBytes(ttype: gguf.TensorType) usize {
     return if (cpu_mod.actFamily(ttype) == .q8_0)
         gguf.blockBytes(.q8_0)
@@ -873,9 +868,9 @@ fn actBlockBytes(ttype: gguf.TensorType) usize {
         gguf.blockBytes(.q8_k);
 }
 
-/// Quantized-activation bytes for a `cols`-wide input: whole blocks, rounded up
-/// exactly like `backend_cpu.q8ScratchBytes` / `q8kScratchBytes`, so a config the
-/// CPU backend accepted cannot overflow the device buffer here.
+/// 宽 `cols` 的输入所需的量化激活字节数：整块，向上取整的方式与
+/// `backend_cpu.q8ScratchBytes` / `q8kScratchBytes` 完全一致，因此 CPU 后端接收
+/// 过的配置在这里不会把设备缓冲撑爆。
 fn actBytes(ttype: gguf.TensorType, cols: usize) usize {
     const be = actBlockElems(ttype);
     return (cols + be - 1) / be * actBlockBytes(ttype);
@@ -885,23 +880,21 @@ fn oomMsg(what: []const u8) void {
     std.debug.print("cuda backend: {s} device buffer allocation failed\n", .{what});
 }
 
-/// Nanoseconds between a timestamp and now.  `durationTo(...).raw.nanoseconds` is
-/// `i96`; the counters are `u64` and only ever accumulate (monotonic clock), so
-/// clamp rather than trap.
+/// 某个时间戳到现在的纳秒数。`durationTo(...).raw.nanoseconds` 是 `i96`，而
+/// 计数器是 `u64` 且只会累加（单调时钟），所以这里钳位而不是触发陷阱。
 
 fn durNs(t0: Io.Clock.Timestamp, io: Io) u64 {
     const d = t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
     return if (d > 0) @intCast(@min(d, std.math.maxInt(u64))) else 0;
 }
 
-// ---- per-slot profiling ($QWEN35_PROF only) --------------------------------
+// ---- 逐 slot 的性能剖析（仅 $QWEN35_PROF） --------------------------------
 
-/// The `backend.Exec` slots, one entry each, plus the two weight/scratch slots
-/// that are not part of the per-token budget but are worth seeing (they are
-/// the load-time and allocation costs).
+/// `backend.Exec` 的各个 slot，每个一项；另外还有两个权重/scratch slot —— 它们
+/// 不算在每 token 的预算里，但值得一看（那是加载期与分配的开销）。
 ///
-/// Order is the report order, so keep the hot entries first when re-reading a
-/// `PROF-SLOT` dump; `reportSlotStats` sorts by total anyway.
+/// 顺序就是报告顺序，所以回读 `PROF-SLOT` 转储时热项排在前面；不过
+/// `reportSlotStats` 最终还是会按总耗时排序。
 pub const Slot = enum(u8) {
     matvec,
     matvec_batchk,
@@ -912,9 +905,9 @@ pub const Slot = enum(u8) {
     rope64_rows,
     l2norm,
     attn_decode,
-    /// Chunk-wide prefill attention (`VTable.attnChunk`).  Separate from
-    /// `attn_decode` so the profile shows the two shapes apart: prefill should
-    /// drop to a handful of calls per layer while decode keeps one per token.
+    /// 块级 prefill attention（`VTable.attnChunk`）。与 `attn_decode` 分开，好让
+    /// 剖析把两种形状分开显示：prefill 每层应该降到少数几次调用，而 decode 保持
+    /// 每 token 一次。
     attn_chunk,
     gdn_gamma,
     gdn_prelude,
@@ -940,28 +933,26 @@ pub const Slot = enum(u8) {
     const_buf,
 };
 
-/// Element-count buckets for the `PROF-COPY` breakdown.  Fixed, not dynamic:
-/// the widths this model actually issues are a handful of distinct values, and
-/// a fixed array keeps the instrumentation allocation-free on the hot path.
+/// `PROF-COPY` 明细所用的元素个数分桶。固定而非动态：这个模型实际发出的宽度只有
+/// 少数几个不同的值，而固定数组让这些插桩在热路径上不产生分配。
 ///
-/// Order is significant only in that `copyBinOf` scans it in order; the bounds
-/// are ascending so the first match is the tightest bucket.
+/// 顺序只在"`copyBinOf` 按序扫描它"这一点上有意义；边界是升序的，所以第一个
+/// 命中就是最紧的桶。
 const copy_bin_bounds = [_]usize{ 128, 256, 512, 1024, 2048, 4096 };
 const copy_bin_count = copy_bin_bounds.len + 1;
 
 
-/// One `copyRange` family: how many calls and how long they took on the host.
+/// 一个 `copyRange` 家族：调用了多少次，以及在主机上花了多久。
 const CopyBin = struct {
     n: u32 = 0,
     ns: u64 = 0,
-    /// Elements moved, summed -- divided by `n` it gives the per-call payload,
-    /// which is how a bucket reveals whether it is the 512-B per-head family or
-    /// a whole embedding row.
+    /// 搬运的元素总数；除以 `n` 就是每次调用的负载 —— 一个桶借此暴露出它是
+    /// 每头 512 B 的那一族，还是整行 embedding。
     elems: u64 = 0,
 };
 
-/// Tightest bucket for an element count (`copy_bin_count-1` = bigger than the
-/// last bound, e.g. a `kv_dim` cache write on the 27B).
+/// 给定元素个数对应最紧的那个桶（`copy_bin_count-1` = 大于最后一个边界，例如
+/// 27B 上的一次 `kv_dim` 缓存写）。
 fn copyBinOf(elems: usize) usize {
     for (copy_bin_bounds, 0..) |b, i| {
         if (elems <= b) return i;
@@ -969,38 +960,32 @@ fn copyBinOf(elems: usize) usize {
     return copy_bin_bounds.len;
 }
 
-/// Number of `Slot` entries; sizes `stat_ns_slot` / `stat_n_slot`.
+/// `Slot` 的条目数；用于给 `stat_ns_slot` / `stat_n_slot` 定尺寸。
 ///
-/// Spelled out rather than derived from `@typeInfo`: Zig 0.17 reworked
-/// `@typeInfo`, and `slotName`'s exhaustive `switch` already makes a forgotten
-/// enum member a compile error, so this only has to stay in sync by being one
-/// past the last enumerator (`const_buf`).
+/// 写死而不是从 `@typeInfo` 推导：Zig 0.17 重做了 `@typeInfo`，而 `slotName` 的
+/// 穷尽 `switch` 已经让"漏掉一个枚举成员"变成编译错误，所以这里只需保持在最后
+/// 一个枚举值（`const_buf`）之后加一即可。
 const slot_count = @intFromEnum(Slot.const_buf) + 1;
 
-/// Event pairs available for `$QWEN35_PROF_GPU` per-slot device timing.  A decode
-/// token issues ~600 timed slot calls (measured: 599 on the 0.8B), so 1024 pairs
-/// cover one token with headroom; a token that overflows is counted in
-/// `stat_gpu_overflow` rather than dropped silently.
+/// `$QWEN35_PROF_GPU` 用于逐 slot 设备计时的 event 对数量。一个 decode token 会
+/// 发出约 600 次计时 slot 调用（0.8B 实测 599 次），所以 1024 对足够覆盖一个
+/// token 并有余量；溢出的 token 会计入 `stat_gpu_overflow`，而不是被静默丢弃。
 ///
-/// The 27B needs far more: a decode token issues ~2273 timed slot calls (measured
-/// from PROF-SLOT: 111k calls / 49 tokens).  With 1024 pairs the pool overflowed
-/// by 93566, so the PROF-GPU breakdown was unusable on 27B and the device-side
-/// attribution had to be inferred from QWEN35_ABLATE instead of measured.  4096
-/// pairs cover one 27B token with headroom.  This is a debug-only path
-/// (`$QWEN35_PROF_GPU` in the environment); the events are created lazily by
-/// `gpuEvEnsure` and destroyed on teardown, so raising it costs nothing at
-/// runtime outside a profiling run.
+/// 27B 需要的多得多：一个 decode token 发出约 2273 次计时 slot 调用（由
+/// PROF-SLOT 实测：111k 次调用 / 49 token）。1024 对时池子溢出了 93566，导致
+/// 27B 上的 PROF-GPU 明细不可用，设备侧的归因只能从 `QWEN35_ABLATE` 反推而无法
+/// 实测。4096 对可以带余量覆盖一个 27B token。这是一条只用于调试的路径（环境
+/// 变量 `$QWEN35_PROF_GPU`）；event 由 `gpuEvEnsure` 惰性创建、析构时销毁，所以
+/// 提高这个数在不做 profiling 时没有运行期代价。
 ///
-/// RAISED AGAIN: the 27B decode token issues ~2273 *timed* calls, but each
-/// call records a pair and the pool is also consumed by the draining slot, so
-/// 4096 still overflowed (measured: 7519 in one 60-token run, i.e. the
-/// attribution below 0.5 ms was being silently dropped).  16384 is the next
-/// power of two with real headroom; it costs 2 * 16384 * sizeof(cudaEvent_t)
-/// in the debug path only.
+/// 再次提高：27B decode token 发出约 2273 次**计时**调用，但每次调用会占一个对，
+/// 而池子还会被排空那个 slot 消耗，所以 4096 仍然溢出（实测：一次 60 token 的
+/// 运行溢出 7519，也就是 0.5 ms 以下的归因一直在被静默丢弃）。16384 是下一个有
+/// 真实余量的 2 的幂；它只在调试路径上花费 2 * 16384 * sizeof(cudaEvent_t)。
 const gpu_ev_capacity = 16384;
 
-/// Human-readable slot names for the `PROF-SLOT` line.  Indexed by
-/// `@intFromEnum`, so a `comptime`-checked length ties them to the enum.
+/// `PROF-SLOT` 那一行用的可读 slot 名。按 `@intFromEnum` 索引，所以一个
+/// `comptime` 校验过的长度把它们与枚举绑在一起。
 fn slotName(s: Slot) []const u8 {
     return switch (s) {
         .matvec => "matvec",
@@ -2057,21 +2042,17 @@ pub const CudaBackend = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// True when the cudart runtime is up.  The kernels need no analogous check:
-    /// they are link-time symbols, so their presence was settled by the build.
-    /// False (e.g. `--backend cuda` on a host without a GPU) is a hard error
-    /// reported from `allocScratch`, which is why no slot needs a CPU fallback.
-    /// The per-step control block (plan §1.5, `cell`).  ONE device buffer holds
-    /// every scalar a captured kernel needs to read at execution time:
+    /// 每步的控制块（计划 §1.5 的 `cell`）。**一块**设备缓冲装着捕获下来的
+    /// kernel 在执行时需要的每一个标量：
     ///
-    ///   [XD_CTL_POS]        rope phase base
-    ///   [XD_CTL_BASE_BITS]  bit pattern of the rope theta
-    ///   [XD_CTL_KV_SLOT]    first KV row this step writes
-    ///   [XD_CTL_ATTN_SLOT]  last KV row full attention must cover
-    ///   [XD_CTL_ROWS]       rows this step produces
+    ///   [XD_CTL_POS]        rope 的相位基准
+    ///   [XD_CTL_BASE_BITS]  rope theta 的位模式
+    ///   [XD_CTL_KV_SLOT]    这一步写入的第一行 KV
+    ///   [XD_CTL_ATTN_SLOT]  full attention 必须覆盖到的最后一行 KV
+    ///   [XD_CTL_ROWS]       这一步产生多少行
     ///
-    /// Allocated lazily; null only if the allocation failed, in which case every
-    /// consumer falls back to its per-scalar (capture-unsafe) path.
+    /// 惰性分配；只有分配失败时才为 null，那时每个消费方退回自己那套
+    /// 逐标量（capture 不安全）的路径。
     fn ensureCtl(self: *CudaBackend) ?*anyopaque {
         if (self.ctl_dev) |p| return p;
         const cu = &(self.cu orelse return null);
@@ -2103,13 +2084,12 @@ pub const CudaBackend = struct {
         return p;
     }
 
-    /// Publish the control block for THIS step on `stream` and remember it.
+    /// 把**这一步**的控制块发布出去，并记住它。
     ///
-    /// Idempotent per distinct value set: `rope64` is called once per head and
-    /// publishes the same `{pos, base}` 448 times on the 27B, so the host mirror
-    /// short-circuits all but the first.  `force` bypasses that (a new step must
-    /// re-publish even if the values happen to repeat, because the graph's other
-    /// nodes may read them before `rope64` is reached).
+    /// 对同一组值幂等：`rope64` 每个 head 调一次，在 27B 上会把同样的
+    /// `{pos, base}` 发布 448 次，所以主机镜像会把第一次之外的都短路掉。
+    /// `force` 绕过这个短路（新的一步必须重新发布，即使值碰巧重复 —— 图里
+    /// 其它节点可能在 `rope64` 被调用之前就读它们）。
     fn publishCtl(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
         _ = stream;
         if (!force and self.ctl_valid and std.meta.eql(self.ctl_host, ctl)) return true;
@@ -5012,14 +4992,13 @@ pub const CudaBackend = struct {
         reserved1: c_int = 0,
     };
 
-    /// Publish this token's sampler parameters into the device control block.
-    /// One 64-byte H2D onto the caller's stream; no kernel, no allocation.
+    /// 把这一步的采样参数发布进设备控制块：一次 64 字节 H2D，不发 kernel、
+    /// 不做分配。
     ///
-    /// `sp.seed` is not re-read every token: `Sampler.state` is the live PRNG
-    /// position, and it advances exactly once per drawn token (the kernel writes
-    /// the advanced value back into `rng_out_*`, which `dSample_body` copies into
-    /// `sp.state` when it collects the token).  Publishing `state` here is what
-    /// makes a replayed stream continue instead of restarting.
+    /// `sp.seed` 不是每个 token 都重读：`Sampler.state` 是活的 PRNG 位置，每抽
+    /// 一个 token 恰好推进一次（kernel 把推进后的值写回 `rng_out_*`，
+    /// `dSample_body` 收集 token 时再把它拷进 `sp.state`）。在这里发布 `state`
+    /// 正是"重放的流是接着往下走、而不是从头开始"的原因。
     fn publishSampleCtl(self: *CudaBackend, logits_len: usize, sp: *const sampler.Sampler, stream: ?*anyopaque) bool {
         _ = stream;
         const cu = &(self.cu orelse return false);
@@ -5078,22 +5057,20 @@ pub const CudaBackend = struct {
         return tok;
     }
 
-    /// Device sampling.
+    /// 设备采样。
     ///
-    /// The whole policy -- greedy argmax, temperature, top-k, top-p, PRNG advance
-    /// -- runs in `sample.cu`.  Two things matter about HOW it is invoked:
+    /// 整套策略 —— greedy argmax、temperature、top-k、top-p、PRNG 推进 —— 都在
+    /// `sample.cu` 里跑。调用方式上有两点要紧：
     ///
-    ///   * The launch goes to `launchStream()`, i.e. to the capture stream while a
-    ///     decode graph is being recorded, so the sampler becomes a node of that
-    ///     graph exactly like the matvecs.  On a replay the gate below suppresses
-    ///     the host launch because the graph already contains it.
-    ///   * The result is NOT downloaded here on the captured path.  A D2H cannot
-    ///     be captured; `stepEnd` performs it after the graph has been closed, and
-    ///     `sampledToken` hands the value to the engine.  On the direct path the
-    ///     download happens immediately and `sampledToken` is the identity.
+    ///   * 发射走 `launchStream()`，也就是录制 decode 图时的那条 capture 流，
+    ///     于是采样器像 matvec 一样成为那张图的一个节点。重放时下面的门控会
+    ///     抑制主机侧发射，因为图里已经包含它了。
+    ///   * 捕获路径上**不**在这里下载结果。D2H 无法被捕获；由 `stepEnd` 在图
+    ///     关闭之后执行它，`sampledToken` 再把值交给引擎。直接发射路径上下载
+    ///     当场发生，`sampledToken` 是恒等。
     fn dSample_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
-        // A/B switch: run the CPU reference sampler on the GPU's own logits.
+        // A/B 开关：在 GPU 自己产出的 logits 上跑 CPU 参照采样器。
         //
         // This is the ONLY way to compare the two samplers end to end, because
         // every other comparison runs into the CPU/CUDA matvec divergence first
@@ -5109,16 +5086,15 @@ pub const CudaBackend = struct {
             self.graphAbandon("QWEN35_CUDA_SAMPLE_CPU inside a capture");
         }
         if (self.sample_cpu_ab) {
-            // The CPU sampler indexes the row directly, so it needs a HOST copy:
-            // `logits` is a device pointer here.  `h_sample_ab` is grown on
-            // demand and reused, and the copy is blocking -- this whole branch is
-            // a debug A/B, never the compute path.
+            // CPU 采样器直接对行下标，所以它需要一份**主机**副本：这里 `logits`
+            // 是设备指针。`h_sample_ab` 按需增长并复用，拷贝是阻塞的 —— 整个
+            // 分支都是调试用 A/B，永远不是计算路径。
             if (!self.ensureSampleAbHost(logits.len)) {
                 return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
             }
             const dst = self.h_sample_ab.?[0..logits.len];
-            // Inlined blocking D2H (`dCopyToHost_body` is a sibling struct's
-            // method and is not reachable by name from here).
+            // 内联的阻塞 D2H（`dCopyToHost_body` 是同级结构体的方法，从这里按名
+            // 字够不到）。
             const cu = &(self.cu orelse return cpu_mod.CpuBackend.vtable.sample(
                 .{}, @ptrCast(&self.cpu), logits, scratch, sp,
             ));
@@ -5133,9 +5109,9 @@ pub const CudaBackend = struct {
                 return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
             }
             const host_row = backend.Buf.wrap(dst);
-            // `scratch` reaches the CPU sampler too, and the engine's copy is a
-            // DEVICE buffer when this backend is in use; hand the reference a
-            // host scratch of the same length or it will sort a device pointer.
+            // `scratch` 也会传给 CPU 采样器，而这个后端在用的时候引擎给的那份
+            // 是**设备**缓冲；不给参照一份同样长度的主机 scratch，它就会去排序
+            // 一个设备指针。
             if (self.h_sample_ab_scratch == null or self.h_sample_ab_scratch.?.len < logits.len) {
                 const alloc = std.heap.page_allocator;
                 if (self.h_sample_ab_scratch) |b| alloc.free(b);
@@ -5147,23 +5123,22 @@ pub const CudaBackend = struct {
                 .{}, @ptrCast(&self.cpu), host_row, backend.Buf.wrap(hs[0..logits.len]), sp,
             );
         }
-        // The device sampler owns its own scratch (`d_sample_scratch`); the
-        // engine-provided one is only needed by the CPU fallbacks below.
+        // 设备采样器有自己的 scratch（`d_sample_scratch`）；引擎提供的那份只有
+        // 下面的 CPU 回退路径才需要。
         if (self.cu == null or logits.len == 0) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // A live S1 graph ran the sampler on `g_stream` during its last replay;
-        // `sample` is still the one that hands the token back, so the download
-        // happens here.  (S3 replaces this with the graph's own control-block
-        // read inside `graphEnd`; until capture exists on the new path, the S1
-        // graph is never live and this branch is unreachable.)
+        // 活的 S1 图在上一次重放时已经在 `g_stream` 上跑过采样器了；仍然由
+        // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
+        // 自己在 `graphEnd` 里读控制块；在新路径上支持捕获之前，S1 图从不为
+        // live，这个分支不可达。）
         const replayed = self.gs().state == .live;
         if (replayed) {
             return self.collectSampledToken(sp);
         }
         // XG 重放：图已在 `graphBegin` 里 launch 完，采样参数也已经在那里发布
-        // 到映射块（见 `xdPhaseBegin`）。这里**什么都不能再写** —— 尤其不能再
-        // `publishSampleCtl`，那条路径会把映射块整体重置，正好覆盖图刚写下的
+        // 进设备控制块（见 `dGraphBegin`）。这里**什么都不能再写** —— 尤其不能
+        // 再 `publishSampleCtl`，那条路径会把控制块整体重置，正好覆盖图刚写下的
         // `CTL_FLAGS` 与 `CTL_TOKEN_OUT`（实测：重放后 token 永远读回 0）。
         if (g.replayed) {
             self.sample_sp = sp;
@@ -5177,7 +5152,7 @@ pub const CudaBackend = struct {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         self.sample_sp = sp;
         self.sample_vocab = logits.len;
-        const stream = self.launchStream(); // capture stream while recording
+        const stream = self.launchStream(); // 录制期间就是 capture 流
         // 录制期不再从这里发布：`cudaMemcpyAsync` 落在 capture 区间内会被录成
         // 一个 **memcpy 节点**，重放时把录制那一步的参数写回设备块（实测：
         // `QWEN35_XD_NODES` 报出 1 个 non-kernel 节点，正是它）。参数已由
@@ -5202,7 +5177,7 @@ pub const CudaBackend = struct {
         return self.sampled;
     }
 
-    /// The token from the current step's `sample`, after `stepEnd` downloaded it.
+    /// 本步 `sample` 产出的 token，在 `stepEnd` 把它下载回来之后可用。
 
     // ==== slots: the two state machines (P2c) ===============================
     //
