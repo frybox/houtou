@@ -3294,9 +3294,8 @@ pub const CudaBackend = struct {
         const cu = &self.cu.?;
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
 
-        // Device activation pointer: the resident buffer when the call site is
-        // already device-side (the whole per-token path), otherwise a one-shot
-        // upload into `d_act` (first use of a host-only tensor).
+        // 设备激活指针：调用点本来就在设备侧时（整条逐 token 路径）用常驻缓冲，
+        // 否则一次性上传到 `d_act`（首次使用只在主机上的张量）。
         const d_x: [*]const f32 = blk: {
             if (dBufPtr(xBuf)) |p| break :blk @ptrCast(p);
             if (xBuf.len != 0) self.uploadAct(xBuf.slice());
@@ -3350,8 +3349,8 @@ pub const CudaBackend = struct {
                         self.clearDevBuf(outBuf);
                         return;
                     }
-                    // This branch downloads the result, which abandons any open
-                    // capture via `dCopyToHost`; no separate check needed.
+                    // 这个分支会下载结果，而下载会经 `dCopyToHost` 放弃任何已经
+                    // 打开的 capture；不需要另外检查。
                 }
                 self.stat_ns_matvec += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(gguf.TensorType.f32)] += 1;
@@ -3368,10 +3367,9 @@ pub const CudaBackend = struct {
                 const rows = q.rows;
                 std.debug.assert(xBuf.len >= cols and outBuf.len >= rows);
 
-                // f16/bf16: no activation quantization, no f32 weight copy.  The
-                // weights are resident in their native 2-byte form and the kernel
-                // widens them element by element against the engine's f32
-                // activation (`q35_k_mul_mat_vec_w16` in mmvq.cu).
+                // f16/bf16：不做激活量化，也不拷 f32 权重。权重以原生 2 字节
+                // 形态常驻，kernel 拿它们逐元素对齐引擎的 f32 激活做加宽
+                // （mmvq.cu 的 `q35_k_mul_mat_vec_w16`）。
                 if (q.ttype == .f16 or q.ttype == .bf16) {
                     const rcw = self.launchW16(g, e.dev, d_x, q.ttype, rows, cols, 1, outBuf);
                     if (rcw != cudart.cudaSuccess) {
@@ -3397,27 +3395,23 @@ pub const CudaBackend = struct {
                     self.clearDevBuf(outBuf);
                     return;
                 };
-                // QUANTISE ONCE PER (source, width, activation FAMILY), not once
-                // per matvec.  The engine hands every matvec of one phase the
-                // SAME activation buffer (measured on the 27B: 497 matvecs per
-                // token touch exactly 3 distinct buffers), and the packed form
-                // depends only on the family -- `actFamily` collapses all 256-
-                // element block types onto one Q8_K layout -- so the same bytes
-                // were being re-quantised up to a hundred times per token.
+                // 每个（来源、宽度、激活**族**）只量化一次，而不是每个 matvec
+                // 一次。引擎给同一阶段的每个 matvec 传的是**同一个**激活缓冲
+                // （27B 实测：一个 token 的 497 次 matvec 只碰 3 个不同的缓冲），
+                // 而打包形态只取决于族 —— `actFamily` 把所有 256 元素块类型都
+                // 归到同一个 Q8_K 布局 —— 于是同一批字节曾在一个 token 里被重复
+                // 量化上百次。
                 //
-                // Why it matters: the quantize is a launch on the CRITICAL PATH
-                // ahead of the matvec, so the GPU cannot start the 60+ us of
-                // weight traffic until it drains.  Measured on 17408x5120
-                // iq3_xxs: matvec alone 54.9 us (666 GB/s), matvec behind its
-                // own quantize 75.2 us (486 GB/s) -- a third of the bandwidth
-                // lost to duplicated work.
+                // 为什么这件事要紧：量化是排在 matvec **关键路径**上的一次发射，
+                // 它排空之前 GPU 起不了那 60 多微秒的权重流量。17408x5120 的
+                // iq3_xxs 实测：单独 matvec 54.9 us（666 GB/s），matvec 排在它
+                // 自己的量化之后 75.2 us（486 GB/s）—— 三分之一的带宽丢在重复
+                // 工作上。
                 //
-                // Sound because a matvec only READS `x` (engine.zig writes the
-                // projections into other buffers) and `stepBegin` clears this
-                // cache every token.  Keying on the family rather than on the
-                // ttype is what makes it legal: q4_k / iq4_xs / iq3_xxs all take
-                // the same Q8_K activation, so switching between them must NOT
-                // invalidate it.
+                // 之所以成立，是因为 matvec 只**读** `x`（engine.zig 把投影写进
+                // 别的缓冲），且 `stepBegin` 每 token 清一次这个缓存。按族而不是
+                // 按 ttype 做键，正是它合法的原因：q4_k / iq4_xs / iq3_xxs 用的
+                // 是同一个 Q8_K 激活，所以在它们之间切换**不能**让它失效。
                 const fam = cpu_mod.actFamily(q.ttype);
                 const _hit = self.actQValid(d_x, fam, cols);
                 if (cudart.getenv("QWEN35_QSTAT") != null) {
@@ -3432,7 +3426,7 @@ pub const CudaBackend = struct {
                     self.actQMark(d_x, fam, cols);
                 }
                 if (dBufPtr(outBuf)) |pd| {
-                    // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
+                    // 实参顺序照 api.h：(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream)。
                     const rc = Launch.mul_mat_vec(g, 
                         e.dev,
                         self.d_xq,
@@ -3475,8 +3469,8 @@ pub const CudaBackend = struct {
                         self.clearDevBuf(outBuf);
                         return;
                     }
-                    // As above: `downloadOut` runs the blocking D2H that
-                    // abandons the capture, so nothing extra is needed here.
+                    // 同上：`downloadOut` 会执行那次阻塞 D2H，而它本身就会放弃
+                    // capture，所以这里不需要额外动作。
                 }
                 self.stat_ns_matvec += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
@@ -3486,20 +3480,19 @@ pub const CudaBackend = struct {
                     self.reportStats("matvec");
                 }
                 if (cudart.getenv("QWEN35_PROF") != null and self.stat_n_matvec == 1) {
-                    // `reportProfile` has no call site on the CLI path and the engine
-                    // is arena-allocated (so `deinit` never runs).  Announce the device
-                    // once, on the first GPU matvec: the observable proof the kernel
-                    // ran instead of a host fallback.
+                    // `reportProfile` 在 CLI 路径上没有调用点，而引擎是 arena
+                    // 分配的（所以 `deinit` 从不执行）。于是在第一次 GPU matvec 上
+                    // 报一次设备信息：这是"kernel 真的跑了、没有回退到主机"的
+                    // 可观测证据。
                     self.reportStats("first gpu matvec");
                 }
                 self.mvCheck(outBuf, q, xBuf);
             },
         }
-        // `$QWEN35_SYNC`: strictly serialize after every matvec.  Purely a
-        // diagnostic for the coherency question -- if a result ever depended on
-        // an unsynchronized producer, inserting this barrier makes the bug
-        // appear/disappear deterministically.  Not needed for correctness:
-        // every launch and every copy in this file is on the default stream,
+        // `$QWEN35_SYNC`：每次 matvec 之后严格串行化。纯粹是用来回答一致性问题的
+        // 诊断开关 —— 如果某个结果依赖了一个没同步的生产者，插入这道屏障会让
+        // 那个 bug 确定性地出现或消失。正确性上并不需要：本文件的每次发射和每次
+        // 拷贝都在同一条流上，
         // which orders them, and each `cudaMemcpy` is the synchronous form, so
         // it blocks until all prior work finished.
         if (self.sync_debug) _ = self.cu.?.lib.DeviceSynchronize();
@@ -4117,24 +4110,24 @@ pub const CudaBackend = struct {
             cpu_mod.CpuBackend.vtable.kvAppend(.{}, @ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
             return;
         }
-        // `dst` is the layer's WHOLE region (an f32 view); the cache row for
-        // `slot` is `slot * row_bytes` bytes past the base.
+        // `dst` 是这一层的**整块**区域（f32 视图）；第 `slot` 行的起始位置是
+        // 基址之后 `slot * row_bytes` 字节。
         const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst.ptr));
         const out_ptr: [*]u8 = dst_bytes + slot * row_bytes;
         // 行号一律从**设备控制块**读（`XD_CTL_KV_SLOT`），capture 与 replay 都走
-        // 这条路。控制块是映射主机内存（见 `ensureCtl`），节点实参固定、内容
-        // 每步刷新，所以录进图的 `k_kv_quant_dslot` 在重放时读到的是**当步**
-        // 的行号。
+        // 这条路，且覆盖全部量化 KV 类型（f16 / q8_0 / q4_0）。节点实参固定、
+        // 控制块每步由主机刷新，所以录进图的 `k_kv_quant_dslot` 在重放时读到的
+        // 是**当步**的行号。
         //
-        // 旧的 `out_ptr = base + slot * row_bytes` 写法只在 `state == .live`
-        // 时才切到设备行号，capture 期把录制那一步的指针固化进图 —— 实测：
-        // 每次重放都往 KV[17] 覆盖写，attn 读 0..pos 拿到旧行，第二次重放起
-        // logits 全错。
-        // 所有量化 KV 类型（f16 / q8_0 / q4_0）都走这条路：行号在 kernel 内从
-        // 控制块读，节点实参固定。以前只有 f16 走，q8_0/q4_0 会落回下面的
-        // `kv_quant(..., out_ptr, ...)` —— 那个 `out_ptr` 在主机侧算好，捕获后
-        // 永远是录制那一步的行（实测：`--kv-type q8_0` 时 XG 与直接发射从第
-        // 十几个 token 起分叉，f32/f16 已经完全一致）。
+        // 两条历史教训：
+        //   * 旧的 `out_ptr = base + slot * row_bytes` 写法只在 `state == .live`
+        //     时才切到设备行号，capture 期把录制那一步的指针固化进图 —— 实测：
+        //     每次重放都往 KV[17] 覆盖写，attn 读 0..pos 拿到旧行，第二次重放
+        //     起 logits 全错。
+        //   * 只让 f16 走这条路也不够：q8_0/q4_0 会落回下面的
+        //     `kv_quant(..., out_ptr, ...)`，而 `out_ptr` 是主机侧算出的行地址，
+        //     捕获后永远是录制那一步的行（实测：`--kv-type q8_0` 时 XG 与直接
+        //     发射从第十几个 token 起分叉，而 f32/f16 已经逐位一致）。
         if (rows == 1 and self.ctl_dev != null) {
             const nbp = @as(c_int, @intCast(kv_dim / 32));
             const rc0 = Launch.kv_quant_dslot(g, src.ptr, @ptrCast(dst_bytes),
@@ -4142,9 +4135,6 @@ pub const CudaBackend = struct {
                 @intCast(row_bytes), kind, self.launchStream());
             if (rc0 == cudart.cudaSuccess) return;
             self.ewLaunchFail("kv_quant_dslot", rc0);
-        }
-        // Record the captured destination (row `slot`) for graph retargeting.
-        if (self.capturing() and rows == 1) {
         }
         const rc = Launch.kv_quant(g, src.ptr, @ptrCast(out_ptr), @intCast(nblocks), kind, self.launchStream());
         if (rc == cudart.cudaSuccess) return;
