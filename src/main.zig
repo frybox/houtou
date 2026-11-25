@@ -1834,13 +1834,17 @@ fn runInference(
     const res = if (spec_mtp) blk: {
         // MTP speculative decode: the model's own nextn block drafts.
         //
-        // GRAPH OFF, and before the prefill: `nextnPredict` is per-round and
-        // has no device-position twin, so a captured node would replay the first
-        // round's arguments -- and because the draft runs INSIDE the span the
-        // verify forward opened, that corrupts the verify too (measured: the
-        // first round verified token 0 instead of 119016).  See
-        // `CudaBackend.forceGraphOff`.
-        if (e.backendKind() == .cuda) houtou.backend_cuda.CudaBackend.forceGraphOff();
+        // 草稿块整段走"非 graph 管辖"的直发段（`VTable.graphDirect`），而不是
+        // 关掉图：关掉之后 decode 也失去图，实测 27B 128 token 从 54.4 掉到
+        // 41.0 tok/s（-25%）。草稿块每轮换嵌入 token、又跑在 verify 的调用栈
+        // 里，录进任何一张图都会重放第一轮的实参（旧机制实测：第一轮验证出
+        // token 0 而不是 119016），所以这一段必须直发；verify 与 decode 的图
+        // 不受影响。
+        if (e.backendKind() == .cuda) e.graphDirect(true);
+        // 离开直发段放在 `res` **之后**：`defer` 的作用域是块，而这一段要覆盖
+        // 整条 `generateSpec`（回滚重放里的 `gdnPrefillCore` 也在其中）。
+        // 无论走不走 MTP，退出后 decode 都恢复成可录制的状态。
+        defer if (e.backendKind() == .cuda) e.graphDirect(false);
         //
         // No external checkpoint, no code bridge, no tap ring: the head is one
         // extra layer that was trained jointly with the target, so it reads the

@@ -157,7 +157,8 @@ static_assert(offsetof(struct xd_node, derived) == 1200, "xd_node.derived moved"
 #define XD_CTL_KV_SLOT   2   // first KV row written by this step
 #define XD_CTL_ATTN_SLOT 3   // last KV row full attention must cover
 #define XD_CTL_ROWS      4   // rows this step produces
-#define XD_CTL_INTS      5
+#define XD_CTL_TOKEN     5   // 草稿块嵌入的 token id（只有 nextn 图用）
+#define XD_CTL_INTS      6
 
 static_assert(sizeof(int) == 4, "the control block is an int32 array");
 

@@ -101,6 +101,16 @@ int q35_launch_dequantize(int ttype, const void *d_src, float *d_dst, int nblock
 int q35_launch_dequantize_row(int ttype, const void *d_src_row, float *d_dst,
                               int cols, void *stream);
 
+// 行反量化，但**行号从每步控制块读**（`ctl[XD_CTL_TOKEN]`）。
+//
+// MTP 草稿块每轮/每链步换一个嵌入 token，而它的嵌入查表是对着设备权重做
+// `dequantize_row` 的。行号若作为 kernel 实参，就会被烧进捕捉下来的节点，
+// 重放永远嵌入第一轮那个 token（实测：前 16 个 token 与普通解码逐位一致，
+// 之后整段跑偏）。地址与列宽仍是常量，所以节点实参固定。
+int q35_launch_dequantize_row_dtoken(int ttype, const void *d_src_base,
+                                     float *d_dst, int cols, int row_bytes,
+                                     const int *d_ctl, void *stream);
+
 // --- matvec (src/kernels/cuda/mmvq.cu) -------------------------------------
 // out[t*rows + r] = W[r] . xq[t] for `tokens` activation rows.
 // `xq` must be quantized in the layout the type asks for: Q8_0 (34 B / 32

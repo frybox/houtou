@@ -89,6 +89,9 @@ const Kernels = struct {
     /// 一行，共 `cols` 个元素。行偏移由调用方在设备侧做指针算术完成（见
     /// `vDequantRow`），所以这里只需要 `cols`。
     extern fn q35_launch_dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// 同上，但行号从每步控制块读（`ctl[XD_CTL_TOKEN]`）。MTP 草稿块的嵌入用：
+    /// 那一行的行号每轮都变，不能作为 kernel 实参录进图。
+    extern fn q35_launch_dequantize_row_dtoken(ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
 
     /// 表驱动的量化 matvec：`d_out[t*rows + r] = W[r] . act_t`。
     /// 实参顺序照 api.h：rows、cols、tokens，**然后**才是 ttype。
@@ -305,6 +308,12 @@ const Launch = if (cuda_linked) struct {
     fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
+    }
+    /// 行号从每步控制块读的行反量化（MTP 草稿块的嵌入）。见 `api.h`：
+    /// 行号若是实参，录进图之后重放永远嵌入第一轮那个 token。
+    fn dequantize_row_dtoken(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_dequantize_row_dtoken(ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, stream);
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -544,6 +553,11 @@ const Launch = if (cuda_linked) struct {
     fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ ttype, d_src_row, d_dst, cols, stream };
+        return stubNoCudaKernels();
+    }
+    fn dequantize_row_dtoken(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+        _ = g;
+        _ = .{ ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, stream };
         return stubNoCudaKernels();
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
@@ -1708,9 +1722,10 @@ pub const CudaBackend = struct {
     //              must be redirectable to `g_stream`.
     //   live    -- `g_exec` holds a replayable graph.
 
-    /// The two graph slots.  `g_cur` selects which one `gs()` returns; the
-    /// decode path uses 0, the speculative verify path uses 1.
-    g_slots: [2]GraphSlot = .{ .{}, .{} },
+    /// 三张图的槽。`g_cur` 由 `xdPhaseBegin` 按 `Graph.kind` 选：
+    /// 0 = decode（1 行）、1 = chunk/verify（k 行）、2 = nextn（草稿块）。
+    /// 形状不同就不能共用一槽：节点集合一变，每步都要重捕，等于没有图。
+    g_slots: [3]GraphSlot = .{ .{}, .{}, .{} },
     /// `sample` 的结果。图活跃时由 `dSample` 留空（只有 kernel 进图），
     /// token 在 `graphEnd` 之后由 `dSampledToken` 读回时填入。
     sampled: u32 = 0,
@@ -1740,6 +1755,10 @@ pub const CudaBackend = struct {
     /// 上一次 `sample` 的 logits 长度。`dGraphBegin` 在 XG 重放前要用它发布
     /// 采样参数，而那时引擎还没调用本步的 `sample`。
     sample_vocab: usize = 0,
+    /// 草稿块录制期间记住这一趟的 f32 logits（`d_deq`）。`dSampledToken` 在图
+    /// 关闭后用一次阻塞 D2H 把它读回主机、交给 CPU 采样器算 token。
+    /// 用完即清；其余路径为 null。
+    sample_logits: ?*anyopaque = null,
 
 
     d_kv_slot: ?*anyopaque = null,
@@ -2225,26 +2244,6 @@ pub const CudaBackend = struct {
         return on;
     }
 
-    /// Turn the decode graph off for the rest of the process.
-    ///
-    /// For op sequences that cannot be captured at all.  The MTP drafter is the
-    /// case that forced this: `nextnPredict` runs a full layer with per-round
-    /// `next_token`/`draft_pos` into the drafter's own KV slot, and there is no
-    /// device-position twin to retarget, so a captured node would replay the
-    /// first round's arguments forever.  Leaving the graph on does not merely
-    /// lose the speedup -- it corrupts the VERIFY forward too, because the
-    /// draft's nodes are recorded inside the same span the target's
-    /// `forwardLogits` opened (measured: the first round's verify returned
-    /// token 0 instead of 119016; `$QWEN35_CUDA_GRAPH=0` gave the right ids).
-    ///
-    /// Must run BEFORE the scratch reservation that arms the graph
-    /// (`rasterizeScratch` reads `graphWanted` once and caches it), which is why
-    /// the spec path calls it right after loading the engine, before any
-    /// prefill.
-    pub fn forceGraphOff() void {
-        g_graph_cached = false;
-    }
-
     /// `QWEN35_GDN_WY=0` forces the per-token GDN kernel (the reference the WY
     /// form was validated against); anything else, including unset, uses WY.
     /// Cached because it is read per GDN layer, ~50 times per prefill.
@@ -2294,8 +2293,6 @@ pub const CudaBackend = struct {
     /// is automatic, so requiring an opt-in would just hide it.  `=0` (or any
     /// of false/no/off) turns it fully off -- that is the A/B switch and the
     /// escape hatch, and with it set nothing below ever runs.
-    /// `graphWanted`'s memo.  Module-level (not a function-local `const S`)
-    /// so `forceGraphOff` can write the same cell.
     var g_graph_cached: ?bool = null;
     var g_xd_cached: ?bool = null;
 
@@ -3180,14 +3177,31 @@ pub const CudaBackend = struct {
         // namespace of those declarations -- see `Kernels` at the top of the file.
         const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
-        const d_row = src + row * row_bytes;
-        const rc = kern.dequantize_row(g,
-            @intCast(@backingInt(w.ttype)),
-            d_row,
-            d_out,
-            @intCast(cols),
-            self.launchStream(),
-        );
+        // 草稿块（`nextn` 图）的嵌入行号每轮都变。它不能作为实参：录进图之后
+        // 重放永远嵌入第一轮那个 token，所以改成从设备控制块读
+        // （`ctl[XD_CTL_TOKEN]`），实参只剩模型常量。decode 的嵌入在图外，
+        // 行号照旧走指针算术。
+        const rc = if (g.kind == .nextn and self.graphActive() and self.ctl_dev != null)
+            kern.dequantize_row_dtoken(
+                g,
+                @intCast(@backingInt(w.ttype)),
+                @ptrCast(e.dev),
+                d_out,
+                @intCast(cols),
+                @intCast(row_bytes),
+                self.ctl_dev.?,
+                self.launchStream(),
+            )
+        else blk: {
+            const d_row = src + row * row_bytes;
+            break :blk kern.dequantize_row(g,
+                @intCast(@backingInt(w.ttype)),
+                d_row,
+                d_out,
+                @intCast(cols),
+                self.launchStream(),
+            );
+        };
         if (rc != cudart.cudaSuccess) {
             if (self.capturing()) self.graphAbandon("dequantize_row launch failed");
             std.debug.print("cuda backend: dequantize_row({s}) launch failed: {s}\n", .{
@@ -5123,6 +5137,26 @@ pub const CudaBackend = struct {
         if (self.cu == null or logits.len == 0) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
+        // 直发段（MTP 草稿块）里的采样：没有图在管这一段，所以参数走阻塞 H2D
+        // 发布，kernel 照常发射，结果立刻 D2H 读回 —— 与图外 decode 完全同一条
+        // 路径，只是没有 capture 能让它被录进去。
+        if (self.g_direct) {
+            if (!self.ensureSampleBufs()) {
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+            }
+            const pdx = dBufPtr(logits) orelse
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+            self.sample_sp = sp;
+            self.sample_vocab = logits.len;
+            if (!self.publishSampleCtl(logits.len, sp, null)) return 0;
+            const rc_s = Launch.sample(backend.Graph.direct, pdx, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, null);
+            if (rc_s != cudart.cudaSuccess) {
+                self.ewLaunchFail("sample (direct)", rc_s);
+                return 0;
+            }
+            self.sampled = self.collectSampledToken(sp);
+            return self.sampled;
+        }
         // 活的 S1 图在上一次重放时已经在 `g_stream` 上跑过采样器了；仍然由
         // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
         // 自己在 `graphEnd` 里读控制块；在新路径上支持捕获之前，S1 图从不为
@@ -5139,6 +5173,14 @@ pub const CudaBackend = struct {
             self.sample_sp = sp;
             self.sample_vocab = logits.len;
             return 0;
+        }
+        // 录制期（草稿块）：这一趟的 f32 logits 常驻在 `d_deq` 里，`dSampledToken`
+        // 在 `graphEnd` 之后要拿它做那次阻塞 D2H。只记指针：它不随步变，也不会
+        // 在 capture 里过期（`graphReserve` 提前把它分配好了）。
+        if (self.graphActive() and self.gs().xd_capturing) {
+            self.sample_sp = sp;
+            self.sample_vocab = logits.len;
+            self.sample_logits = if (dBufPtr(logits) != null) self.d_deq else null;
         }
         if (!self.ensureSampleBufs()) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
@@ -6748,6 +6790,13 @@ pub const CudaBackend = struct {
         // 发布失败不是致命的：每个消费方都有逐标量回退，所以这一步照样跑（只是
         // capture 不安全，也就是它不会被录进图）。
         _ = self.publishCtl(ctl, null, true);
+        // 每种 kind 一张图：decode（1 行）、chunk/verify（k 行）、nextn（草稿块）。
+        // 节点集合不同，共用一槽会让每步都失配重捕。
+        self.g_cur = switch (kind) {
+            .decode => 0,
+            .chunk => 1,
+            .nextn => 2,
+        };
         const g = backend.Graph{ .kind = kind, .ctl = ctl };
 
         // XG 只服务 decode：prefill 的块长度是数据相关的，按形状建图会得到
@@ -6772,7 +6821,7 @@ pub const CudaBackend = struct {
         //
         // 引擎每步传的是同一个 `*Sampler`（`dSample_body` 里记下的
         // `sample_sp`），所以这里拿到的 temperature/top-k/top-p/PRNG 就是当步的。
-        if (self.gs().xd_phase == .live) {
+        if (self.gs().xd_phase == .live and kind == .decode) {
             if (self.sample_sp) |sp| {
                 if (self.d_sample_ctl != null) {
                     _ = self.publishSampleCtl(self.sample_vocab, sp, self.g_stream);
@@ -6804,6 +6853,31 @@ pub const CudaBackend = struct {
             if (self.g_stream) |st| _ = cu.lib.StreamSynchronize(st);
             if (cu.lib.StreamSynchronize(null) != cudart.cudaSuccess) _ = cu.lib.GetLastError();
         }
+        // 草稿块的采样器在 capture 期间**没有**被录进去（那不是 `sample.cu` 的
+        // 节点，而是 `argmax_batch`），所以结果得在这里用 CPU 参照从
+        // `d_deq` 里那份 f32 logits 算出来。读一次 `vocab` 个 float：草稿块
+        // 一轮只有一次，与 decode 的一 token 一次同量级。
+        if (self.sample_logits) |pl| {
+            if (self.h_sample_ab_scratch == null or self.h_sample_ab_scratch.?.len < self.sample_vocab) {
+                const alloc = std.heap.page_allocator;
+                if (self.h_sample_ab_scratch) |b| alloc.free(b);
+                self.h_sample_ab_scratch = alloc.alloc(f32, self.sample_vocab) catch null;
+            }
+            if (self.h_sample_ab_scratch) |hs| {
+                if (self.cu) |*cu| {
+                    if (cu.lib.Memcpy(hs.ptr, pl, self.sample_vocab * @sizeOf(f32), cudart.MemcpyDeviceToHost) == cudart.cudaSuccess) {
+                        const row = backend.Buf.wrap(hs[0..self.sample_vocab]);
+                        self.sampled = cpu_mod.CpuBackend.vtable.sample(
+                            .{}, @ptrCast(&self.cpu), row, backend.Buf.wrap(hs[0..self.sample_vocab]), sp,
+                        );
+                        self.sample_logits = null;
+                        return self.sampled;
+                    }
+                    _ = cu.lib.GetLastError();
+                }
+            }
+            self.sample_logits = null;
+        }
         self.sampled = self.collectSampledToken(sp);
         return self.sampled;
     }
@@ -6814,6 +6888,38 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         self.io = io;
         self.cpu.exec().setThreads(io, nt);
+    }
+
+    /// 进入/离开"图外的直发段"（MTP 草稿块）。见 `VTable.graphDirect`。
+    ///
+    /// 进入：关掉当前正在录的 capture（把已录的节点丢掉、改用直发，原因见
+    /// `graphAbandon`），并让每种 kind 的图都转成 `.off` —— 草稿块每轮换嵌入
+    /// token，它的节点实参无法固化成常量，录进去只会重放第一轮。
+    ///
+    /// 这不只是"少录一段"的问题：草稿块跑在 verify 的 `forwardChunk` 调用栈
+    /// **里面**，旧机制下它的节点会被记进 verify 那张图（实测：第一轮就验证出
+    /// token 0 而不是 119016）。整段直发还它本来该有的样子。
+    ///
+    /// 离开：清掉"图断了"的标记。下一次 `graphReserve` 会重新把 decode 置回
+    /// `.rec`（幂等），于是草稿块的代价不泄漏到 decode。
+    fn dGraphDirect(ctx: *anyopaque, on: bool) void {
+        const self = self_(ctx);
+        if (on) {
+            if (self.gs().xd_capturing) self.graphAbandon("direct span (MTP draft)");
+            for (&self.g_slots) |*s| {
+                if (s.xd_phase != .off or s.xd_gexec != null) {
+                    if (s.xd_gexec) |e| {
+                        if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
+                    }
+                    s.xd_gexec = null;
+                }
+                s.xd_phase = .off;
+            }
+            self.g_direct = true;
+            return;
+        }
+        self.g_direct = false;
+        if (self.gs().xd_phase == .off and xdWanted()) self.gs().xd_phase = .rec;
     }
 
     /// prefill 循环的结束点：主机侧唯一能确知"prefill 已经做完"的地方。这里记录
@@ -7772,6 +7878,7 @@ pub const vtable = backend.Exec.VTable{
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
     .graphBegin = CudaBackend.dGraphBegin,
     .graphEnd = CudaBackend.dGraphEnd,
+    .graphDirect = CudaBackend.dGraphDirect,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .profReport = CudaBackend.dProfReport,

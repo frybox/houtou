@@ -15,6 +15,7 @@
 const std = @import("std");
 const reg = @import("graph_registry.zig");
 const xd = @import("xd.zig");
+const backend = @import("backend.zig");
 
 // ---------------------------------------------------------------------------
 // 状态机
@@ -95,8 +96,22 @@ test "registry: disableAll turns every graph into the direct path" {
 // ---------------------------------------------------------------------------
 
 test "GraphCtl is a 64-byte control block" {
+    // `graph_registry.GraphCtl`（S1 的 registry 布局）仍然按 64 B 一次刷完；
+    // 真正接在设备上的那块是 `backend.GraphCtl`（6 个 int32），见下一条用例。
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(reg.GraphCtl));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(reg.GraphCtl));
+}
+
+test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 同为 6 个 int32" {
+    // 设备控制块是 `int32_t[XD_CTL_INTS]`。Zig 侧多一个字段就是读写相邻内存，
+    // 少一个则 `tok` 读不到（MTP 草稿块会永远嵌入第一轮那个 token）。
+    try std.testing.expectEqual(@as(usize, 6), @sizeOf(backend.GraphCtl) / 4);
+    try std.testing.expectEqual(@as(usize, 4), @alignOf(backend.GraphCtl));
+    // 字段顺序即控制块布局：tok 必须是第 6 个（下标 5）。
+    var ctl = backend.GraphCtl{};
+    ctl.tok = 12345;
+    const ints: [*]const i32 = @ptrCast(&ctl);
+    try std.testing.expectEqual(@as(i32, 12345), ints[5]);
 }
 
 test "xd.Slot matches xd.h's xd_slot" {

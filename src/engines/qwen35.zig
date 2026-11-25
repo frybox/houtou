@@ -2496,6 +2496,35 @@ pub const Engine = struct {
         const li = nn.li;
         const lw = &self.layers[li];
 
+        // 草稿块这一趟自己的图。它是**独立的一槽**（`GraphKind.nextn`）：
+        // 节点集合与 decode 不同（反量化的是嵌入行、下一层是 nextn 层），
+        // 共用会让两边每步都失配重捕。
+        //
+        // 逐轮变化的量只有嵌入 token（`tok`，设备控制块里读）和位置
+        // （`pos`/`kv_slot`/`attn_slot` 三个标量，同样走控制块），所以第一次
+        // 之后每轮就是一次 `GraphLaunch`。
+        //
+        // 草稿块的算子本身 capture 安全：嵌入走 `dequantize_row_dtoken`（行号从
+        // 控制块读），其余是 matvec / rmsnorm / attention 的设备位置形态。
+        // 但**在 CUDA 上它仍在直发段里跑**：`main.zig` 的 MTP 分支先用
+        // `graphDirect(true)` 把整段草稿包起来，于是这里的 `graphBegin` 拿到的是
+        // 直通图 —— 原因见 `VTable.graphDirect`（草稿块跑在 verify 的调用栈里，
+        // 旧机制会把它录进 verify 那张图）。`.nextn` 这一 kind 因此只在没有
+        // CUDA 图的后端上真正成立；控制块的 `tok` 字段留给将来直接建这张图用。
+        const saved = self.graph;
+        self.graph = self.exec.graphBegin(.nextn, .{
+            .pos = draft_pos,
+            .rope_base_bits = @bitCast(c.rope_freq_base),
+            .kv_slot = draft_pos,
+            .attn_slot = draft_pos,
+            .rows = 1,
+            .tok = next_token,
+        });
+        defer {
+            self.exec.graphEnd(&self.graph);
+            self.graph = saved;
+        }
+
         // h = eh_proj([enorm(e); hnorm(h)])  -- one matvec over a 2*hidden input.
         //
         // `enorm`/`hnorm` are RMSNorms, and they are applied to the two halves
@@ -2939,6 +2968,14 @@ pub const Engine = struct {
     /// Which backend this engine drives (debug/verification helpers use it).
     pub fn backendKind(self: *const Engine) backend.Kind {
         return self.backend_kind;
+    }
+
+    /// 进入/离开"图外直发段"。`main.zig` 的 MTP 分支用它把草稿块整段排除在
+    /// 任何 capture 之外：草稿块每轮换嵌入 token，录进图只会重放第一轮，而它
+    /// 又跑在 verify 的调用栈里，会把 verify 那张图一起污染。
+    /// 见 `backend.VTable.graphDirect`。
+    pub fn graphDirect(self: *Engine, on: bool) void {
+        self.exec.graphDirect(on);
     }
 
     /// Allocate a one-row hidden-state buffer (debug/verification helper).

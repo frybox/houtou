@@ -142,7 +142,18 @@ pub const LoadError = error{
 /// What shape of forward a graph captures.  **Decode** is the one-row forward
 /// (`forwardGdn`/`forwardFull`/`forwardMlp`); **chunk** is the K-row forward
 /// (`forwardChunkRun`), shared by prefill and by the speculative verify.
-pub const GraphKind = enum { decode, chunk };
+pub const GraphKind = enum {
+    /// 一个 token 的完整前向（`forwardLogits`）。
+    decode,
+    /// K 行 prefill 块（`forwardChunk`）。逐块建图，所以默认不录。
+    chunk,
+    /// MTP 草稿块（`nextnPredict`）：一轮/一个链步，1 行。
+    ///
+    /// 它和 decode 是**两张图**：节点集合不同（草稿块反量化的是嵌入行、
+    /// 走的是 nextn 层），共用一槽会让每步都失配重捕。逐轮变化的只有嵌入
+    /// token（走设备控制块的 `tok` 字段）和几个位置标量（同 decode）。
+    nextn,
+};
 
 /// Per-step scalars of one graph.  This is the HOST mirror of the device control
 /// block (`GraphCtlDev` in `src/kernels/cuda/xd.h`): the backend copies it to
@@ -169,12 +180,17 @@ pub const GraphCtl = extern struct {
     attn_slot: u32 = 0,
     /// Rows this step produces (1 for decode, k for a verify chunk).
     rows: u32 = 1,
+    /// 草稿块的嵌入 token。MTP 的 `nextnPredict` 每轮/每链步换一个，而它是对
+    /// 着**设备**权重做嵌入查表的（`embedTo`），所以地址不能烘进捕捉下来的
+    /// kernel 实参 —— 否则重放永远嵌入第一轮那个 token。只在
+    /// `GraphKind.nextn` 的图里有意义，其余图填 0。
+    tok: u32 = 0,
 };
 
 comptime {
-    // The device block is a `int32_t[GRAPH_CTL_INTS]`; this must stay 5 ints
+    // The device block is a `int32_t[GRAPH_CTL_INTS]`; this must stay 6 ints
     // wide.  Widening it needs the .cu side's array size changed in step.
-    std.debug.assert(@sizeOf(GraphCtl) == 5 * @sizeOf(i32));
+    std.debug.assert(@sizeOf(GraphCtl) == 6 * @sizeOf(i32));
     std.debug.assert(@alignOf(GraphCtl) == 4);
 }
 
@@ -621,6 +637,14 @@ pub const Exec = struct {
         graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl) Graph,
         graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
 
+        /// 进入/离开"图外的直发段"。
+        ///
+        /// 段内每个算子都真实发射，且没有任何 capture 在此期间打开 —— 这样
+        /// 一整套不属于任何可重放单元的算子（MTP 草稿块就是一个：它每轮换嵌入
+        /// token，节点实参无法固化成常量）就不会被前后某个 `graphBegin` 顺带
+        /// 录进去。默认实现是空操作（CPU 后端没有图）。
+        graphDirect: *const fn (ctx: *anyopaque, on: bool) void,
+
         /// The token this step's `sample` produced, valid AFTER `graphEnd`.
         ///
         /// `sample` runs INSIDE the graph span (it is the graph's last node) so a
@@ -902,6 +926,10 @@ pub const Exec = struct {
     }
     pub fn graphEnd(self: Exec, g: *Graph) void {
         self.vtable.graphEnd(self.ptr, g);
+    }
+    /// Enter / leave the "direct, never captured" span.  See `VTable.graphDirect`.
+    pub fn graphDirect(self: Exec, on: bool) void {
+        self.vtable.graphDirect(self.ptr, on);
     }
     /// See `VTable.sampledToken`: valid only after `graphEnd`.
     pub fn sampledToken(self: Exec) u32 {

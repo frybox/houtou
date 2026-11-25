@@ -1006,6 +1006,35 @@ extern "C" int q35_launch_dequantize_row(int ttype, const void *d_src_row,
                                       stream);
 }
 
+// 行号由**设备控制块**给出：`ctl[XD_CTL_TOKEN]` 是行号，行基址 = 表基址 +
+// 行号 * `row_bytes`。给 MTP 草稿块的嵌入用（见 api.h）。
+//
+// 为什么不能直接用 `q35_launch_dequantize_row`：那条路把行基址作为 kernel 实参，
+// 而草稿块每个链步都换一个 token —— 录进图之后重放永远嵌入第一轮那一个。
+// 这里实参是 `d_src_base`/`row_bytes`/`cols`/`ctl`，四个都是模型常量。
+//
+// `ttype == Q35_TT_F32` 没有反量化 kernel（源就是 f32），由下面的拷贝分支处理。
+extern "C" int q35_launch_dequantize_row_dtoken(int ttype, const void *d_src_base,
+                                                float *d_dst, int cols, int row_bytes,
+                                                const int *d_ctl, void *stream_v) {
+    if (cols <= 0) return (int)cudaSuccess;
+    if (d_ctl == nullptr || row_bytes <= 0) return (int)cudaErrorInvalidValue;
+    const int row = d_ctl[XD_CTL_TOKEN];
+    const unsigned char *src = (const unsigned char *)d_src_base + (size_t)row * (size_t)row_bytes;
+    if (ttype == Q35_TT_F32) {
+        const int threads = 128;
+        const int blocks = (cols + threads - 1) / threads;
+        q35_k_copy_f32<<<blocks, threads, 0, (cudaStream_t)stream_v>>>(
+            (const float *)src, d_dst, (cols + 31) / 32);
+        return (int)cudaGetLastError();
+    }
+    int block_elems = 0, block_bytes = 0;
+    if (!q35_quant_geom(ttype, &block_elems, &block_bytes)) return (int)cudaErrorInvalidValue;
+    (void)block_bytes;
+    if (cols % block_elems != 0) return (int)cudaErrorInvalidValue;
+    return q35_launch_dequantize_impl(ttype, src, d_dst, cols / block_elems, stream_v);
+}
+
 // ---------------------------------------------------------------------------
 // device kernel: MMQ activation quantizer (block_q8_1_mmq)
 // ---------------------------------------------------------------------------
