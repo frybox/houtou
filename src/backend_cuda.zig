@@ -2592,6 +2592,8 @@ pub const CudaBackend = struct {
         // note on `xd_launched`.  It is armed only when explicitly asked for,
         // so `QWEN35_CUDA_GRAPH=0` and the plain path stay the default.
         if (self.g_slots[0].xd_phase == .off and xdWanted()) self.g_slots[0].xd_phase = .rec;
+        // [V] chunk 槽 arm。
+        if (xdWanted()) self.g_slots[1].xd_phase = .rec;
     }
 
     /// Open the capture.  `pos` and `slot` are this token's values, recorded so
@@ -2652,7 +2654,8 @@ pub const CudaBackend = struct {
         // 在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7 的账本），所以
         // `.chunk` 一律直通，**不要把 `xd_phase` 置回 `.rec` 给它用**。
         // 这里把它挡在 open/instantiate 之前：否则每块都会录一张、上一张作废。
-        if (g.kind == .chunk) return g;
+        // [V] 放开 chunk：先只用一个槽，确认进 XG 后结果是否正确。
+        if (g.kind == .chunk and s.xd_phase == .off) return g;
         // 再防一次同槽重入：prefill 的尾巴块只有 1 个 token 时，
         // `forwardChunk` 会递归调用 `forwardLogits`，同一个槽里出现两次
         // `graphBegin`。第二次 `StreamBeginCapture` 会被运行时拒绝
