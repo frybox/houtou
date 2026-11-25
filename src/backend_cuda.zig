@@ -5442,20 +5442,19 @@ pub const CudaBackend = struct {
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
         if (graphGate(g)) return;
-        // `kcache`/`vcache` are the first `slot+1` rows of the layer's cache, so
-        // they are sized (slot+1)*kv_dim, not max_seq*kv_dim (the engine passes
-        // exactly that span).  `att` needs slot+1 floats.
+        // `kcache`/`vcache` 是本层 cache 的前 `slot+1` 行，所以它们的尺寸是
+        // (slot+1)*kv_dim 而不是 max_seq*kv_dim（引擎传的就是这段跨度）。`att`
+        // 需要 slot+1 个 float。
         //
-        // `heads * hd <= gout.len` and `q.len >= heads*hd` are the engine's
-        // contract; a violation is a bug, and the CPU reference's slicing would
-        // trap on it, so fall through to it rather than launch on bad sizes.
+        // `heads * hd <= gout.len` 与 `q.len >= heads*hd` 是引擎的契约；违反就是
+        // bug，CPU 参照在切片时会直接陷阱，所以宁可落到它那里，也不要在错误的
+        // 尺寸上发射。
         const nrows = slot + 1;
-        // The cache regions are f32 VIEWS over byte allocations, so a packed row
-        // is only `kvRowBytes/4` elements wide here.  Comparing against
-        // `nrows * kv_dim` rejected every quantized cache and dropped into the
-        // CPU reference, which then read DEVICE pointers on the host -- the
-        // 2026-11 prefill segfault (q8_0, slot0=1024).  `kv_dim` itself stays
-        // the kernel's logical row width; only the length check converts.
+        // cache 区域是**字节分配的 f32 视图**，所以一行打包数据在这里只有
+        // `kvRowBytes/4` 个元素宽。拿 `nrows * kv_dim` 去比会把每一种量化 cache
+        // 都判为不合格、落进 CPU 参照，而它会去读**设备**指针 —— 这就是 2026-11
+        // 那次 prefill 段错误（q8_0，slot0=1024）。`kv_dim` 本身仍是 kernel 的
+        // 逻辑行宽，只有长度检查这一处做换算。
         const cache_row_elems: usize = (backend.kvRowBytes(kv_dim, self.kv_type) + 3) / 4;
         if (self.cu != null and heads != 0 and hd != 0 and
             q.len >= heads * hd and gout.len >= heads * hd and
@@ -5467,17 +5466,14 @@ pub const CudaBackend = struct {
                         if (dBufPtr(vcache)) |pv| {
                             if (dBufPtr(att)) |patt| {
                                 if (dBufPtr(gout)) |pgout| {
-                                    // Take the DEVICE-slot path whenever this launch
-                                    // may be captured (or is being replayed).  On that
-                                    // path the node's arguments and its
-                                    // `shared_mem_bytes` are both constants, so the
-                                    // replay never calls `GraphExecKernelNodeSetParams`
-                                    // for it.  Measured on the 27B: retargeting this
-                                    // one node per layer per token cost 14.3 ms of a
-                                    // 33.8 ms token (43%), against 1.4 ms of actual
-                                    // kernel time.  The scalar-`slot` form stays for
-                                    // the direct path, where there is no node to
-                                    // retarget and the smaller shared block is free.
+                                    // 只要这次发射可能被捕获（或正在被重放），就走
+                                    // 设备 slot 路径。那条路上节点的实参和它的
+                                    // `shared_mem_bytes` 都是常量，所以重放永远不需要
+                                    // 为它调 `GraphExecKernelNodeSetParams`。27B 实测：
+                                    // 每层每 token 重定向这一个节点要花掉 33.8 ms
+                                    // 里的 14.3 ms（43%），而 kernel 实际只跑 1.4 ms。
+                                    // 标量 `slot` 形态留给直接发射路径 —— 那里没有
+                                    // 节点可重定向，较小的 shared 块是白拿的。
                                     // 判定必须覆盖**两套**机制：旧的 `state` 与
                                     // XG 的 `xd_phase`。只认 `state` 时，XG 的
                                     // `.live` 重放会落进标量 `slot` 分支 —— 那一
@@ -5487,38 +5483,32 @@ pub const CudaBackend = struct {
                                         (self.gs().state == .live or self.gs().state == .rec or self.graphActive());
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
-                                            // DO NOT publish `slot` here.  During
-                                            // capture `launchStream()` is the capture
-                                            // stream, so a publish issued now would
-                                            // become a graph NODE with this token's
-                                            // value baked into its arguments -- and on
-                                            // every replay that node would overwrite
-                                            // the fresh value `graphReplayInner`
-                                            // writes, pinning the whole graph to the
-                                            // capture token's KV length.  (Measured:
-                                            // the first 6 tokens matched, then the text
-                                            // diverged exactly when replay began, and
-                                            // the device cell read back the capture
-                                            // value.)  The publish lives in
-                                            // `graphReplayInner`, on `g_stream`,
-                                            // immediately before `GraphLaunch`.
+                                            // **不要**在这里发布 `slot`。capture 期间
+                                            // `launchStream()` 就是 capture 流，此时
+                                            // 发出的发布会变成一个图节点，把这个 token
+                                            // 的值烧进它的实参 —— 而每次重放那个节点都
+                                            // 会把新写的值覆盖掉，等于把整张图钉死在录制
+                                            // 那个 token 的 KV 长度上。（实测：前 6 个
+                                            // token 一致，正文恰好在重放开始时发散，
+                                            // 而设备控制块读回来的正是录制时的值。）
+                                            // 发布由 `dGraphBegin` 负责，它在
+                                            // `GraphLaunch` 之前、图外把控制块写好。
                                             const sslot = @as([*]c_int, @ptrCast(@alignCast(pdyn)));
-                                            // Prefer the SPLIT device-slot path when
-                                            // enabled: four constant-argument nodes,
-                                            // still zero retargeting, and the row
-                                            // walk is spread over `split` blocks per
-                                            // head instead of one.
+                                            // 启用时优先走切分版设备 slot 路径：四个
+                                            // 实参恒定的节点，仍然零重定向，而每个
+                                            // head 的行遍历摊到 `split` 个 block 上，
+                                            // 而不是一个。
                                             if (self.attn_split > 1) {
                                                 if (self.d_att_part) |ppart| {
                                                     const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
                                                     const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
                                                     const rcs = Launch.attn_decode_split_dyn(g, pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                                     if (rcs == cudart.cudaSuccess) {
-                                                        // FOUR nodes (score, softmax,
-                                                        // PV, reduce+gate), all
-                                                        // `.attn_dyn`-class: none is
-                                                        // ever retargeted.  The census
-                                                        // must see all four.
+                                                        // 四个节点（score、softmax、
+                                                        // PV、reduce+gate），都属于
+                                                        // `.attn_dyn` 类：没有一个会被
+                                                        // 重定向。节点普查必须看到全部
+                                                        // 四个。
                                                         return;
                                                     }
                                                     if (self.capturing()) self.graphAbandon("attn_decode split_dyn launch failed");
@@ -5527,32 +5517,30 @@ pub const CudaBackend = struct {
                                             }
                                             const rc = Launch.attn_decode_dyn(g, pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.kvKind(), self.launchStream());
                                             if (rc == cudart.cudaSuccess) {
-                                                // Counted, not recorded: the node is
-                                                // classified `.attn_dyn` and never
-                                                // retargeted, but `graphCaptureEnd`
-                                                // demands the census agree.
+                                                // 只计数、不记录：该节点被归为
+                                                // `.attn_dyn` 且从不重定向，但节点普查
+                                                // 要求记账一致。
                                                 return;
                                             }
                                             if (self.capturing()) self.graphAbandon("attn_decode dyn launch failed");
                                             self.ewLaunchFail("attn_decode_dyn", rc);
                                         }
                                     }
-                                    // `slot` (and only `slot`) changes per token: the
-                                    // cache POINTERS are fixed regions and the engine
-                                    // merely hands over a longer prefix of them, so a
-                                    // captured node stays valid as long as the kernel is
-                                    // told the new slot.  That is the one retarget.
+                                    // 逐 token 变化的只有 `slot`：cache 的**指针**是固定
+                                    // 区域，引擎只是交出一个更长的前缀，所以只要把新
+                                    // slot 告诉 kernel，捕获下来的节点就一直有效。
+                                    // 这就是那唯一的一次重定向。
                                     //
-                                    // With `$QWEN35_CUDA_ATTN_SPLIT` set, take the
-                                    // row-split variant instead: it divides BOTH row
-                                    // walks across that many blocks per head, because
-                                    // one block per head is 24 blocks on 114 SMs (21%)
-                                    // and every lane then walks all `n` rows serially
-                                    // (measured 33 GB/s on non-L2-resident KV caches).
+                                    // 设了 `$QWEN35_CUDA_ATTN_SPLIT` 时改走按行切分的
+                                    // 变体：它把**两条**行遍历都摊到每 head 那么多
+                                    // block 上 —— 因为每 head 单 block 在 114 SM 上只有
+                                    // 24 个 block（21%），此时每个 lane 串行走完 `n`
+                                    // 全部行（KV cache 不在 L2 时实测 33 GB/s）。
                                     if (self.attn_split > 1) {
                                         if (self.d_att_part) |ppart| {
                                             const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
-                                            // `d_att_prob`, NOT `patt`: see the field note.
+                                            // 用 `d_att_prob` 而**不是** `patt`：见该
+                                            // 字段的说明。
                                             const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
                                             const rc2 = Launch.attn_decode_split2(g, pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.kvKind(), self.launchStream());
                                             if (rc2 == cudart.cudaSuccess) return;
@@ -5563,9 +5551,8 @@ pub const CudaBackend = struct {
                                     if (rc == cudart.cudaSuccess) {
                                         return;
                                     }
-                                    // A failed launch cannot be part of a graph: the
-                                    // capture would then be missing a whole layer's
-                                    // attention.  Abandon rather than instantiate.
+                                    // 失败的发射不能进图：否则捕获下来的图会缺掉整整
+                                    // 一层的 attention。宁可放弃，也不要实例化。
                                     if (self.capturing()) self.graphAbandon("attn_decode launch failed");
                                     self.ewLaunchFail("attn_decode", rc);
                                 } else return;
@@ -5578,7 +5565,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.attnDecode(.{}, @ptrCast(&self.cpu), q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
-    // rope64: TWO paths, selected at runtime by `$QWEN35_CUDA_ROPE`.
+    // rope64：两条路径，由 `$QWEN35_CUDA_ROPE` 在运行期选择。
     //
     //   host   (DEFAULT, unchanged from before) -- D2H, `elementwise.zig`
     //          `applyRope64` on the CPU, H2D.  The one remaining D2H+H2D pair on
