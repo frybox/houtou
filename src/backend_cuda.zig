@@ -6721,31 +6721,27 @@ pub const CudaBackend = struct {
     }
 
     fn dSetTier(ctx: *anyopaque, tier_name: []const u8) void {
-        // The device has one implementation per format; the CPU ISA tier only
-        // affects the metadata loader now.  Accepted and ignored so `--tier` keeps
-        // its diagnostic value for that part.
+        // 设备上每种格式只有一份实现；CPU 的 ISA tier 现在只影响元数据加载器。
+        // 接受并忽略，好让 `--tier` 在那一部分保持诊断价值。
         _ = ctx;
         _ = tier_name;
     }
 
-    /// The explicit-compute-graph hooks.  S2 returns the pass-through graph:
-    /// capture/replay is wired in S3.  The CUDA backend keeps the S1 registry
-    /// alive so the A/B switch (`QWEN35_CUDA_GRAPH`) and the diagnostics still
-    /// describe what is going to happen.
+    /// 显式计算图（XG）的钩子。S2 返回直通图；捕获/重放在 S3 接线。CUDA 后端
+    /// 仍保留 S1 的 registry，好让 A/B 开关（`QWEN35_CUDA_GRAPH`）与诊断输出
+    /// 依然能描述"接下来会发生什么"。
     fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
         const self = self_(ctx);
         if (!self.gpuReady()) return .{ .kind = kind, .ctl = ctl };
-        // Publish this step's scalars BEFORE anything else runs.  This is the one
-        // place per step that can safely allocate the block (`cudaMalloc` inside
-        // a capture is illegal) and the one place that knows the step began.
+        // 在其它任何东西跑起来之前，先把这一步的标量发布出去。这是每步唯一能
+        // 安全分配控制块的地方（capture 区间内 `cudaMalloc` 非法），也是唯一
+        // 知道"这一步开始了"的地方。
         //
-        // The write goes on the DEFAULT stream here and the graph stream waits
-        // for it in `graphSyncFromDefault`; a non-graph step reads the block
-        // through its own stream order, which is the same stream.
+        // 这次写发生在图 launch 之前，图里的 kernel 只读那块设备内存；不带图的
+        // 步骤则按自己的流顺序读同一个块（同一条流）。
         //
-        // A failed publish is not fatal: every consumer has a per-scalar
-        // fallback, so the step still runs (capture-unsafe, i.e. it simply will
-        // not be recorded).
+        // 发布失败不是致命的：每个消费方都有逐标量回退，所以这一步照样跑（只是
+        // capture 不安全，也就是它不会被录进图）。
         _ = self.publishCtl(ctl, null, true);
         const g = backend.Graph{ .kind = kind, .ctl = ctl };
 
@@ -6808,29 +6804,25 @@ pub const CudaBackend = struct {
     }
 
     fn dSetThreads(ctx: *anyopaque, io: std.Io, nt: usize) void {
-        // Only the (non-computational) metadata loader runs on the host; the pool is
-        // otherwise unused, but the CPU backend is still told so its profile lines
-        // stay meaningful.
+        // 主机上只跑（非计算的）元数据加载器；线程池除此之外并不使用，但仍然转告
+        // CPU 后端，好让它的 profile 行保持有意义。
         const self = self_(ctx);
         self.io = io;
         self.cpu.exec().setThreads(io, nt);
     }
 
-    /// End of the prefill loop: the one point where "prefill" is known to have
-    /// finished on the host side.  Events recorded here are still ordered after
-    /// every prefill kernel in the default stream, so waiting for the end event
-    /// cannot truncate the span.
+    /// prefill 循环的结束点：主机侧唯一能确知"prefill 已经做完"的地方。这里记录
+    /// 的 event 仍然排在默认流里每一个 prefill kernel 之后，所以等这个结束 event
+    /// 不会把统计区间截短。
     fn dProfPrefillEnd(ctx: *anyopaque) void {
         const self = self_(ctx);
         self.closePrefillWindow();
     }
 
-    /// Open a decode step: the one place a CUDA graph can be recorded.
-    ///
-    /// The first step after a successful warm-up records; every later step
-    /// replays.  A step that cannot be captured or replayed simply runs as
-    /// direct launches -- `stepEnd` then does nothing, because no capture is
-    /// open and every `Launch.*` in the step already used the default stream.
+    // 注：这里原有两段悬空的 doc comment（"Open a decode step" /
+    // "Close a decode step"），它们描述的是已被删除的 S1 生命周期（含已经不存在
+    // 的 warm 阶段），重构后没有对应函数。真正的开/关逻辑见 `dGraphBegin` 与
+    // `dGraphEnd`。
 
     /// `VTable.selectGraphSlot`：切换 graph 状态槽。0 = decode，1 = verify。
     ///
@@ -6840,16 +6832,13 @@ pub const CudaBackend = struct {
     /// verify 的 graph 之外运行，这段里的每个 op 都必须真正执行。
 
 
-    /// Close a decode step: if this step was captured, instantiate the graph so
-    /// the NEXT step can replay it.
-
     fn dProfPhase(ctx: *anyopaque, on: bool) void {
         const self = self_(ctx);
         self.cpu.exec().profPhase(on);
-        // Safety net only: the prefill window is normally already shut by the
-        // first decode `matvec` (`closePrefillWindow` is idempotent).  This
-        // catches the degenerate run where prefill issued no decode matvec at
-        // all (e.g. `-n 0`), so the `CUDA-M [prefill done]` line still appears.
+        // 只是兜底：prefill 窗口通常已经被第一次 decode `matvec` 关掉
+        // （`closePrefillWindow` 幂等）。这里接住的是 prefill 一次 decode matvec
+        // 都没发过的退化情形（例如 `-n 0`），好让 `CUDA-M [prefill done]` 那一行
+        // 照样出现。
         if (!on) self.closePrefillWindow();
     }
 
