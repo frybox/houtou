@@ -1176,7 +1176,9 @@ fn runInference(
             var n: usize = plen;
             for (0..nsteps) |_| {
                 const tk = seq[n - 1];
-                _ = e.forwardChunk(&[_]u32{tk}, @intCast(n - 1));
+                // 单 token 不是块：`forwardChunk` 只处理 k > 1（它不预留单行
+                // 路径，单行要走 `forwardLogits` 的逐 token 前向）。
+                _ = e.forwardLogits(tk, @intCast(n - 1));
                 hiddens[n - 1] = try e.specTapNormedPlane(0, 1);
                 // greedy pick from the target's own logits
                 var best: u32 = 0;

@@ -308,6 +308,8 @@ fn graphGate(g: backend.Graph) bool {
     // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
     if (g.kind == .nextn) {
         const self = xg_backend orelse return g.replayed;
+        // 槽数组在堆上，分配失败时是空切片（见 `g_slots` 的注释）。
+        if (xg_cur_slot >= self.g_slots.len) return g.replayed;
         const s = self.g_slots[xg_cur_slot];
         if (s.xd_capturing) return false;
         if (s.xd_phase == .live) return true;
@@ -1200,6 +1202,25 @@ const kernel_max_args: usize = 24;
 /// 次数约 3000（`QWEN35_PROF` 各 slot 的 calls 之和），4096 留出余量。
 
 
+/// 每步设备控制块里 `kv_slot` 的 int 下标（`xd.h` 的 `XD_CTL_KV_SLOT`）。
+///
+/// 设备块是 `int32_t[6]`，字段顺序**必须**与 `backend.GraphCtl` 一致；那边
+/// 有 `@sizeOf` 断言，这里补一条顺序断言 —— 设备变体（如 `attn_chunk_dyn`）
+/// 按固定下标读它，错一位就是静默读到别的标量。
+const ctl_kv_slot: usize = 2;
+
+comptime {
+    // `GraphCtl` 里 `kv_slot` 的字节偏移必须正好是这个下标处的 i32。
+    const GC = @import("backend.zig").GraphCtl;
+    if (@offsetOf(GC, "kv_slot") != ctl_kv_slot * @sizeOf(c_int)) {
+        @compileError("ctl_kv_slot 与 GraphCtl 的字段顺序不符");
+    }
+}
+
+/// 槽数：decode / verify / nextn 各一张。槽号必须和 `engines/qwen35.zig` 的
+/// `graph_slot_*` 常量一致（引擎传进来，后端只做边界检查）。
+const graph_slot_count: usize = 3;
+
 /// One argument slot of a tracked kernel: `width` bytes of value storage, so a
 /// f32 (4) and a 64-bit pointer (8) both fit without a variant type.  Alignment
 /// is 8 because the widest thing stored is a pointer.
@@ -1207,9 +1228,10 @@ const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
 
 /// One graph's captured state.
 ///
-/// Two instances exist:
-///   * slot 0 -- the DECODE graph: one `forwardLogits` (1 row).
+/// Three instances exist:
+///   * slot 0 -- the DECODE graph: one `forwardLogitsSampled` (1 row).
 ///   * slot 1 -- the VERIFY graph: one `forwardChunkVerify` (k rows).
+///   * slot 2 -- the NEXTN graph: one MTP draft block (1 row).
 ///
 /// They cannot share one graph: the node set (and every `ne`/`nb` the
 /// backend compares in `graphUpdateRequired`) differs between a 1-row
@@ -1282,6 +1304,10 @@ const GraphSlot = struct {
     xd_launched: bool = false,
     /// capture 已经打开、尚未关闭。防止同一调用栈里重入 `graphBegin`。
     xd_capturing: bool = false,
+    /// 这一槽的图是按多少行录的（`GraphCtl.rows` 的原值）。只有 `.verify`
+    /// 需要它：它的行数是草稿块长度，逐轮会变，而一张图的节点数和 buffer
+    /// 行数都烘死在录制那一刻。
+    xd_rows: u32 = 0,
 };
 
 /// XG 一张图的状态。`warm` 是"下一步录制"（`absent → warm → live`），
@@ -1747,9 +1773,17 @@ pub const CudaBackend = struct {
 
     /// 三张图的槽。槽号由引擎经 `Graph.slot` 传进来（`xdPhaseBegin` 只看
     /// `g.slot`），后端没有"当前槽"这种全局状态：
-    /// 0 = decode（1 行）、1 = chunk/verify（k 行）、2 = nextn（草稿块）。
+    /// 0 = decode（1 行）、1 = verify（k 行）、2 = nextn（草稿块）。
     /// 形状不同就不能共用一槽：节点集合一变，每步都要重捕，等于没有图。
-    g_slots: [3]GraphSlot = .{ .{}, .{}, .{} },
+    ///
+    /// **堆上分配，不内联。** `GraphSlot` 里还留着旧机制的一大堆
+    /// `[graph_max_layers][kernel_max_args]` 参数数组，单个槽有上百 KB；三个
+    /// 内联进 `CudaBackend` 会把它撑到接近线程栈上限（`CpuBackend` 是按值嵌在
+    /// 引擎里的，引擎就活在主线程栈上）。实测：给槽加一个 4 字节字段就让
+    /// `CudaBackend.init` 在 `--backend cpu` 下段错误，地址紧贴栈顶
+    /// （0x7fff73e27e10）。`init` 里分配，失败时留空切片（`gs()` 的调用方都已
+    /// 做了边界检查）。
+    g_slots: []GraphSlot = &.{},
     /// `sample` 的结果。图活跃时由 `dSample` 留空（只有 kernel 进图），
     /// token 在 `graphEnd` 之后由 `dSampledToken` 读回时填入。
     sampled: u32 = 0,
@@ -1988,6 +2022,10 @@ pub const CudaBackend = struct {
             .cpu = cpu_mod.CpuBackend.init(alloc, g),
             .g = g,
         };
+        // 槽在堆上（见 `g_slots` 的注释）。分配失败留空切片：`gs()` 的调用方
+        // 都会先查边界，此时图一律直通，模型照常跑。
+        self.g_slots = alloc.alloc(GraphSlot, graph_slot_count) catch &.{};
+        for (self.g_slots) |*s| s.* = .{};
 
         // Ask cudart for the device before touching weights, so a host with no GPU
         // fails here (and `allocScratch` reports it) rather than after a partial
@@ -2323,6 +2361,7 @@ pub const CudaBackend = struct {
     /// 来（见 `backend.Graph.slot` 的说明 —— 嵌套 span 下全局当前槽会让外层
     /// `graphEnd` 收尾到错误的槽上）。
     inline fn gs(self: anytype, slot: u8) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
+        std.debug.assert(slot < self.g_slots.len);
         return &self.g_slots[slot];
     }
 
@@ -2433,7 +2472,7 @@ pub const CudaBackend = struct {
         for (self.g_slots) |s| {
             if (s.xd_phase == .rec) return self.g_stream;
         }
-        return switch (self.g_slots[0].state) {
+        return switch (self.gs(0).state) {
             .rec => self.g_stream,
             else => null,
         };
@@ -2591,9 +2630,10 @@ pub const CudaBackend = struct {
         // engine silently produced a garbled token stream -- see the "xg: replay"
         // note on `xd_launched`.  It is armed only when explicitly asked for,
         // so `QWEN35_CUDA_GRAPH=0` and the plain path stay the default.
-        if (self.g_slots[0].xd_phase == .off and xdWanted()) self.g_slots[0].xd_phase = .rec;
-        // [V] chunk 槽 arm。
-        if (xdWanted()) self.g_slots[1].xd_phase = .rec;
+        if (self.gs(0).xd_phase == .off and xdWanted()) self.gs(0).xd_phase = .rec;
+        // `.verify` 槽同样 arm：`forwardChunkVerify` 只在 MTP 下被调用，
+        // 不 arm 的话它永远停在 `.off`，第一轮录不到就再也不会重放。
+        if (xdWanted()) self.gs(1).xd_phase = .rec;
     }
 
     /// Open the capture.  `pos` and `slot` are this token's values, recorded so
@@ -2652,15 +2692,21 @@ pub const CudaBackend = struct {
         // prefill 的块长度是数据相关的（`min(nbatch, 剩余 token)`），而一张图
         // 只对一种行数成立；按形状建图最多要 nbatch-1 张。prefill 的发射开销
         // 在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7 的账本），所以
-        // `.chunk` 一律直通，**不要把 `xd_phase` 置回 `.rec` 给它用**。
-        // 这里把它挡在 open/instantiate 之前：否则每块都会录一张、上一张作废。
-        // [V] 放开 chunk：先只用一个槽，确认进 XG 后结果是否正确。
-        if (g.kind == .chunk and s.xd_phase == .off) return g;
-        // 再防一次同槽重入：prefill 的尾巴块只有 1 个 token 时，
-        // `forwardChunk` 会递归调用 `forwardLogits`，同一个槽里出现两次
-        // `graphBegin`。第二次 `StreamBeginCapture` 会被运行时拒绝
-        // （`cudaErrorStreamCaptureUnsupported` 401），而第一次开下的 capture
-        // 就永远没人关。
+        // prefill 一律直通 —— 它现在压根不经过这里（`forwardChunk` 自己不开
+        // span，只有 `forwardChunkVerify` 开 `.verify`）。
+        //
+        // `.verify` 走到这里只可能来自 `$QWEN35_XD_VERIFY=1`（默认不建图，
+        // 见 `dGraphBegin`）。它的行数逐轮会变，所以这里按 `rows` 校验：一张
+        // 图只对一种行数成立，行数变了必须重录，否则会重放一张节点数与 buffer
+        // 行数都不匹配的图 —— 那是静默算错，不是报错。
+        if (s.xd_phase == .live and s.xd_rows != g.ctl.rows) {
+            if (s.xd_gexec) |e| {
+                if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
+                s.xd_gexec = null;
+            }
+            s.xd_phase = .rec;
+        }
+        s.xd_rows = g.ctl.rows;
         switch (s.xd_phase) {
             .off => return g,
             .rec => {
@@ -2899,7 +2945,7 @@ pub const CudaBackend = struct {
     /// Free the graph state.  Idempotent; called from `deinit`.
     fn graphDestroy(self: *CudaBackend) void {
         if (self.cu) |*cu| {
-            for (&self.g_slots) |*sl| {
+            for (self.g_slots) |*sl| {
                 if (sl.xd_gexec) |e| {
                     _ = cu.lib.GraphExecDestroy(e);
                     sl.xd_gexec = null;
@@ -2907,9 +2953,9 @@ pub const CudaBackend = struct {
                 sl.xd_phase = .off;
                 sl.xd_capturing = false;
             }
-            if (self.g_slots[0].xd_gexec) |e| {
+            if (self.gs(0).xd_gexec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
-                self.g_slots[0].xd_gexec = null;
+                self.gs(0).xd_gexec = null;
             }
             if (self.g_ev_out) |ev| {
                 _ = cu.lib.EventDestroy(ev);
@@ -2924,7 +2970,7 @@ pub const CudaBackend = struct {
                 self.g_stream = null;
             }
         }
-        for (&self.g_slots) |*sl| {
+        for (self.g_slots) |*sl| {
             sl.xd_phase = .off;
             sl.xd_capturing = false;
         }
@@ -4249,10 +4295,16 @@ pub const CudaBackend = struct {
         //     `kv_quant(..., out_ptr, ...)`，而 `out_ptr` 是主机侧算出的行地址，
         //     捕获后永远是录制那一步的行（实测：`--kv-type q8_0` 时 XG 与直接
         //     发射从第十几个 token 起分叉，而 f32/f16 已经逐位一致）。
-        if (rows == 1 and self.ctl_dev != null) {
+        // `rows == 1` 曾是这里的门槛：kernel 其实**一直**支持多行
+        // （`slot = ctl[KV_SLOT] + row`），只是旧代码只把它接到单行上。放开到
+        // 任意 `rows` 之后，k 行前向（verify）也不必再走下面的主机侧
+        // `out_ptr` —— 那条路径把"基址 + 录制那一行的偏移"烘进图里，重放时
+        // 每一轮都往同一段 KV 覆盖写。实测（verify、k=2）：两行 argmax 完全
+        // 相同、anchor 不推进、MTP 接受率 60% → 0%。
+        if (self.graphActive(g) and self.ctl_dev != null) {
             const nbp = @as(c_int, @intCast(kv_dim / 32));
             const rc0 = Launch.kv_quant_dslot(g, src.ptr, @ptrCast(dst_bytes),
-                @ptrCast(@alignCast(self.ctl_dev.?)), nbp, 1,
+                @ptrCast(@alignCast(self.ctl_dev.?)), nbp, @intCast(rows),
                 @intCast(row_bytes), kind, self.launchStream());
             if (rc0 == cudart.cudaSuccess) return;
             self.ewLaunchFail("kv_quant_dslot", rc0);
@@ -5263,7 +5315,7 @@ pub const CudaBackend = struct {
         // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
         // 自己在 `graphEnd` 里读控制块；在新路径上支持捕获之前，S1 图从不为
         // live，这个分支不可达。）
-        const replayed = self.g_slots[0].state == .live;
+        const replayed = self.gs(0).state == .live;
         if (replayed) {
             return self.collectSampledToken(sp);
         }
@@ -5629,7 +5681,7 @@ pub const CudaBackend = struct {
                                     // 分支把 slot 当 kernel 实参，录进图后每次重放
                                     // 都按录制那一步的 KV 长度算 attention。
                                     const want_dyn = graphWanted() and
-                                        (self.g_slots[0].state == .live or self.g_slots[0].state == .rec or self.graphActive(g));
+                                        (self.gs(0).state == .live or self.gs(0).state == .rec or self.graphActive(g));
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
                                             // **不要**在这里发布 `slot`。capture 期间
@@ -6223,7 +6275,7 @@ pub const CudaBackend = struct {
         // -- the pairs would measure empty intervals.  The graph path reports
         // its own totals via `stat_ns_token_dev`; disable the pool instead of
         // printing a table of zeros.
-        if (self.g_slots[0].state == .live) return null;
+        if (self.gs(0).state == .live) return null;
         if (self.slot_depth != 0) return null;
         if (!self.gpuEvEnsure()) {
             self.gpu_ev_on = false;
@@ -6900,19 +6952,27 @@ pub const CudaBackend = struct {
         _ = self.publishCtl(ctl, null, true);
         const g = backend.Graph{ .kind = kind, .ctl = ctl, .slot = slot };
 
-        // XG 只服务 decode：prefill 的块长度是数据相关的，按形状建图会得到
-        // 最多 nbatch-1 张图（实测见 AGENTS.md 的 prefill 账本），而 prefill
-        // 的发射开销在 238 ms 的块里上界只有 6.3%。见 `xdPhaseBegin`。
+        // XG 服务"节点集合可重放"的三种前向：`.decode`（1 行）、`.verify`
+        // （k 行，k 由调用方声明、写进控制块）、`.nextn`（草稿块，1 行）。
+        // prefill 的块长度是数据相关的，按形状建图最多要 nbatch-1 张；而
+        // prefill 现在压根不经过这里（`forwardChunk` 自己不开 span），它的
+        // 发射开销在 238 ms 的块里上界只有 6.3%。
         if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
             std.debug.print("[xg] graphBegin kind={s} slot={d} phase={s}\n", .{ @tagName(kind), slot, @tagName(self.gs(slot).xd_phase) });
         }
-        // 草稿块（`.nextn`）自己一张图：它在 `graphDirect` 段里跑，逐轮变的
-        // 只有嵌入 token（控制块的 `tok`）和几个位置标量，所以录一次就能重放。
-        if (kind == .nextn) {
-            if (!graphWanted() or !xdWanted()) return g;
-            return self.xdPhaseBegin(g);
-        }
-        if (kind != .decode or !graphWanted()) return g;
+        if (kind != .decode and kind != .verify and kind != .nextn) return g;
+        if (!graphWanted() or !xdWanted()) return g;
+        // `.verify` 默认**不进图**：把 k 行前向录成一张可重放的图，要求它的
+        // 每一个逐轮标量都走设备控制块。目前只覆盖到 KV 写入行与 attn 起始行，
+        // `matvecBatchK` 的激活/输出 scratch 仍按录制时那一次固化 —— 实测
+        // （27B IQ3_XXS，MTP draft=2）：图里只剩"尾部 rmsnormRows + lm_head"
+        // 两步时接受率也是 0%（直发 60%），说明缺口不止一处。
+        //
+        // prefill 不走这里，它的发射开销在 238 ms 的块里上界只有 6.3%，所以
+        // "verify 不建图"并不亏；把剩下的标量逐个搬到 ctl 之后再打开。
+        // `$QWEN35_XD_VERIFY=1` 可以强行打开，用来继续那条工作。
+        if (kind == .verify and cudart.getenv("QWEN35_XD_VERIFY") == null) return g;
+        if (kind != .decode) return self.xdPhaseBegin(g);
         // 采样参数在**图 launch 之前**拷进设备常驻控制块。这是整个重放循环里
         // 唯一正确的位置：
         //   * 图里的 `k_plan` / `k_draw` / `k_coin` 在重放时从该块读
@@ -7829,28 +7889,31 @@ pub const CudaBackend = struct {
 
         if (maxrows != 0) {
             // CUDA-graph 重放：起始行必须从设备读，dynamic shared 固定最大值。
-            // 否则捕获时固化的 `slot0`/`smem` 会让每个 token 都要重新捕获。
-            if (self.g_slots[0].state == .live and self.g_slots[0].d_attn_slot != null and
+            // 否则捕获时固化的 `slot0`/`smem` 会让每个 chunk 都要重新捕获。
+            //
+            // **起始行的来源是每步的设备控制块**（`ctl + XD_CTL_KV_SLOT`），
+            // 不是每槽另开一块 int：那个块已经由 `dGraphBegin` 里的
+            // `publishCtl` 在 capture 之外写好了，rope 也在读它。以前这里走
+            // `s.d_attn_slot`，而那个指针从来没有被分配过（只有声明），所以
+            // 这段路径一次都没生效 —— k 行前向只能走 per-slice 的
+            // `attn_chunk`，它的 `slot0` 是普通实参、被烘死在图里。decode 只有
+            // 1 行，且每轮别的地方会重录，问题不明显；verify 的 k 行起始行每轮
+            // 都在前进，于是每一轮都读到录制那一行（实测：两行 argmax 完全
+            // 相同、anchor 不推进、接受率 0%）。
+            if (self.graphActive(g) and self.ensureCtl() != null and
                 rows <= maxrows and self.kvKind() == 0 and n_tot <= 12288)
             {
-                const want: c_int = @intCast(slot0);
-                if (want != self.g_slots[0].d_attn_slot_host) {
-                    if (self.cu.?.lib.MemcpyAsync(self.g_slots[0].d_attn_slot.?, &want,
-                            @sizeOf(c_int), cudart.MemcpyHostToDevice, self.launchStream()) ==
-                        cudart.cudaSuccess)
-                    {
-                        self.g_slots[0].d_attn_slot_host = want;
-                    }
-                }
                 if (dBufPtr(q)) |pq| {
                     if (dBufPtr(gate)) |pgate| {
                         if (dBufPtr(kcache)) |pk| {
                             if (dBufPtr(vcache)) |pv| {
                                 if (dBufPtr(gout)) |pgout| {
+                                    // `d_slot0` 指向控制块的第 KV_SLOT 个 int。
+                                    const ctl_base: [*]const c_int = @ptrCast(@alignCast(self.ctl_dev.?));
                                     const rc = Launch.attn_chunk_dyn(
                                         g,
                                         pq, pgate, pk, pv, pgout,
-                                        @ptrCast(@alignCast(self.g_slots[0].d_attn_slot.?)),
+                                        @ptrCast(ctl_base + ctl_kv_slot),
                                         @intCast(rows), @intCast(heads), @intCast(gqa),
                                         @intCast(hd), @intCast(kv_dim), scale,
                                         self.kvKind(), self.launchStream());
@@ -7862,6 +7925,7 @@ pub const CudaBackend = struct {
                     }
                 }
             }
+
             if (dBufPtr(q)) |pq| {
                 if (dBufPtr(gate)) |pgate| {
                     if (dBufPtr(kcache)) |pk| {

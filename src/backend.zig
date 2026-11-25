@@ -139,14 +139,21 @@ pub const LoadError = error{
     BackendUnavailable,
 };
 
-/// What shape of forward a graph captures.  **Decode** is the one-row forward
-/// (`forwardGdn`/`forwardFull`/`forwardMlp`); **chunk** is the K-row forward
-/// (`forwardChunkRun`), shared by prefill and by the speculative verify.
+/// What a graph captures.  **decode** is the one-row forward
+/// (`forwardGdn`/`forwardFull`/`forwardMlp`); **verify** is the K-row forward
+/// of a speculative verify block (`forwardChunk` behind `.verify`).
+///
+/// prefill 的 K 行块走的是同一个 `forwardChunk`，但它**没有 kind**：块长度
+/// 是数据相关的（`min(nbatch, 剩余 token)`），按形状建图最多要 nbatch-1 张，
+/// 而它的发射开销在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7）。所以
+/// prefill 一律直发，`forwardChunk` 自己也不开 span —— kind 是**调用方**声明
+/// 的意图，不是被调函数的属性。
 pub const GraphKind = enum {
-    /// 一个 token 的完整前向（`forwardLogits`）。
+    /// 一个 token 的完整前向（`forwardLogits` 的调用方 `step` 开）。
     decode,
-    /// K 行 prefill 块（`forwardChunk`）。逐块建图，所以默认不录。
-    chunk,
+    /// 推测解码的 K 行验证块（`forwardChunkVerify` 开）。K 是草稿块长度，
+    /// 逐轮可能变（2..max_draft+1），所以**每种 K 要各自一槽**。
+    verify,
     /// MTP 草稿块（`nextnPredict`）：一轮/一个链步，1 行。
     ///
     /// 它和 decode 是**两张图**：节点集合不同（草稿块反量化的是嵌入行、
