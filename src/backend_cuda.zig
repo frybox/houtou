@@ -2560,6 +2560,11 @@ pub const CudaBackend = struct {
     fn xdPhaseBegin(self: *CudaBackend, g: backend.Graph) backend.Graph {
         const s = self.gs();
         s.xd_launched = false;
+        // prefill 的块长度是数据相关的（`min(nbatch, 剩余 token)`），而一张图
+        // 只对一种行数成立；按形状建图最多要 nbatch-1 张。prefill 的发射开销
+        // 在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7 的账本），所以
+        // `.chunk` 一律直通，**不要把 `xd_phase` 置回 `.rec` 给它用**。
+        // 这里把它挡在 open/instantiate 之前：否则每块都会录一张、上一张作废。
         switch (s.xd_phase) {
             .off => return g,
             .rec => {
