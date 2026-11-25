@@ -2427,6 +2427,9 @@ pub const CudaBackend = struct {
     fn launchStream(self: *CudaBackend) ?*anyopaque {
         // XG 的录制也必须在 `g_stream` 上，否则 `xd_capture` 看到的流不在
         // capture 状态，录制直接失败（实测：rc=1 在第一个 op）。
+        //
+        // 这里保持"任何槽在录就用图流"：capture 只有一条流，且同一时刻只
+        // 允许一个槽进 `.rec`。真正需要区分"哪张图"的判断在 `capturing(g)`。
         for (self.g_slots) |s| {
             if (s.xd_phase == .rec) return self.g_stream;
         }
@@ -2438,9 +2441,17 @@ pub const CudaBackend = struct {
 
     /// True when a launch happening right now is being captured, i.e. when its
     /// arguments must be recorded for the per-token retarget.
-    fn capturing(self: *const CudaBackend) bool {
-        // 任何槽在录都算"正在 capture"。三张图的 capture 不可能同时开
-        // （流只有一条、相位机一次只让一个槽进 `.rec`）。
+    /// 这张图此刻正在被录吗。
+    ///
+    /// 必须按图问：不同槽的 capture 状态不同，问"后端有没有在录"会把 A 图
+    /// 的录制误当成 B 图的（草稿块就嵌在 verify 的调用栈里面）。
+    fn capturing(self: *const CudaBackend, g: backend.Graph) bool {
+        if (g.slot >= self.g_slots.len) return false;
+        return self.g_slots[g.slot].xd_capturing;
+    }
+
+    /// 后端级问题：**有没有任何**槽在录。只给拿不到图的统计路径用。
+    fn anySlotCapturing(self: *const CudaBackend) bool {
         for (self.g_slots) |s| {
             if (s.xd_capturing) return true;
         }
@@ -2460,11 +2471,12 @@ pub const CudaBackend = struct {
         return false;
     }
 
-    fn graphActive(self: *const CudaBackend) bool {
-        for (self.g_slots) |s| {
-            if (s.xd_phase == .rec or s.xd_phase == .live) return true;
-        }
-        return false;
+    /// 这张图是（或即将是）`rec`/`live` 吗 —— 即它的 op 必须走设备控制块
+    /// 形态，好让重放的节点读到当步的标量。同样按图问，理由同 `capturing`。
+    fn graphActive(self: *const CudaBackend, g: backend.Graph) bool {
+        if (g.slot >= self.g_slots.len) return false;
+        const ph = self.g_slots[g.slot].xd_phase;
+        return ph == .rec or ph == .live;
     }
 
     /// Suppress a host-side launch when the captured graph already contains it.
@@ -2494,12 +2506,24 @@ pub const CudaBackend = struct {
     /// for this token so the caller falls back to direct launches.  `why` is
     /// printed once (not per token) -- a per-token flood would bury the real
     /// message and cost measurable time in the very path being measured.
-    fn graphAbandon(self: *CudaBackend, why: []const u8) void {
-        var slot_i: u8 = 0;
-        while (slot_i < self.g_slots.len) : (slot_i += 1) {
-            if (self.g_slots[slot_i].xd_capturing) break;
+    /// 后端级：放弃**任何**正在录的槽。只给拿不到具体图的路径用
+    /// （`dGraphDirect` 进入直发段时）。
+    fn graphAbandonAny(self: *CudaBackend, why: []const u8) void {
+        var i: u8 = 0;
+        while (i < self.g_slots.len) : (i += 1) {
+            if (!self.g_slots[i].xd_capturing) continue;
+            self.graphAbandon(.{ .slot = i }, why);
+            return;
         }
-        if (slot_i == self.g_slots.len) return;
+    }
+
+    /// 放弃**这张图**的 capture。
+    ///
+    /// 按图而不是"扫描所有槽"：嵌套 span 下（草稿块在 verify 里面）扫描会
+    /// 关掉外层的 capture 而把内层的留着，结果两个槽的状态都不对。
+    fn graphAbandon(self: *CudaBackend, g: backend.Graph, why: []const u8) void {
+        if (g.slot >= self.g_slots.len) return;
+        if (!self.g_slots[g.slot].xd_capturing) return;
         self.stat_g_abandon += 1;
         if (self.stat_g_abandon == 1) {
             std.debug.print(
@@ -2510,18 +2534,18 @@ pub const CudaBackend = struct {
         // ORDER MATTERS: the capture has to be CLOSED first, because until
         // `cudaStreamEndCapture` returns the stream is still "capturing" and any
         // subsequent launch on it fails with `cudaErrorStreamCaptureUnsupported`.
-        self.g_slots[slot_i].xd_capturing = false;
-        if (self.g_slots[slot_i].xd_phase == .rec) self.g_slots[slot_i].xd_phase = .off;
+        self.g_slots[g.slot].xd_capturing = false;
+        if (self.g_slots[g.slot].xd_phase == .rec) self.g_slots[g.slot].xd_phase = .off;
         if (self.cu) |*cu| {
-            var g: ?*anyopaque = null;
-            _ = cu.lib.StreamEndCapture(self.g_stream, &g);
+            var cap: ?*anyopaque = null;
+            _ = cu.lib.StreamEndCapture(self.g_stream, &cap);
             // THE ABANDONED CAPTURE STILL HAS TO RUN.  Capture mode records
             // launches instead of executing them, so this token has had no kernel
             // at all: no KV row appended, no GDN state advanced.  Instantiate and
             // launch once, which replays exactly the kernels the direct path would
             // have issued, so the step is performed and the numbers stay right
             // even though no graph is kept.
-            if (g) |gg| {
+            if (cap) |gg| {
                 var ab_exec: ?*anyopaque = null;
                 if (cu.lib.GraphInstantiate(&ab_exec, gg, 0) == cudart.cudaSuccess and ab_exec != null) {
                     if (cu.lib.GraphLaunch(ab_exec.?, self.g_stream) != cudart.cudaSuccess) {
@@ -2971,7 +2995,7 @@ pub const CudaBackend = struct {
     /// The activation is read straight from a device pointer, which after P2d is
     /// normally the caller's own resident buffer (`xBuf`), not a `d_act` staging
     /// area -- staging is only written when a caller hands over a host slice.
-    fn quantizeActFrom(self: *CudaBackend, d_src: [*]const f32, ttype: gguf.TensorType, cols: usize) !usize {
+    fn quantizeActFrom(self: *CudaBackend, g: backend.Graph, d_src: [*]const f32, ttype: gguf.TensorType, cols: usize) !usize {
         const cu = &self.cu.?;
         const nb = cols / actBlockElems(ttype);
         std.debug.assert(nb * actBlockElems(ttype) == cols);
@@ -2981,7 +3005,7 @@ pub const CudaBackend = struct {
         else
             kern.quantize_q8_k(d_src, self.d_xq.?, @intCast(nb), self.launchStream());
         if (rc != cudart.cudaSuccess) {
-            if (self.capturing()) self.graphAbandon("quantize activation launch failed");
+            if (self.capturing(g)) self.graphAbandon(g, "quantize activation launch failed");
             std.debug.print("cuda backend: quantize({s}) launch failed: {s}\n", .{
                 @tagName(ttype), std.mem.span(cu.lib.errStr(rc)),
             });
@@ -3256,7 +3280,7 @@ pub const CudaBackend = struct {
         // 重放永远嵌入第一轮那个 token，所以改成从设备控制块读
         // （`ctl[XD_CTL_TOKEN]`），实参只剩模型常量。decode 的嵌入在图外，
         // 行号照旧走指针算术。
-        const rc = if (g.kind == .nextn and self.graphActive() and self.ctl_dev != null)
+        const rc = if (g.kind == .nextn and self.graphActive(g) and self.ctl_dev != null)
             kern.dequantize_row_dtoken(
                 g,
                 @intCast(@backingInt(w.ttype)),
@@ -3278,7 +3302,7 @@ pub const CudaBackend = struct {
             );
         };
         if (rc != cudart.cudaSuccess) {
-            if (self.capturing()) self.graphAbandon("dequantize_row launch failed");
+            if (self.capturing(g)) self.graphAbandon(g, "dequantize_row launch failed");
             std.debug.print("cuda backend: dequantize_row({s}) launch failed: {s}\n", .{
                 @tagName(w.ttype), std.mem.span(cu.lib.errStr(rc)),
             });
@@ -3417,7 +3441,7 @@ pub const CudaBackend = struct {
                         self.launchStream(),
                     );
                     if (rc != cudart.cudaSuccess) {
-                        if (self.capturing()) self.graphAbandon("mul_mat_vec_f32 launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "mul_mat_vec_f32 launch failed");
                         std.debug.print("cuda backend: mul_mat_vec_f32 launch failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
                         self.clearDevBuf(outBuf);
                         return;
@@ -3438,7 +3462,7 @@ pub const CudaBackend = struct {
                         self.launchStream(),
                     );
                     if (rc != cudart.cudaSuccess) {
-                        if (self.capturing()) self.graphAbandon("mul_mat_vec_f32 launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "mul_mat_vec_f32 launch failed");
                         std.debug.print("cuda backend: mul_mat_vec_f32 launch failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
                         self.clearDevBuf(outBuf);
                         return;
@@ -3467,7 +3491,7 @@ pub const CudaBackend = struct {
                 if (q.ttype == .f16 or q.ttype == .bf16) {
                     const rcw = self.launchW16(g, e.dev, d_x, q.ttype, rows, cols, 1, outBuf);
                     if (rcw != cudart.cudaSuccess) {
-                        if (self.capturing()) self.graphAbandon("mul_mat_vec_w16 launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "mul_mat_vec_w16 launch failed");
                         std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
                             @tagName(q.ttype), std.mem.span(cu.lib.errStr(rcw)),
                         });
@@ -3513,7 +3537,7 @@ pub const CudaBackend = struct {
                     self.q_miss += @intFromBool(!_hit);
                 }
                 if (!_hit) {
-                    _ = self.quantizeActFrom(d_x, q.ttype, cols) catch {
+                    _ = self.quantizeActFrom(g, d_x, q.ttype, cols) catch {
                         self.clearDevBuf(outBuf);
                         return;
                     };
@@ -3532,7 +3556,7 @@ pub const CudaBackend = struct {
                         self.launchStream(),
                     );
                     if (rc != cudart.cudaSuccess) {
-                        if (self.capturing()) self.graphAbandon("mul_mat_vec launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "mul_mat_vec launch failed");
                         std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
                             @tagName(q.ttype), std.mem.span(cu.lib.errStr(rc)),
                         });
@@ -3556,7 +3580,7 @@ pub const CudaBackend = struct {
                         self.launchStream(),
                     );
                     if (rc != cudart.cudaSuccess) {
-                        if (self.capturing()) self.graphAbandon("mul_mat_vec launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "mul_mat_vec launch failed");
                         std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
                             @tagName(q.ttype), std.mem.span(cu.lib.errStr(rc)),
                         });
@@ -4173,7 +4197,7 @@ pub const CudaBackend = struct {
         // that a replayed/recorded step takes its ROW from the control block so
         // the captured destination pointer stays a constant region base.
         if (self.kv_type == .f32) {
-            if (self.graphActive() and self.ctl_dev != null) {
+            if (self.graphActive(g) and self.ctl_dev != null) {
                 if (dBufPtr(dst)) |pd| {
                     if (dBufPtr(src)) |ps| {
                         const n = rows * kv_dim;
@@ -4181,7 +4205,7 @@ pub const CudaBackend = struct {
                             @intCast(rows), @intCast(n),
                             @ptrCast(@alignCast(self.ctl_dev.?)), self.launchStream());
                         if (rc0 == cudart.cudaSuccess) return;
-                        if (self.capturing()) self.graphAbandon("copy_range_dslot launch failed");
+                        if (self.capturing(g)) self.graphAbandon(g, "copy_range_dslot launch failed");
                         self.ewLaunchFail("copy_range_dslot", rc0);
                     }
                 }
@@ -4232,7 +4256,7 @@ pub const CudaBackend = struct {
         }
         const rc = Launch.kv_quant(g, src.ptr, @ptrCast(out_ptr), @intCast(nblocks), kind, self.launchStream());
         if (rc == cudart.cudaSuccess) return;
-        if (self.capturing()) self.graphAbandon("kv_quant launch failed");
+        if (self.capturing(g)) self.graphAbandon(g, "kv_quant launch failed");
         self.ewLaunchFail("kv_quant", rc);
         cpu_mod.CpuBackend.vtable.kvAppend(.{}, @ptrCast(&self.cpu), dst, src, slot, kv_dim, rows);
     }
@@ -4553,7 +4577,6 @@ pub const CudaBackend = struct {
     // Everything else in this file is device-to-device.
 
     fn dCopyFromHost_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
-        _ = g;
         const self = self_(ctx);
         // The bytes behind `dst` just changed, so anything quantised from it is
         // stale.  Conservative and free: the next matvec re-quantises.
@@ -4565,7 +4588,7 @@ pub const CudaBackend = struct {
         // here rather than at each engine call site because the engine has no
         // idea a capture is open -- by design (AGENTS.md 1.1: it must not know
         // about the hardware's execution strategy).
-        if (self.capturing()) self.graphAbandon("host-to-device copy inside forward");
+        if (self.capturing(g)) self.graphAbandon(g, "host-to-device copy inside forward");
         if (self.cu != null and src.len != 0 and src.len <= dst.len) {
             if (dBufPtr(dst)) |pd| {
                 const cu = &self.cu.?;
@@ -4597,10 +4620,9 @@ pub const CudaBackend = struct {
     }
 
     fn dCopyToHost_body(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
-        _ = g;
         const self = self_(ctx);
         std.debug.assert(dst.len <= src.len);
-        if (self.capturing()) self.graphAbandon("device-to-host copy inside forward");
+        if (self.capturing(g)) self.graphAbandon(g, "device-to-host copy inside forward");
         if (self.cu != null) {
             if (dBufPtr(src)) |ps| {
                 // Blocking on purpose: this slot is for small diagnostic
@@ -5164,12 +5186,12 @@ pub const CudaBackend = struct {
         // are then fed different logits.  With this set, both runs consume the
         // identical device logits row, so any token difference is the sampler's
         // fault alone.  Read once per process, on the host, before any capture.
-        if (self.sample_cpu_ab and self.capturing()) {
+        if (self.sample_cpu_ab and self.capturing(g)) {
             // A blocking D2H inside a capture is illegal and would silently
             // corrupt the graph.  Refuse loudly: this switch is for A/B on the
             // direct path only, and `graphAbandon` is the documented way to say
             // "this capture cannot continue".
-            self.graphAbandon("QWEN35_CUDA_SAMPLE_CPU inside a capture");
+            self.graphAbandon(g, "QWEN35_CUDA_SAMPLE_CPU inside a capture");
         }
         if (self.sample_cpu_ab) {
             // CPU 采样器直接对行下标，所以它需要一份**主机**副本：这里 `logits`
@@ -5254,7 +5276,7 @@ pub const CudaBackend = struct {
         // 录制期（草稿块）：这一趟的 f32 logits 常驻在 `d_deq` 里，`dSampledToken`
         // 在 `graphEnd` 之后要拿它做那次阻塞 D2H。只记指针：它不随步变，也不会
         // 在 capture 里过期（`graphReserve` 提前把它分配好了）。
-        if (self.graphActive() and self.capturing()) {
+        if (self.graphActive(g) and self.capturing(g)) {
             self.sample_sp = sp;
             self.sample_vocab = logits.len;
             self.sample_logits = if (dBufPtr(logits) != null) self.d_deq else null;
@@ -5271,7 +5293,7 @@ pub const CudaBackend = struct {
         // 一个 **memcpy 节点**，重放时把录制那一步的参数写回设备块（实测：
         // `QWEN35_XD_NODES` 报出 1 个 non-kernel 节点，正是它）。参数已由
         // `dGraphBegin` 在图外、图 launch 之前发布好，这里只负责把 kernel 录进去。
-        if (!self.capturing() and !self.publishSampleCtl(logits.len, sp, stream)) {
+        if (!self.capturing(g) and !self.publishSampleCtl(logits.len, sp, stream)) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
         const rc = Launch.sample(g,
@@ -5286,7 +5308,7 @@ pub const CudaBackend = struct {
         // 所以图活跃时这里只发射、返回 0，由 `dGraphEnd` 在图关闭后做那一次
         // 4 字节读取（`sampledToken` 再把结果交给 engine）。
         // 直接发射路径没有图，就地读回，行为和以前完全一致。
-        if (self.graphActive()) return 0;
+        if (self.graphActive(g)) return 0;
         self.sampled = self.collectSampledToken(sp);
         return self.sampled;
     }
@@ -5392,7 +5414,7 @@ pub const CudaBackend = struct {
                                                     @intCast(kd), @intCast(vd), self.launchStream(),
                                                 );
                                                 if (rc == cudart.cudaSuccess) return;
-                                                if (self.capturing()) self.graphAbandon("gdn_step_rows launch failed");
+                                                if (self.capturing(g)) self.graphAbandon(g, "gdn_step_rows launch failed");
                                                 self.ewLaunchFail("gdn_step_rows", rc);
                                             }
                                         }
@@ -5604,7 +5626,7 @@ pub const CudaBackend = struct {
                                     // 分支把 slot 当 kernel 实参，录进图后每次重放
                                     // 都按录制那一步的 KV 长度算 attention。
                                     const want_dyn = graphWanted() and
-                                        (self.g_slots[0].state == .live or self.g_slots[0].state == .rec or self.graphActive());
+                                        (self.g_slots[0].state == .live or self.g_slots[0].state == .rec or self.graphActive(g));
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
                                             // **不要**在这里发布 `slot`。capture 期间
@@ -5635,7 +5657,7 @@ pub const CudaBackend = struct {
                                                         // 四个。
                                                         return;
                                                     }
-                                                    if (self.capturing()) self.graphAbandon("attn_decode split_dyn launch failed");
+                                                    if (self.capturing(g)) self.graphAbandon(g, "attn_decode split_dyn launch failed");
                                                     self.ewLaunchFail("attn_decode_split_dyn", rcs);
                                                 }
                                             }
@@ -5646,7 +5668,7 @@ pub const CudaBackend = struct {
                                                 // 要求记账一致。
                                                 return;
                                             }
-                                            if (self.capturing()) self.graphAbandon("attn_decode dyn launch failed");
+                                            if (self.capturing(g)) self.graphAbandon(g, "attn_decode dyn launch failed");
                                             self.ewLaunchFail("attn_decode_dyn", rc);
                                         }
                                     }
@@ -5677,7 +5699,7 @@ pub const CudaBackend = struct {
                                     }
                                     // 失败的发射不能进图：否则捕获下来的图会缺掉整整
                                     // 一层的 attention。宁可放弃，也不要实例化。
-                                    if (self.capturing()) self.graphAbandon("attn_decode launch failed");
+                                    if (self.capturing(g)) self.graphAbandon(g, "attn_decode launch failed");
                                     self.ewLaunchFail("attn_decode", rc);
                                 } else return;
                             } else return;
@@ -5812,7 +5834,7 @@ pub const CudaBackend = struct {
                         self.stat_rope_devices += 1;
                         return;
                     }
-                    if (self.capturing()) self.graphAbandon("rope64_dpos launch failed");
+                    if (self.capturing(g)) self.graphAbandon(g, "rope64_dpos launch failed");
                     self.ewLaunchFail("rope64_dpos", rc);
                 }
                 const rc = Launch.rope64(g, px, 1, @intCast(n), @bitCast(pos), base, self.launchStream());
@@ -5820,7 +5842,7 @@ pub const CudaBackend = struct {
                     self.stat_rope_devices += 1;
                     return;
                 }
-                if (self.capturing()) self.graphAbandon("rope64 launch failed");
+                if (self.capturing(g)) self.graphAbandon(g, "rope64 launch failed");
                 self.ewLaunchFail("rope64", rc);
             }
             // No device pointer (or the launch failed): the CPU path below is
@@ -5867,7 +5889,7 @@ pub const CudaBackend = struct {
         // `pos`/`base` are published into the same device channel the per-head
         // path uses (`ropeSetEnv` runs once per token, not once per call), so
         // the captured node reads them fresh on every replay.
-        if (self.graphActive()) {
+        if (self.graphActive(g)) {
             if (self.ensureCtl()) |ctl_dev| {
                 _ = self.publishCtl(.{
                     .pos = pos,
@@ -5881,7 +5903,7 @@ pub const CudaBackend = struct {
                     if (rc == cudart.cudaSuccess) {
                         return;
                     }
-                    if (self.capturing()) self.graphAbandon("rope64_rows_dpos launch failed");
+                    if (self.capturing(g)) self.graphAbandon(g, "rope64_rows_dpos launch failed");
                     self.ewLaunchFail("rope64_rows_dpos", rc);
                 }
             }
@@ -6192,7 +6214,7 @@ pub const CudaBackend = struct {
 
     inline fn gpuEvEnter(self: *CudaBackend) ?usize {
         if (!self.gpu_ev_on) return null;
-        if (self.capturing()) return null;
+        if (self.anySlotCapturing()) return null;
         // A live decode graph replays one graph per token and suppresses the
         // host-side launches (`gOpGate`), so there is nothing per slot to record
         // -- the pairs would measure empty intervals.  The graph path reports
@@ -6989,7 +7011,7 @@ pub const CudaBackend = struct {
     fn dGraphDirect(ctx: *anyopaque, on: bool) void {
         const self = self_(ctx);
         if (on) {
-            if (self.capturing()) self.graphAbandon("direct span (MTP draft)");
+            if (self.anySlotCapturing()) self.graphAbandonAny("direct span (MTP draft)");
             for (&self.g_slots) |*s| {
                 if (s.xd_phase != .off or s.xd_gexec != null) {
                     if (s.xd_gexec) |e| {
@@ -7960,8 +7982,8 @@ pub const CudaBackend = struct {
         // the capture down and run the op with a DIRECT launch (never the CPU
         // fallback -- `x` is a device pointer here, and the CPU twin would
         // dereference it as host memory).
-        if (self.capturing()) {
-            self.graphAbandon("ropeRows (variable rotary_dim) is not capture-safe");
+        if (self.capturing(g)) {
+            self.graphAbandon(g, "ropeRows (variable rotary_dim) is not capture-safe");
         }
         if (dBufPtr(x)) |px| {
             const rc = Launch.rope_rows_dim(g, px, @intCast(rows), @intCast(heads), @intCast(hd), @bitCast(pos), base, @intCast(rotary_dim), self.launchStream());
