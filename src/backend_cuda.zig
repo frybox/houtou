@@ -7011,21 +7011,18 @@ pub const CudaBackend = struct {
     fn dGraphDirect(ctx: *anyopaque, on: bool) void {
         const self = self_(ctx);
         if (on) {
-            if (self.anySlotCapturing()) self.graphAbandonAny("direct span (MTP draft)");
-            for (&self.g_slots) |*s| {
-                if (s.xd_phase != .off or s.xd_gexec != null) {
-                    if (s.xd_gexec) |e| {
-                        if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
-                    }
-                    s.xd_gexec = null;
-                }
-                s.xd_phase = .off;
-            }
+            // **只置标记，不动任何槽。**
+            //
+            // 这段的语义是"接下来这些 op 不属于任何可重放单元"，不是"把已有
+            // 的图作废"。以前这里会 `GraphExecDestroy` 全部槽并把 `xd_phase`
+            // 归 `.off` —— 而 MTP 的整段 `generateSpec` 都在这个 span 里，
+            // 于是 verify 的图永远建不起来（实测 `[xg] graphBegin kind=chunk
+            // slot=1 phase=off`，一次都没录过）。真要把某个槽作废，用
+            // `graphAbandon` 或把那个槽的 phase 单独置掉。
             self.g_direct = true;
             return;
         }
         self.g_direct = false;
-        if (self.g_slots[0].xd_phase == .off and xdWanted()) self.g_slots[0].xd_phase = .rec;
     }
 
     /// prefill 循环的结束点：主机侧唯一能确知"prefill 已经做完"的地方。这里记录
