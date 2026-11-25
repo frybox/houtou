@@ -210,6 +210,18 @@ pub const Graph = struct {
     /// launches are what the capture records.  A backend that has no graph
     /// (the CPU one) always leaves it false, so every op runs normally.
     replayed: bool = false,
+    /// Backend-defined slot index for this graph, carried **by the handle**
+    /// rather than looked up from a "current graph" global.
+    ///
+    /// 为什么要放进句柄：`graphBegin`/`graphEnd` 成对，但会**嵌套**。MTP 的
+    /// 草稿块（`.nextn`）跑在 verify 的 `forwardChunk` span 里面，若槽号存在
+    /// 后端的一个"当前槽"字段里，内层退出时就把外层的当前槽覆盖了 — 外层
+    /// `graphEnd` 于是收尾到错误的槽上（实测：草稿槽永远停在 `.off`，草稿
+    /// 的 op 全落到主机侧又算一遍，接受率 0%）。带上句柄之后嵌套天然正确，
+    /// 后端也不需要 `g_cur`。
+    ///
+    /// 直通图（`ptr == null`）不看它。
+    slot: u8 = 0,
 
     /// The graph a caller passes when it wants the historical direct path.
     pub const direct = Graph{};
@@ -634,7 +646,7 @@ pub const Exec = struct {
         // the pass; `graphEnd` closes it.  A CPU backend returns the
         // pass-through graph and does nothing on `graphEnd`, so the engine's
         // code is identical on both.
-        graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl) Graph,
+        graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl, slot: u8) Graph,
         graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
 
         /// 进入/离开"图外的直发段"。
@@ -921,8 +933,11 @@ pub const Exec = struct {
     }
     /// Open / close one decode step.  See the vtable comments: this is a
     /// boundary hint the backend may ignore, and the CPU backend does.
-    pub fn graphBegin(self: Exec, kind: GraphKind, ctl: GraphCtl) Graph {
-        return self.vtable.graphBegin(self.ptr, kind, ctl);
+    /// `slot` 由调用方指定（同一时刻不同 kind 的图必须落在不同槽），后端只
+    /// 原样记进句柄。见 `Graph.slot` 的说明：槽号走句柄而不是后端全局，才能
+    /// 让嵌套 span 正确收尾。
+    pub fn graphBegin(self: Exec, kind: GraphKind, ctl: GraphCtl, slot: u8) Graph {
+        return self.vtable.graphBegin(self.ptr, kind, ctl, slot);
     }
     pub fn graphEnd(self: Exec, g: *Graph) void {
         self.vtable.graphEnd(self.ptr, g);

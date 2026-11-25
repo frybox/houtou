@@ -998,9 +998,9 @@ pub const CpuBackend = struct {
     /// The explicit-compute-graph hooks.  The CPU runs straight-line code: there
     /// is nothing to capture and nothing to replay, so `graphBegin` hands back
     /// the pass-through graph (`ptr == null`) and every op ignores its `g`.
-    fn vGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
+    fn vGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl, slot: u8) backend.Graph {
         _ = ctx;
-        return .{ .kind = kind, .ctl = ctl };
+        return .{ .kind = kind, .ctl = ctl, .slot = slot };
     }
 
     fn vGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {

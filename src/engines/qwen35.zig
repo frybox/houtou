@@ -876,6 +876,13 @@ pub const Engine = struct {
     /// prefill chunk `nbatch` (1024), which would make it 1 GB.
     pub const spec_verify_rows: usize = 16;
 
+    /// 图槽号：**由引擎指定**，后端只把它记进 `Graph.slot`。三种 kind 必须在
+    /// 不同槽上（节点集合不同，共用会让每步都失配重捕），而槽号走句柄而不是
+    /// 后端的"当前槽"，嵌套 span（草稿块在 verify 里面）才能各自正确收尾。
+    pub const graph_slot_decode: u8 = 0;
+    pub const graph_slot_chunk: u8 = 1;
+    pub const graph_slot_nextn: u8 = 2;
+
     /// GDN 状态快照槽数 K。一次 verify 块最多 `spec_verify_rows` 行，接受
     /// `rows <= verify_rows - 1` 行，而槽 `rows-1` 是"跑完第 rows 行之后"，
     /// 所以需要 `spec_verify_rows - 1` 个 快照块。取 16 覆盖到 verify 的
@@ -1594,7 +1601,7 @@ pub const Engine = struct {
             .kv_slot = pos,
             .attn_slot = pos,
             .rows = 1,
-        });
+        }, graph_slot_decode);
         // 模型带 nextn 块时 `self.layers` 会多出一个槽（见 `nSlots`）；普通的
         // 前向必须停在 decoder 层，否则每个 token 都会把草稿头当作第 64 层再跑
         // 一遍。
@@ -1731,7 +1738,7 @@ pub const Engine = struct {
         // One chunk-shaped graph for the whole K-token pass (`slot0` and `rows`
         // are its per-step scalars).  S2 opens it here; a chunk graph is never
         // recorded yet, so the backend returns the pass-through one.
-        self.graph = self.exec.graphBegin(.chunk, .{ .pos = pos0, .kv_slot = pos0, .attn_slot = pos0, .rows = @intCast(k) });
+        self.graph = self.exec.graphBegin(.chunk, .{ .pos = pos0, .kv_slot = pos0, .attn_slot = pos0, .rows = @intCast(k) }, graph_slot_chunk);
 
         var t: usize = 0;
         while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
@@ -2519,7 +2526,7 @@ pub const Engine = struct {
             .attn_slot = draft_pos,
             .rows = 1,
             .tok = next_token,
-        });
+        }, graph_slot_nextn);
         defer {
             self.exec.graphEnd(&self.graph);
             self.graph = saved;

@@ -288,7 +288,30 @@ fn stubNoCudaKernels() c_int {
 ///
 /// 这样就不需要 op 表，也不需要按 op 分别记账：判断依据是"这一 token 的
 /// 工作是否已经由图承担"。
+/// 当前正在执行的那一层图。它由 **每个 op 的定时包装**（`vMatvec`、
+/// `dAddResid` …）在调用 body 之前压入、之后弹回，而不是由"当前 span"全局
+/// 决定 —— 后者在嵌套 span（草稿块在 verify 里面）下会拿错槽。
+///
+/// 为什么需要它：`graphGate` 只能看到 `Graph.replayed`，而 verify 那段是逐
+/// kernel 直发（`replayed == false`）。草稿图重放时它的 op 同样是 `false`，
+/// 必须靠"槽 2 是 `.live`"来抑制，否则草稿的每一步会在主机上再算一遍。
+var xg_cur_slot: u8 = 0;
+/// 压入 `slot`，返回先前那个（供 `defer` 恢复）。
+inline fn xg_push_slot(slot: u8) u8 {
+    const prev = xg_cur_slot;
+    xg_cur_slot = slot;
+    return prev;
+}
+var xg_backend: ?*CudaBackend = null;
+
 fn graphGate(g: backend.Graph) bool {
+    // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
+    if (g.kind == .nextn) {
+        const self = xg_backend orelse return g.replayed;
+        const s = self.g_slots[xg_cur_slot];
+        if (s.xd_capturing) return false;
+        if (s.xd_phase == .live) return true;
+    }
     return g.replayed;
 }
 
@@ -1722,7 +1745,8 @@ pub const CudaBackend = struct {
     //              must be redirectable to `g_stream`.
     //   live    -- `g_exec` holds a replayable graph.
 
-    /// 三张图的槽。`g_cur` 由 `xdPhaseBegin` 按 `Graph.kind` 选：
+    /// 三张图的槽。槽号由引擎经 `Graph.slot` 传进来（`xdPhaseBegin` 只看
+    /// `g.slot`），后端没有"当前槽"这种全局状态：
     /// 0 = decode（1 行）、1 = chunk/verify（k 行）、2 = nextn（草稿块）。
     /// 形状不同就不能共用一槽：节点集合一变，每步都要重捕，等于没有图。
     g_slots: [3]GraphSlot = .{ .{}, .{}, .{} },
@@ -1735,7 +1759,6 @@ pub const CudaBackend = struct {
     /// `dSample` 里记下指针（engine 的采样器活的比一步长）。
     sample_sp: ?*sampler.Sampler = null,
 
-    g_cur: usize = 0,
     /// 见 `gOpGate`：非 graph 管辖段。
     g_direct: bool = false,
 
@@ -2296,9 +2319,11 @@ pub const CudaBackend = struct {
     var g_graph_cached: ?bool = null;
     var g_xd_cached: ?bool = null;
 
-    /// The graph slot currently in use.
-    inline fn gs(self: anytype) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
-        return &self.g_slots[self.g_cur];
+    /// 槽 `i`。**没有"当前槽"这种全局状态**：调用方一律把 `Graph.slot` 传进
+    /// 来（见 `backend.Graph.slot` 的说明 —— 嵌套 span 下全局当前槽会让外层
+    /// `graphEnd` 收尾到错误的槽上）。
+    inline fn gs(self: anytype, slot: u8) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
+        return &self.g_slots[slot];
     }
 
     /// XG（显式计算图）的开关，**默认开启**。`$QWEN35_XD=0` 退回旧机制
@@ -2402,8 +2427,10 @@ pub const CudaBackend = struct {
     fn launchStream(self: *CudaBackend) ?*anyopaque {
         // XG 的录制也必须在 `g_stream` 上，否则 `xd_capture` 看到的流不在
         // capture 状态，录制直接失败（实测：rc=1 在第一个 op）。
-        if (self.gs().xd_phase == .rec) return self.g_stream;
-        return switch (self.gs().state) {
+        for (self.g_slots) |s| {
+            if (s.xd_phase == .rec) return self.g_stream;
+        }
+        return switch (self.g_slots[0].state) {
             .rec => self.g_stream,
             else => null,
         };
@@ -2412,7 +2439,12 @@ pub const CudaBackend = struct {
     /// True when a launch happening right now is being captured, i.e. when its
     /// arguments must be recorded for the per-token retarget.
     fn capturing(self: *const CudaBackend) bool {
-        return self.gs().xd_capturing;
+        // 任何槽在录都算"正在 capture"。三张图的 capture 不可能同时开
+        // （流只有一条、相位机一次只让一个槽进 `.rec`）。
+        for (self.g_slots) |s| {
+            if (s.xd_capturing) return true;
+        }
+        return false;
     }
 
     /// True when this step's work is (or will be) inside a graph, i.e. the op
@@ -2420,8 +2452,19 @@ pub const CudaBackend = struct {
     /// per-token scalars.  Covers BOTH mechanisms: the old `state` and XG's
     /// `xd_phase`.  Getting this wrong is silent: a node captured with a
     /// frozen `pos`/`slot` re-runs the first token's value every replay.
+    /// 有没有任何一个槽是 `.live`（诊断路径用；decode 只看槽 0）。
+    fn anySlotLive(self: *const CudaBackend) bool {
+        for (self.g_slots) |s| {
+            if (s.state == .live) return true;
+        }
+        return false;
+    }
+
     fn graphActive(self: *const CudaBackend) bool {
-        return self.gs().xd_phase == .rec or self.gs().xd_phase == .live;
+        for (self.g_slots) |s| {
+            if (s.xd_phase == .rec or s.xd_phase == .live) return true;
+        }
+        return false;
     }
 
     /// Suppress a host-side launch when the captured graph already contains it.
@@ -2431,12 +2474,12 @@ pub const CudaBackend = struct {
     /// for a REPLAYED step, whose work the graph has already done on `g_stream`.
     /// Without this the host path re-runs the whole step on the default stream
     /// next to the graph -- see `g_op_seen`.
-    fn gOpGate(self: *CudaBackend, seen: *bool) bool {
+    fn gOpGate(self: *CudaBackend, g: backend.Graph, seen: *bool) bool {
         // `g_direct`：当前这段代码不在任何 graph 的管辖范围内（MTP 的 draft
         // 循环就是这样跑的）。它必须真正执行，而不是被当成"已由 graph 重放
         // 吸收"而跳过 —— 否则 draft 什么都不算，verify 拿到垃圾。
         if (self.g_direct) return false;
-        switch (self.gs().state) {
+        switch (self.gs(g.slot).state) {
             .rec => {
                 seen.* = true;
                 return false;
@@ -2452,7 +2495,11 @@ pub const CudaBackend = struct {
     /// printed once (not per token) -- a per-token flood would bury the real
     /// message and cost measurable time in the very path being measured.
     fn graphAbandon(self: *CudaBackend, why: []const u8) void {
-        if (!self.gs().xd_capturing) return;
+        var slot_i: u8 = 0;
+        while (slot_i < self.g_slots.len) : (slot_i += 1) {
+            if (self.g_slots[slot_i].xd_capturing) break;
+        }
+        if (slot_i == self.g_slots.len) return;
         self.stat_g_abandon += 1;
         if (self.stat_g_abandon == 1) {
             std.debug.print(
@@ -2463,8 +2510,8 @@ pub const CudaBackend = struct {
         // ORDER MATTERS: the capture has to be CLOSED first, because until
         // `cudaStreamEndCapture` returns the stream is still "capturing" and any
         // subsequent launch on it fails with `cudaErrorStreamCaptureUnsupported`.
-        self.gs().xd_capturing = false;
-        if (self.gs().xd_phase == .rec) self.gs().xd_phase = .off;
+        self.g_slots[slot_i].xd_capturing = false;
+        if (self.g_slots[slot_i].xd_phase == .rec) self.g_slots[slot_i].xd_phase = .off;
         if (self.cu) |*cu| {
             var g: ?*anyopaque = null;
             _ = cu.lib.StreamEndCapture(self.g_stream, &g);
@@ -2520,7 +2567,7 @@ pub const CudaBackend = struct {
         // engine silently produced a garbled token stream -- see the "xg: replay"
         // note on `xd_launched`.  It is armed only when explicitly asked for,
         // so `QWEN35_CUDA_GRAPH=0` and the plain path stay the default.
-        if (self.gs().xd_phase == .off and xdWanted()) self.gs().xd_phase = .rec;
+        if (self.g_slots[0].xd_phase == .off and xdWanted()) self.g_slots[0].xd_phase = .rec;
     }
 
     /// Open the capture.  `pos` and `slot` are this token's values, recorded so
@@ -2557,71 +2604,86 @@ pub const CudaBackend = struct {
     // 每 token 重试一次 capture，用 `QWEN35_CUDA_GRAPH=0` 关掉即可）。
 
     /// 开始/推进这一步。返回带 `ptr` 的图（`live`/`rec`）或直通图。
+    ///
+    /// 槽号来自**句柄**（`g.slot`），不是后端的"当前槽"。`graphBegin` 与
+    /// `graphEnd` 会嵌套（草稿块在 verify 里面），全局当前槽会让外层的收尾
+    /// 落到内层的槽上 —— 实测：草稿槽永远停在 `.off`，草稿的 op 全落到主机侧
+    /// 又算一遍，接受率 0%。
     fn xdPhaseBegin(self: *CudaBackend, g: backend.Graph) backend.Graph {
-        const s = self.gs();
+        const s = self.gs(g.slot);
+        const out_node = struct {
+            fn make(gg: backend.Graph, ss: *GraphSlot, replayed: bool) backend.Graph {
+                return .{
+                    .kind = gg.kind,
+                    .ctl = gg.ctl,
+                    .slot = gg.slot,
+                    .ptr = @ptrCast(ss),
+                    .replayed = replayed,
+                };
+            }
+        }.make;
         s.xd_launched = false;
         // prefill 的块长度是数据相关的（`min(nbatch, 剩余 token)`），而一张图
         // 只对一种行数成立；按形状建图最多要 nbatch-1 张。prefill 的发射开销
         // 在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7 的账本），所以
         // `.chunk` 一律直通，**不要把 `xd_phase` 置回 `.rec` 给它用**。
         // 这里把它挡在 open/instantiate 之前：否则每块都会录一张、上一张作废。
+        if (g.kind == .chunk) return g;
+        // 再防一次同槽重入：prefill 的尾巴块只有 1 个 token 时，
+        // `forwardChunk` 会递归调用 `forwardLogits`，同一个槽里出现两次
+        // `graphBegin`。第二次 `StreamBeginCapture` 会被运行时拒绝
+        // （`cudaErrorStreamCaptureUnsupported` 401），而第一次开下的 capture
+        // 就永远没人关。
         switch (s.xd_phase) {
             .off => return g,
             .rec => {
                 // 直通图：capture 期 op 必须照常发射，CUDA 才会记录它们；
                 // 若返回带 ptr 的图，`graphGate` 会把每次发射都跳过，图就是空的。
-                //
-                // `xd_phase` 已经是 `.rec` 时**不要**再开一次：prefill 的尾巴块
-                // 只有 1 个 token 时，`forwardChunk` 会递归调用 `forwardLogits`，
-                // 于是同一个调用栈里出现两次 `graphBegin`。第二次 `StreamBeginCapture`
-                // 会被运行时拒绝（`cudaErrorStreamCaptureUnsupported` 401），而第一次
-                // 开下的 capture 就永远没人关。
-                if (s.xd_capturing) return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
-                if (!self.xdStartCapture()) return g;
-                return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+                if (s.xd_capturing) return out_node(g, s, false);
+                if (!self.xdStartCapture(s)) return g;
+                return out_node(g, s, false);
             },
             .live => {
                 // `$QWEN35_XD_NOREPLAY=1`：每一步都重新录制而不是重放。调试用，
                 // 用来把"图的内容错"与"重放这个动作错"分开。
                 if (cudart.getenv("QWEN35_XD_NOREPLAY") != null) {
-                    if (self.gs().xd_gexec) |e| {
+                    if (s.xd_gexec) |e| {
                         if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
                         s.xd_gexec = null;
                     }
                     s.xd_phase = .rec;
-                    if (!self.xdStartCapture()) return g;
-                    return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s) };
+                    if (!self.xdStartCapture(s)) return g;
+                    return out_node(g, s, false);
                 }
-                if (!self.xdReplay()) {
+                if (!self.xdReplay(s)) {
                     // 重放失败后**不能**退回主机侧直接发射：图可能已经执行
                     // （状态被推进一次），重跑整步会把状态推进两次。所以只有
                     // "图没启动"这一种失败允许降级；见 `xd_launched`。
                     s.xd_phase = .off;
-                    if (s.xd_launched) return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s), .replayed = true };
+                    if (s.xd_launched) return out_node(g, s, true);
                     return g;
                 }
                 // `.replayed = true` 是抑制主机侧发射的唯一依据：图的每一个节点
                 // 都会在本步执行，主机再发一遍就是在默认流上把整步算第二次。
-                return .{ .kind = g.kind, .ctl = g.ctl, .ptr = @ptrCast(s), .replayed = true };
+                return out_node(g, s, true);
             },
         }
-        return g;
     }
 
-    fn xdPhaseEnd(self: *CudaBackend) void {
-        const s = self.gs();
+    fn xdPhaseEnd(self: *CudaBackend, g: backend.Graph) void {
+        const s = self.gs(g.slot);
         switch (s.xd_phase) {
-            .rec => self.xdFinishCapture(),
+            .rec => self.xdFinishCapture(s),
             // `live` 的 `GraphLaunch` 已经在 `xdPhaseBegin` 里发过，没有收尾。
             else => {},
         }
     }
 
     /// 开 capture。失败返回 false，`xd_phase` 归 `.off`。
-    fn xdStartCapture(self: *CudaBackend) bool {
+    fn xdStartCapture(self: *CudaBackend, slot: *GraphSlot) bool {
         const cu = &(self.cu orelse return false);
         if (!self.xdEnsureStream()) {
-            self.gs().xd_phase = .off;
+            slot.xd_phase = .off;
             return false;
         }
         // 先排空：capture 开始前默认流上的 embedding 拷贝必须已经落定，否则
@@ -2639,10 +2701,10 @@ pub const CudaBackend = struct {
         const rc = cu.lib.StreamBeginCapture(self.g_stream, cudart.StreamCaptureModeGlobal);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("xg: begin capture", rc);
-            self.gs().xd_phase = .off;
+            slot.xd_phase = .off;
             return false;
         }
-        self.gs().xd_capturing = true;
+        slot.xd_capturing = true;
         return true;
     }
 
@@ -2684,9 +2746,8 @@ pub const CudaBackend = struct {
         });
     }
 
-    fn xdFinishCapture(self: *CudaBackend) void {
+    fn xdFinishCapture(self: *CudaBackend, s: *GraphSlot) void {
         const cu = &(self.cu orelse return);
-        const s = self.gs();
         if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
             std.debug.print("[xg] finish capture, phase={s}\n", .{@tagName(s.xd_phase)});
         }
@@ -2734,9 +2795,8 @@ pub const CudaBackend = struct {
     /// （lm_head matvec、读它结果的 argmax）因此会和图并发，除非显式排序。
     /// 旧机制在这里踩过：`backend_cuda.zig` 的 `graphReplayInner` 注释记录了
     /// "参数全冻结、每次跑出不同 token"，只加这一道 barrier 就逐位一致。
-    fn xdReplay(self: *CudaBackend) bool {
+    fn xdReplay(self: *CudaBackend, s: *GraphSlot) bool {
         const cu = &(self.cu orelse return false);
-        const s = self.gs();
         const gexec_live = s.xd_gexec orelse return false;
         // 没有 `apply`：参照项目（llama.cpp / ds4 / Strata）重放前都不改节点。
         // 逐 token 变化的标量由设备控制块在 kernel 内读取（S3a/S3b），其余
@@ -2812,9 +2872,17 @@ pub const CudaBackend = struct {
     /// Free the graph state.  Idempotent; called from `deinit`.
     fn graphDestroy(self: *CudaBackend) void {
         if (self.cu) |*cu| {
-            if (self.gs().xd_gexec) |e| {
+            for (&self.g_slots) |*sl| {
+                if (sl.xd_gexec) |e| {
+                    _ = cu.lib.GraphExecDestroy(e);
+                    sl.xd_gexec = null;
+                }
+                sl.xd_phase = .off;
+                sl.xd_capturing = false;
+            }
+            if (self.g_slots[0].xd_gexec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
-                self.gs().xd_gexec = null;
+                self.g_slots[0].xd_gexec = null;
             }
             if (self.g_ev_out) |ev| {
                 _ = cu.lib.EventDestroy(ev);
@@ -2829,8 +2897,10 @@ pub const CudaBackend = struct {
                 self.g_stream = null;
             }
         }
-        self.gs().xd_phase = .off;
-        self.gs().xd_capturing = false;
+        for (&self.g_slots) |*sl| {
+            sl.xd_phase = .off;
+            sl.xd_capturing = false;
+        }
         if (self.stat_g_replay != 0 or self.stat_g_abandon != 0) {
             std.debug.print("cuda: graph replays={d} abandoned-tokens={d}\n", .{
                 self.stat_g_replay, self.stat_g_abandon,
@@ -4761,6 +4831,8 @@ pub const CudaBackend = struct {
     /// wait five times per round was pure loss.
     fn dArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         std.debug.assert(out.len >= rows and rows > 0);
         if (self.cu == null or logits.len == 0 or logits.len % rows != 0) {
             // Host memory (or a malformed region): the CPU oracle is the
@@ -4851,7 +4923,7 @@ pub const CudaBackend = struct {
     fn dArgmaxConf(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
         _ = g;
         const self = self_(ctx);
-        if (self.gs().state == .live) p.* = 1.0; // the graph already ran it
+        if (self.anySlotLive()) p.* = 1.0; // the graph already ran it
         return self.argmaxConf(logits, p);
     }
 
@@ -5166,7 +5238,7 @@ pub const CudaBackend = struct {
         // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
         // 自己在 `graphEnd` 里读控制块；在新路径上支持捕获之前，S1 图从不为
         // live，这个分支不可达。）
-        const replayed = self.gs().state == .live;
+        const replayed = self.g_slots[0].state == .live;
         if (replayed) {
             return self.collectSampledToken(sp);
         }
@@ -5182,7 +5254,7 @@ pub const CudaBackend = struct {
         // 录制期（草稿块）：这一趟的 f32 logits 常驻在 `d_deq` 里，`dSampledToken`
         // 在 `graphEnd` 之后要拿它做那次阻塞 D2H。只记指针：它不随步变，也不会
         // 在 capture 里过期（`graphReserve` 提前把它分配好了）。
-        if (self.graphActive() and self.gs().xd_capturing) {
+        if (self.graphActive() and self.capturing()) {
             self.sample_sp = sp;
             self.sample_vocab = logits.len;
             self.sample_logits = if (dBufPtr(logits) != null) self.d_deq else null;
@@ -5532,7 +5604,7 @@ pub const CudaBackend = struct {
                                     // 分支把 slot 当 kernel 实参，录进图后每次重放
                                     // 都按录制那一步的 KV 长度算 attention。
                                     const want_dyn = graphWanted() and
-                                        (self.gs().state == .live or self.gs().state == .rec or self.graphActive());
+                                        (self.g_slots[0].state == .live or self.g_slots[0].state == .rec or self.graphActive());
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
                                             // **不要**在这里发布 `slot`。capture 期间
@@ -6126,7 +6198,7 @@ pub const CudaBackend = struct {
         // -- the pairs would measure empty intervals.  The graph path reports
         // its own totals via `stat_ns_token_dev`; disable the pool instead of
         // printing a table of zeros.
-        if (self.gs().state == .live) return null;
+        if (self.g_slots[0].state == .live) return null;
         if (self.slot_depth != 0) return null;
         if (!self.gpuEvEnsure()) {
             self.gpu_ev_on = false;
@@ -6782,9 +6854,15 @@ pub const CudaBackend = struct {
     /// 显式计算图（XG）的钩子。S2 返回直通图；捕获/重放在 S3 接线。CUDA 后端
     /// 仍保留 S1 的 registry，好让 A/B 开关（`QWEN35_CUDA_GRAPH`）与诊断输出
     /// 依然能描述"接下来会发生什么"。
-    fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl) backend.Graph {
+    fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl, slot: u8) backend.Graph {
         const self = self_(ctx);
-        if (!self.gpuReady()) return .{ .kind = kind, .ctl = ctl };
+        if (!self.gpuReady()) return .{ .kind = kind, .ctl = ctl, .slot = slot };
+        // 槽号来自调用方（见 `backend.Graph.slot`）。越界只会是引擎的笔误，
+        // 直接落回直通图并报一次，而不是悄悄写到别的槽上。
+        if (slot >= self.g_slots.len) {
+            std.debug.print("cuda backend: graphBegin slot {d} out of range\n", .{slot});
+            return .{ .kind = kind, .ctl = ctl, .slot = slot };
+        }
         // 在其它任何东西跑起来之前，先把这一步的标量发布出去。这是每步唯一能
         // 安全分配控制块的地方（capture 区间内 `cudaMalloc` 非法），也是唯一
         // 知道"这一步开始了"的地方。
@@ -6795,20 +6873,19 @@ pub const CudaBackend = struct {
         // 发布失败不是致命的：每个消费方都有逐标量回退，所以这一步照样跑（只是
         // capture 不安全，也就是它不会被录进图）。
         _ = self.publishCtl(ctl, null, true);
-        // 每种 kind 一张图：decode（1 行）、chunk/verify（k 行）、nextn（草稿块）。
-        // 节点集合不同，共用一槽会让每步都失配重捕。
-        self.g_cur = switch (kind) {
-            .decode => 0,
-            .chunk => 1,
-            .nextn => 2,
-        };
-        const g = backend.Graph{ .kind = kind, .ctl = ctl };
+        const g = backend.Graph{ .kind = kind, .ctl = ctl, .slot = slot };
 
         // XG 只服务 decode：prefill 的块长度是数据相关的，按形状建图会得到
         // 最多 nbatch-1 张图（实测见 AGENTS.md 的 prefill 账本），而 prefill
         // 的发射开销在 238 ms 的块里上界只有 6.3%。见 `xdPhaseBegin`。
         if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
-            std.debug.print("[xg] graphBegin kind={s} phase={s}\n", .{ @tagName(kind), @tagName(self.gs().xd_phase) });
+            std.debug.print("[xg] graphBegin kind={s} slot={d} phase={s}\n", .{ @tagName(kind), slot, @tagName(self.gs(slot).xd_phase) });
+        }
+        // 草稿块（`.nextn`）自己一张图：它在 `graphDirect` 段里跑，逐轮变的
+        // 只有嵌入 token（控制块的 `tok`）和几个位置标量，所以录一次就能重放。
+        if (kind == .nextn) {
+            if (!graphWanted() or !xdWanted()) return g;
+            return self.xdPhaseBegin(g);
         }
         if (kind != .decode or !graphWanted()) return g;
         // 采样参数在**图 launch 之前**拷进设备常驻控制块。这是整个重放循环里
@@ -6826,7 +6903,7 @@ pub const CudaBackend = struct {
         //
         // 引擎每步传的是同一个 `*Sampler`（`dSample_body` 里记下的
         // `sample_sp`），所以这里拿到的 temperature/top-k/top-p/PRNG 就是当步的。
-        if (self.gs().xd_phase == .live and kind == .decode) {
+        if (self.gs(slot).xd_phase == .live and kind == .decode) {
             if (self.sample_sp) |sp| {
                 if (self.d_sample_ctl != null) {
                     _ = self.publishSampleCtl(self.sample_vocab, sp, self.g_stream);
@@ -6840,7 +6917,9 @@ pub const CudaBackend = struct {
     fn dGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
         const self = self_(ctx);
         if (g.ptr == null) return;
-        self.xdPhaseEnd();
+        // 收尾用的是**这张图自己的槽**，所以嵌套 span（草稿块在 verify 里面）
+        // 各自关各自的 capture，外层不会被内层提前关掉。
+        self.xdPhaseEnd(g.*);
         g.ptr = null;
     }
 
@@ -6910,7 +6989,7 @@ pub const CudaBackend = struct {
     fn dGraphDirect(ctx: *anyopaque, on: bool) void {
         const self = self_(ctx);
         if (on) {
-            if (self.gs().xd_capturing) self.graphAbandon("direct span (MTP draft)");
+            if (self.capturing()) self.graphAbandon("direct span (MTP draft)");
             for (&self.g_slots) |*s| {
                 if (s.xd_phase != .off or s.xd_gexec != null) {
                     if (s.xd_gexec) |e| {
@@ -6924,7 +7003,7 @@ pub const CudaBackend = struct {
             return;
         }
         self.g_direct = false;
-        if (self.gs().xd_phase == .off and xdWanted()) self.gs().xd_phase = .rec;
+        if (self.g_slots[0].xd_phase == .off and xdWanted()) self.g_slots[0].xd_phase = .rec;
     }
 
     /// prefill 循环的结束点：主机侧唯一能确知"prefill 已经做完"的地方。这里记录
@@ -7061,6 +7140,8 @@ pub const CudaBackend = struct {
     /// The `dequantRow` slot, timed (`$QWEN35_PROF`).
     fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.dequant_row, t0);
         vDequantRow_body(g, ctx, dstBuf, w, row);
@@ -7069,6 +7150,8 @@ pub const CudaBackend = struct {
     /// The `matvec` slot, timed (`$QWEN35_PROF`).
     fn vMatvec(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec, t0);
         if (self.ablated(.matvec)) return ;
@@ -7079,6 +7162,8 @@ pub const CudaBackend = struct {
     /// (or two), and a separate slot would only split the same total.
     fn vMatvecPair(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec, t0);
         if (self.ablated(.matvec)) return ;
@@ -7088,6 +7173,8 @@ pub const CudaBackend = struct {
     /// The `matvecBatchK` slot, timed (`$QWEN35_PROF`).
     fn vMatvecBatchK(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec_batchk, t0);
         if (self.ablated(.matvec_batchk)) return ;
@@ -7128,6 +7215,8 @@ pub const CudaBackend = struct {
     /// The `scaleVec` slot, timed (`$QWEN35_PROF`).
     fn dScaleVec(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.scale_vec, t0);
         if (self.ablated(.scale_vec)) return ;
@@ -7137,6 +7226,8 @@ pub const CudaBackend = struct {
     /// The `addResid` slot, timed (`$QWEN35_PROF`).
     fn dAddResid(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.add_resid, t0);
         if (self.ablated(.add_resid)) return ;
@@ -7146,6 +7237,8 @@ pub const CudaBackend = struct {
     /// The `copyRange` slot, timed (`$QWEN35_PROF`).
     fn dCopyRange(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         // Per-width accounting, alongside the slot total.  The bucket comes from
         // `src.len` alone, so it is chosen on the way in and does not need the
@@ -7170,6 +7263,8 @@ pub const CudaBackend = struct {
     /// generic path, where a moving destination does not exist.
     fn dCopyRangeSlot(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         if (t0) |t| {
             const b = &self.stat_copy_bins[copyBinOf(src.len)];
@@ -7193,6 +7288,8 @@ pub const CudaBackend = struct {
     /// can produce the dense layout -- hence the kernel.
     fn dDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
         if (self.ablated(.deinterleave_qg)) return ;
@@ -7243,6 +7340,8 @@ pub const CudaBackend = struct {
     /// The `zeroBuf` slot, timed (`$QWEN35_PROF`).
     fn dZeroBuf(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.zero_buf, t0);
         if (self.ablated(.zero_buf)) return ;
@@ -7252,6 +7351,8 @@ pub const CudaBackend = struct {
     /// The `copyFromHost` slot, timed (`$QWEN35_PROF`).
     fn dCopyFromHost(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.copy_from_host, t0);
         if (self.ablated(.copy_from_host)) return ;
@@ -7261,6 +7362,8 @@ pub const CudaBackend = struct {
     /// The `copyToHost` slot, timed (`$QWEN35_PROF`).
     fn dCopyToHost(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.copy_to_host, t0);
         dCopyToHost_body(g, ctx, dst, src);
@@ -7269,6 +7372,8 @@ pub const CudaBackend = struct {
     /// The `rmsnorm` slot, timed (`$QWEN35_PROF`).
     fn dRmsnorm(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
         if (self.ablated(.rmsnorm)) return ;
@@ -7280,6 +7385,8 @@ pub const CudaBackend = struct {
     /// its `calls` count moves, which is the point of the merge).
     fn dRmsnormRows(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
         if (self.ablated(.rmsnorm)) return ;
@@ -7289,6 +7396,8 @@ pub const CudaBackend = struct {
     /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
     fn dL2norm(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
         if (self.ablated(.l2norm)) return;
@@ -7298,6 +7407,8 @@ pub const CudaBackend = struct {
     /// Row-batched twin of `dL2norm`; charged to the `l2norm` slot.
     fn dL2normRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, n: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
         dL2normRows_body(g, ctx, x, n);
@@ -7306,6 +7417,8 @@ pub const CudaBackend = struct {
     /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
     fn dSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.silu, t0);
         if (self.ablated(.silu)) return ;
@@ -7315,6 +7428,8 @@ pub const CudaBackend = struct {
     /// The `mulSilu` slot, timed (`$QWEN35_PROF`).
     fn dMulSilu(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_silu, t0);
         if (self.ablated(.mul_silu)) return ;
@@ -7324,6 +7439,8 @@ pub const CudaBackend = struct {
     /// The `mulSigmoid` slot, timed (`$QWEN35_PROF`).
     fn dMulSigmoid(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_sigmoid, t0);
         if (self.ablated(.mul_sigmoid)) return ;
@@ -7333,6 +7450,8 @@ pub const CudaBackend = struct {
     /// The `swiglu` slot, timed (`$QWEN35_PROF`).
     fn dSwiglu(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.swiglu, t0);
         if (self.ablated(.swiglu)) return ;
@@ -7342,6 +7461,8 @@ pub const CudaBackend = struct {
     /// The `softmax` slot, timed (`$QWEN35_PROF`).
     fn dSoftmax(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.softmax, t0);
         if (self.ablated(.softmax)) return ;
@@ -7351,6 +7472,8 @@ pub const CudaBackend = struct {
     /// The `argmax` slot, timed (`$QWEN35_PROF`).
     fn dArgmax(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.argmax, t0);
         if (self.ablated(.argmax)) return 0;
@@ -7360,6 +7483,8 @@ pub const CudaBackend = struct {
     /// The `sample` slot, timed (`$QWEN35_PROF`).
     fn dSample(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.sample, t0);
         if (self.ablated(.sample)) return 0;
@@ -7683,16 +7808,16 @@ pub const CudaBackend = struct {
         if (maxrows != 0) {
             // CUDA-graph 重放：起始行必须从设备读，dynamic shared 固定最大值。
             // 否则捕获时固化的 `slot0`/`smem` 会让每个 token 都要重新捕获。
-            if (self.gs().state == .live and self.gs().d_attn_slot != null and
+            if (self.g_slots[0].state == .live and self.g_slots[0].d_attn_slot != null and
                 rows <= maxrows and self.kvKind() == 0 and n_tot <= 12288)
             {
                 const want: c_int = @intCast(slot0);
-                if (want != self.gs().d_attn_slot_host) {
-                    if (self.cu.?.lib.MemcpyAsync(self.gs().d_attn_slot.?, &want,
+                if (want != self.g_slots[0].d_attn_slot_host) {
+                    if (self.cu.?.lib.MemcpyAsync(self.g_slots[0].d_attn_slot.?, &want,
                             @sizeOf(c_int), cudart.MemcpyHostToDevice, self.launchStream()) ==
                         cudart.cudaSuccess)
                     {
-                        self.gs().d_attn_slot_host = want;
+                        self.g_slots[0].d_attn_slot_host = want;
                     }
                 }
                 if (dBufPtr(q)) |pq| {
@@ -7703,7 +7828,7 @@ pub const CudaBackend = struct {
                                     const rc = Launch.attn_chunk_dyn(
                                         g,
                                         pq, pgate, pk, pv, pgout,
-                                        @ptrCast(@alignCast(self.gs().d_attn_slot.?)),
+                                        @ptrCast(@alignCast(self.g_slots[0].d_attn_slot.?)),
                                         @intCast(rows), @intCast(heads), @intCast(gqa),
                                         @intCast(hd), @intCast(kv_dim), scale,
                                         self.kvKind(), self.launchStream());
@@ -7763,6 +7888,8 @@ pub const CudaBackend = struct {
     /// `rope64(slot)`, timed (`$QWEN35_PROF`).
     fn dRope64(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64, t0);
         if (self.ablated(.rope64)) return;
@@ -7805,6 +7932,8 @@ pub const CudaBackend = struct {
     /// this op, and it must not become a silent corruption if it changes.
     fn dRopeRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64_rows, t0);
         if (self.ablated(.rope64_rows)) return;
@@ -7845,6 +7974,8 @@ pub const CudaBackend = struct {
 
     fn dRope64Rows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64_rows, t0);
         if (self.ablated(.rope64_rows)) return;
@@ -7854,6 +7985,8 @@ pub const CudaBackend = struct {
     /// The `convStep` slot, timed (`$QWEN35_PROF`).
     fn dConvStep(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.conv_step, t0);
         if (self.ablated(.conv_step)) return ;
