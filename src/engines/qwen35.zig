@@ -1916,97 +1916,82 @@ pub const Engine = struct {
 
         self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
-        // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
-        // Q,K are nk*kd wide, V is nv*kd wide
+        // in_proj_qkv [hidden, conv_dim]：[Q|K|V] 连续排布（SPEC A1）；
+        // Q、K 宽 nk*kd，V 宽 nv*kd
         const qkv = self.qkv.span(0, conv_dim);
         self.exec.matvec(self.graph, qkv, lw.attn_qkv.?, self.x1);
 
-        // z projection (attn_gate [hidden, value_dim])
+        // z 投影（attn_gate [hidden, value_dim]）
         const z = self.z.span(0, value_dim);
         self.exec.matvec(self.graph, z, lw.attn_gate.?, self.x1);
 
-        // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
-        // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
-        // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
+        // a/b 投影：ssm_alpha 即 a（衰减），ssm_beta 即 b（beta 的输入），每个
+        // **value head** 一个标量（C 参照里 gdn_a/gdn_b/A/dt 都按 gdn_vheads
+        // 定尺寸；GGUF 的行在 0.8B/2B/4B 上都是 [hidden, nv]）
         //
-        // ONE `matvecPair` instead of two `matvec` calls.  `ssm_alpha` and
-        // `ssm_beta` are both [hidden, nv] of the same type and sit back to
-        // back in the GGUF (verified for all 48 layers: `alpha.off +
-        // alpha.size == beta.off`), i.e. they ARE one `2*nv x hidden` matrix,
-        // and `ab` is already the contiguous output.  The backend proves the
-        // adjacency before fusing and falls back to the two calls otherwise.
+        // 用**一次** `matvecPair` 而不是两次 `matvec`。`ssm_alpha` 与
+        // `ssm_beta` 都是 [hidden, nv] 同类型，且在 GGUF 里紧邻存放（48 层全都
+        // 核对过：`alpha.off + alpha.size == beta.off`），也就是说它们**就是**一张
+        // `2*nv x hidden` 的矩阵，而 `ab` 本来就是连续的输出。后端在融合之前会先
+        // 证明相邻性，否则退回两次调用。
         //
-        // Two launches here cost more than they compute: each is 48x5120 q8_0
-        // = 255 KB, and 255 KB reads in 3.1-4.4 us at 60-85 GB/s for every
-        // block shape tested (/tmp/shp/bw2.cu) -- that is the launch floor, not
-        // bandwidth.  96 such launches per token (~0.3 ms, 1.6%) halve to 48.
+        // 这里两次发射的开销大于它们算的东西：每个是 48x5120 q8_0 = 255 KB，而
+        // 在所有试过的 block 形状下（/tmp/shp/bw2.cu），读 255 KB 要 3.1–4.4 us、
+        // 带宽只有 60–85 GB/s —— 那是发射下限，不是带宽。这样的发射每 token 有
+        // 96 次（约 0.3 ms，1.6%），减半到 48 次。
         const ab = self.ab.span(0, 2 * nv);
         self.exec.matvecPair(self.graph, ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
 
-        // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
-        // convStep handles history + silu for all channels; beta/gamma
-        // are computed after, on the RAW a/b projections (not conv'd).
+        // 因果 conv1d，左侧补 K-1，之后接 silu（SPEC A2，C 参照 520-556）
+        // convStep 对所有通道处理历史 + silu；beta/gamma 在其后基于**原始** a/b
+        // 投影计算（不经过 conv）。
         const st = &self.gdn[li];
         self.exec.convStep(self.graph, st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
 
-        // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
-        // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
+        // beta = sigmoid(b)；g = A * softplus(a + dt_bias)，其中 A = ssm_a
+        // （GGUF 的 ssm_a 已经是 -exp(A_log)，即负值，已核对）。
         //
-        // `beta` is written IN PLACE into the b half of `ab`, and `gamma` is
-        // this layer's `nv` decay scalars.  Both are backend regions, and they
-        // STAY there: `gdnStepRows` takes them as `Buf`s and a device backend
-        // reads its own memory, so a token makes no gamma/beta PCIe trip at all
-        // (it used to be 2 * nv * 4 B down and 2 * nv * 4 B back up per GDN
-        // layer -- `Exec.copyToHost` per layer, which is now off this path
-        // entirely).
+        // `beta` **就地**写进 `ab` 的 b 那一半，`gamma` 是本层的 `nv` 个衰减标量。
+        // 两者都是后端区域，而且**一直留在那里**：`gdnStepRows` 以 `Buf` 形式接收
+        // 它们，设备后端读自己的内存，所以一个 token 完全不会为 gamma/beta 走一趟
+        // PCIe（过去是每个 GDN 层 2*nv*4 B 下行加 2*nv*4 B 上行 —— 每层一次
+        // `Exec.copyToHost`，现在已彻底离开这条路径）。
         //
-        // The two regions change contents every layer every token, so they must
-        // never be handed to a pointer-keyed "upload once" cache; see
-        // `VTable.gdnStepRows`.
+        // 这两块区域每层每 token 都换内容，所以绝不能交给按指针做键的"只上传一次"
+        // 缓存；见 `VTable.gdnStepRows`。
         const beta = self.ab.span(nv, nv); // b half, overwritten with sigmoid(b)
         const gamma = self.gamma_scratch.span(0, nv);
         self.exec.gdnGamma(self.graph, ab.span(0, nv), beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
-        // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128), for a
-        // whole head-run at a time instead of one head at a time.  Conditions:
+        // 对 q、k 做 L2 normalize（eps 在求和里面），然后给 q 乘 1/sqrt(128)，
+        // 一次处理一整段 head，而不是一次一个 head。前提条件是：
         //   * the q heads are `qkv[0..kq_dim]`, the k heads `qkv[kq_dim .. 2*kq_dim]`
         //     and the v heads `qkv[2*kq_dim .. 3*kq_dim]` -- contiguous runs of
         //     `kd`-wide rows;
-        //   * every row gets the same eps / the same `qscale`;
-        //   * each row's normalisation is independent (own sum of squares).
-        // `l2normRows` is `n` consecutive single-row `k_l2norm` blocks and
-        // `scaleVec` is elementwise, so both are the same arithmetic per row.
+        //   * 每一行用同样的 eps / 同样的 `qscale`；
+        //   * 每一行的归一化互相独立（各自的平方和）。
+        // `l2normRows` 就是 `n` 个连续的单行 `k_l2norm` block，`scaleVec` 是逐
+        // 元素操作，所以两者在每行上的算术完全相同。
         //
-        // ACTIVE ON THIS MODEL: nv (48) > nk (16), so head `h` maps to k head
-        // `h % nk` and each q/k row is visited `nv / nk` = 3 times, in the order
-        // 0..nk-1 repeated.  `l2norm` is NOT idempotent (a second pass divides by
-        // sqrt(1 + eps) again), so the repetitions are part of the semantics and
-        // must be kept: one `l2normRows` over the `nk` rows, `nk_reps` times,
-        // reproduces exactly the sequence of per-row calls the loop made.
-        //
-        // NO `nv/nk` REPETITION.  The per-head loop this replaced visited row
-        // `h % nk` once per v head, i.e. `nv/nk` = 3 times per k head, and
-        // `l2normRows(span(0, kq_dim), kd)` normalises each of the `nk` rows
-        // ONCE -- so reproducing that loop needed 3 repeats.  That is the wrong
-        // operation, not just a slow way to express it: the reference
-        // (llama.cpp `llama_model_qwen3next::graph::build_layer_gdn`,
-        // src/models/qwen3next.cpp:503-511) applies `build_gdn_l2_norm` to a
-        // `(head_k_dim, num_k_heads)` view -- **16** rows -- and only THEN
-        // broadcasts q/k up to `num_v_heads` with `ggml_repeat_4d`
-        // (qwen3next.cpp:520-528).  Normalising 16 rows 3 times is not the same
-        // as normalising them once and repeating: `l2norm` is not idempotent,
-        // so passes 2 and 3 multiply the row by `rsqrt(1 + 1e-6)` ≈ 1-5e-7
-        // again.  The error was too small to flip a greedy token, which is why
-        // no test caught it, but it is both WRONG and 3x the work:
-        // ncu measured `k_l2norm` at 15.68 ms / 7452 calls over 20 tokens
-        // (2.1 us each for a 128-float reduction), and 2/3 of those calls were
-        // this repetition.
+        // **不做** `nv/nk` 次重复。这里替代掉的逐 head 循环会让第 `h % nk` 行每个
+        // v head 被访问一次（即每个 k head 3 次），而
+        // `l2normRows(span(0, kq_dim), kd)` 只把 `nk` 行各归一化**一次** —— 想复现
+        // 那个循环就得重复 3 次。但那是**错误的**运算，不只是表达得慢：参照实现
+        // （llama.cpp `llama_model_qwen3next::graph::build_layer_gdn`，
+        // src/models/qwen3next.cpp:503-511）是对一个 `(head_k_dim, num_k_heads)`
+        // 视图 —— **16** 行 —— 做 `build_gdn_l2_norm`，然后才用 `ggml_repeat_4d`
+        // 把 q/k 广播到 `num_v_heads`（qwen3next.cpp:520-528）。把 16 行归一化
+        // 3 次与"归一化一次再重复"并不等价：`l2norm` 不是幂等的，第 2、3 遍会把
+        // 该行再乘一次 `rsqrt(1 + 1e-6)` ≈ 1-5e-7。这个误差小到不会翻转 greedy
+        // 的 token，所以没有测试抓到它 —— 但它既**算错了**又做了 3 倍的活：ncu
+        // 实测 `k_l2norm` 在 20 个 token 里 15.68 ms / 7452 次调用（每次 2.1 us
+        // 做一次 128 元素的归约），其中 2/3 的调用就是这个重复。
         if (gdnHeadsTiled(nv, nk)) {
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            // One launch instead of three (l2normRows q, l2normRows k,
-            // scaleVec q).  Same arithmetic in the same order -- the CPU
+            // 一次发射取代三次（l2normRows q、l2normRows k、scaleVec q）。同样的
+            // 算术、同样的顺序 —— CPU
             // backend's `l2normQkScale` literally calls those three, and the
             // device kernel reproduces them per row.  See `backend.Exec`.
             self.exec.l2normQkScale(self.graph, qkv, nk, kd, kq_dim, qscale);
