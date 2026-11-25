@@ -531,10 +531,10 @@ pub fn applyRope64(x: []f32, pos: u32, base: f32) void {
 
 pub var prof_io: Io = undefined;
 
-/// Disable the K-token prefill chunking (QWEN35_NO_BATCH); every token then
-/// runs through the single-token path.
+/// 关闭 K-token 的 prefill 分块（QWEN35_NO_BATCH）；此后每个 token 都走单
+/// token 路径。
 pub var no_batch = false;
-/// Enable the per-phase timing report (QWEN35_PROF).
+/// 打开逐阶段计时报表（QWEN35_PROF）。
 pub var prof = false;
 
 pub fn profReport() void {
@@ -560,47 +560,42 @@ pub const Engine = struct {
     mm: std.Io.File.MemoryMap,
     file: std.Io.File,
     io: std.Io,
-    /// set by `load` when it created the Threaded instance; freed in deinit
+    /// 由 `load` 在创建 Threaded 实例时设置；在 deinit 里释放。
     owns_io: ?*std.Io.Threaded = null,
 
     token_embd: LinearW, // [vocab, hidden] row-major (embedding)
-    /// untied lm_head (27B+); null in the Engine means "tied" -> use
-    /// token_embd.  GGUF `output.weight` has the SAME [vocab, hidden]
-    /// row-major layout as token_embd.
+    /// 不共享的 lm_head（27B 及以上）；在 Engine 里为 null 表示"共享"，即用
+    /// token_embd。GGUF 的 `output.weight` 与 token_embd 是**相同**的
+    /// [vocab, hidden] 行优先布局。
     output_weight: ?LinearW,
     output_norm: backend.Buf, // [hidden]
-    /// Hardware boundary: matvecs, weight loading, dequantization and the
-    /// activation scratch the kernels need.  The engine never learns which
-    /// implementation this is -- CPU today, CUDA later.
+    /// 硬件边界：matvec、权重加载、反量化，以及 kernel 需要的激活 scratch。引擎
+    /// 永远不知道背后是哪一份实现。
     exec: backend.Exec,
-    /// The compute graph the current forward pass is being recorded into or
-    /// replayed from.  Set by `forwardLogits` / `forwardChunk`, which are the
-    /// only entry points: every op between them and the next `graphEnd` reads
-    /// it.  The pass-through value (`ptr == null`) makes every op behave
-    /// exactly as it did before the graph existed, which is what the CPU
-    /// backend and a failed capture use.
+    /// 当前这次前向正在被录制进（或从中重放）的计算图。由 `forwardLogits` /
+    /// `forwardChunk` 设置，它们是唯一的入口：从这里到下一个 `graphEnd` 之间的
+    /// 每个算子都读它。直通值（`ptr == null`）让每个算子的行为与"图还不存在时"
+    /// 完全一致，CPU 后端与捕获失败的情况用的就是它。
     ///
-    /// A field rather than a parameter threading: the layer helpers are 15 deep
-    /// and all of them would otherwise take it just to pass it on.
+    /// 做成字段而不是逐层传参：层内的辅助函数有 15 层深，否则它们都得为了往下
+    /// 传这一个参数而多一个形参。
     graph: backend.Graph = .{},
-    /// The token `step` produced.  Written inside the graph span so a backend
-    /// can sample on the device (`Exec.sample`), read by `step` right after.
+    /// `step` 产出的 token。在图的范围之内写出，好让后端能在设备上采样
+    /// （`Exec.sample`），随后由 `step` 读取。
     sampled: u32 = 0,
     layers: []LayerWeights,
     kv: []KvCache,
     gdn: []GdnState,
-    /// Pre-verify snapshot for speculative decoding; empty until
-    /// `specSnapshotAlloc` runs.
+    /// 推测解码用的 verify 前快照；在 `specSnapshotAlloc` 跑过之前是空的。
     spec_snap: []SnapLayer = &.{},
-    /// Trailing MTP / nextn prediction block (`blk.<n_layers>.*`), or null when
-    /// the model has none (0.8B/2B/4B) or `spec` was never initialised.
+    /// 尾部的 MTP / nextn 预测块（`blk.<n_layers>.*`）；模型没有这个块时
+    /// （0.8B/2B/4B）为 null，`spec` 从未初始化时也为 null。
     ///
-    /// SPECULATIVE DECODING (stage 1): the nextn block is a full decoder layer
-    /// plus a `eh_proj` that folds (embedding, hidden) back to `hidden`, and it
-    /// shares the main model's `output_norm` / lm_head.  It is the cheapest
-    /// possible drafter -- the weights ship with the target, so there is nothing
-    /// to download, and one forward gives one speculative token instead of the
-    /// 15 a DSpine-style block drafter proposes.
+    /// 推测解码（第 1 阶段）：nextn 块是一个完整的 decoder 层，外加一个
+    /// `eh_proj` 把 (embedding, hidden) 折回 `hidden`，它共享主模型的
+    /// `output_norm` / lm_head。这是最便宜的一种草稿头 —— 权重随目标模型一起
+    /// 发布，没有东西要下载，一次 forward 给出一个投机 token，而不是 DSpine
+    /// 那类块级草稿头一次提 15 个。
     nextn: ?Nextn = null,
     /// worker count (1 = serial); set by load from `n_threads`
     n_threads: usize = 1,
@@ -662,16 +657,14 @@ pub const Engine = struct {
     /// 每轮现场 `alloc` 3 MB 既没必要，也会让分配点混进热路径。
     spec_dbg_a: []f32 = &.{},
     spec_dbg_b: []f32 = &.{},
-    /// Number of tokens batched per prefill chunk (K-token batched projection:
-    /// each layer's weights are read once per chunk and reused across K tokens
-    /// through cache).  0 => the batched path is unavailable.
+    /// 每个 prefill 块批量处理的 token 数（K-token 批量投影：每层的权重每块只读
+    /// 一次，然后经缓存供 K 个 token 复用）。0 表示批量路径不可用。
     nbatch: usize = 0,
-    /// K-slot scratch for the batched prefill path.  `xK[t*hidden..]` is the
-    /// residual stream of token t of the current chunk; `x1K[t*hidden..]` the
-    /// RMS-normed input; `qkvK/gateK/abK/qK/kK/vK` the batched projection
-    /// outputs; `goutK/x2K` per-token attention/GDN output and out-projection
-    /// result; `mlpK/mlpK1` the ffn intermediates; `q8kK/q8K` the per-token
-    /// quantized activations for the batched matvecs.
+    /// 批量 prefill 路径的 K 槽 scratch。`xK[t*hidden..]` 是当前块第 t 个 token
+    /// 的残差流；`x1K[t*hidden..]` 是 RMS norm 之后的输入；`qkvK/gateK/abK/`
+    /// `qK/kK/vK` 是批量投影的输出；`goutK/x2K` 是逐 token 的 attention/GDN 输出
+    /// 与 out-projection 结果；`mlpK/mlpK1` 是 ffn 中间量；`q8kK/q8K` 是批量
+    /// matvec 用的逐 token 量化激活。
     xK: backend.Buf = backend.Buf.empty,
     x1K: backend.Buf = backend.Buf.empty,
     qkvK: backend.Buf = backend.Buf.empty,
@@ -684,40 +677,35 @@ pub const Engine = struct {
     x2K: backend.Buf = backend.Buf.empty,
     mlpK: backend.Buf = backend.Buf.empty,
     mlpK1: backend.Buf = backend.Buf.empty,
-    /// `spec_verify_rows * vocab` f32: every row's lm_head output for a batched
-    /// speculative verify (`forwardChunkVerify`).  The single-row `logits`
-    /// buffer cannot hold a block's worth.
+    /// `spec_verify_rows * vocab` 个 f32：批量推测验证（`forwardChunkVerify`）时
+    /// 每一行的 lm_head 输出。单行的 `logits` 缓冲装不下一整块。
     logitsK: backend.Buf = backend.Buf.empty,
-    /// Top-k order-statistic workspace (quickselect); sized vocab.
+    /// top-k 的次序统计工作区（quickselect）；尺寸为 vocab。
     sample_scratch: backend.Buf = backend.Buf.empty,
-    /// Sampling policy applied to every produced token.  Default is greedy
-    /// (temperature 0), i.e. exactly the historical behaviour; the CLI sets
-    /// it from -t/-k/-s.
+    /// 施加到每个产出 token 上的采样策略。默认是 greedy（temperature 0），也就是
+    /// 与历史行为完全一致；CLI 由 -t/-k/-s 设置它。
     sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
 
-    // ---- speculative-decoding taps (DSpine port, stage 0) ----
+    // ---- 推测解码的抽头（DSpine 移植，第 0 阶段）----
     //
-    // The DSpine draft consumes the target's hidden state at a FIXED set of
-    // layer indices (`dflash_config.target_layers`, `[2,17,32,47,62]` for the
-    // 27B) and never looks at any other layer.  `forwardChunk` can therefore
-    // copy those layers' OUTPUT hidden state into `tap_hidden`, which the
-    // draft's `fc` projection then turns into its 5H -> H context.
+    // DSpine 草稿头只消费目标模型在**固定**一组层索引上的 hidden state
+    // （`dflash_config.target_layers`，27B 是 `[2,17,32,47,62]`），其它层一概不
+    // 看。于是 `forwardChunk` 可以把这些层的**输出** hidden state 拷进
+    // `tap_hidden`，草稿头的 `fc` 投影再把它变成 5H -> H 的上下文。
     //
-    // LAYOUT: `tap_hidden` is `taps.len * nbatch * hidden`, i.e. one
-    // `nbatch * hidden` plane per tap, tap-major.  Tap `i` covers layer
-    // `tap_layers[i]`, and inside that plane row `t` is token `t` of the
-    // chunk -- matching `dspine_mlx`'s `_LayerHook`, which stores the layer's
-    // WHOLE output tensor (`mx.concatenate(storage, axis=-1)` keeps every
-    // position; the draft needs features for all block rows, not just the
-    // last).  The `nbatch` stride (not `k`) is so a short final chunk still
-    // lands at a fixed offset and the reader does not have to know `k`.
+    // 布局：`tap_hidden` 是 `taps.len * nbatch * hidden`，即每个抽头一片
+    // `nbatch * hidden`，抽头优先。抽头 `i` 对应层 `tap_layers[i]`，片内第 `t` 行
+    // 就是块内第 `t` 个 token —— 与 `dspine_mlx` 的 `_LayerHook` 一致：它存的是该
+    // 层**整张**输出张量（`mx.concatenate(storage, axis=-1)` 保留每个位置；草稿
+    // 头需要块内所有行的特征，不只是最后一行）。用 `nbatch` 而不是 `k` 做步长，
+    // 是为了让较短的末块仍落在固定偏移上，读者不必知道 `k`。
     //
-    // Disabled by default: `tap_hidden` is `Buf.empty`, so the normal
-    // prefill/decode path pays ONE usize compare per layer and nothing else.
+    // 默认关闭：`tap_hidden` 是 `Buf.empty`，所以正常的 prefill/decode 路径每层
+    // 只付一次 usize 比较，别的什么也不付。
     //
-    // ORDER: `tap_layers` must be ASCENDING (it is the draft's
-    // `target_layers`); tap i is written from layer `tap_layers[i]`.
+    // 顺序：`tap_layers` 必须**升序**（它就是草稿头的 `target_layers`）；抽头 i
+    // 从层 `tap_layers[i]` 写出。
     tap_layers: []const u32 = &.{},
     tap_hidden: backend.Buf = backend.Buf.empty,
     /// Rolling tap ring for the spec context window (`specRingEnable`).
