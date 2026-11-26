@@ -326,7 +326,6 @@ fn graphGate(g: backend.Graph) bool {
     // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
     if (g.kind == .nextn) {
         const self = xg_backend orelse return g.replayed;
-        // 槽数组在堆上，分配失败时是空切片（见 `g_slots` 的注释）。
         if (xg_cur_slot >= self.g_slots.len) return g.replayed;
         const s = self.g_slots[xg_cur_slot];
         if (s.xd_capturing) return false;
@@ -1684,14 +1683,9 @@ pub const CudaBackend = struct {
     /// 0 = decode（1 行）、1 = verify（k 行）、2 = nextn（草稿块）。
     /// 形状不同就不能共用一槽：节点集合一变，每步都要重捕，等于没有图。
     ///
-    /// **堆上分配，不内联。** `GraphSlot` 里还留着旧机制的一大堆
-    /// `[graph_max_layers][kernel_max_args]` 参数数组，单个槽有上百 KB；三个
-    /// 内联进 `CudaBackend` 会把它撑到接近线程栈上限（`CpuBackend` 是按值嵌在
-    /// 引擎里的，引擎就活在主线程栈上）。实测：给槽加一个 4 字节字段就让
-    /// `CudaBackend.init` 在 `--backend cpu` 下段错误，地址紧贴栈顶
-    /// （0x7fff73e27e10）。`init` 里分配，失败时留空切片（`gs()` 的调用方都已
-    /// 做了边界检查）。
-    g_slots: []GraphSlot = &.{},
+    /// 三个槽内联：`GraphSlot` 现在只有 3 个指针 + 一个枚举 + 两个标量
+    /// （约 32 B），三个不到 100 B，不会重演"上百 KB 的槽撑爆线程栈"。
+    g_slots: [graph_slot_count]GraphSlot = @splat(.{}),
     /// `sample` 的结果。图活跃时由 `dSample` 留空（只有 kernel 进图），
     /// token 在 `graphEnd` 之后由 `dSampledToken` 读回时填入。
     sampled: u32 = 0,
@@ -1827,11 +1821,6 @@ pub const CudaBackend = struct {
             .cpu = cpu_mod.CpuBackend.init(alloc, g),
             .g = g,
         };
-        // 槽在堆上（见 `g_slots` 的注释）。分配失败留空切片：`gs()` 的调用方
-        // 都会先查边界，此时图一律直通，模型照常跑。
-        self.g_slots = alloc.alloc(GraphSlot, graph_slot_count) catch &.{};
-        for (self.g_slots) |*s| s.* = .{};
-
         // Ask cudart for the device before touching weights, so a host with no GPU
         // fails here (and `allocScratch` reports it) rather than after a partial
         // upload.
@@ -2783,7 +2772,7 @@ pub const CudaBackend = struct {
     /// Free the graph state.  Idempotent; called from `deinit`.
     fn graphDestroy(self: *CudaBackend) void {
         if (self.cu) |*cu| {
-            for (self.g_slots) |*sl| {
+            for (&self.g_slots) |*sl| {
                 if (sl.xd_gexec) |e| {
                     _ = cu.lib.GraphExecDestroy(e);
                     sl.xd_gexec = null;
@@ -2808,7 +2797,7 @@ pub const CudaBackend = struct {
                 self.g_stream = null;
             }
         }
-        for (self.g_slots) |*sl| {
+        for (&self.g_slots) |*sl| {
             sl.xd_phase = .off;
             sl.xd_capturing = false;
         }
