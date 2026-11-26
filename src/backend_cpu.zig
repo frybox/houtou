@@ -892,6 +892,18 @@ pub const CpuBackend = struct {
         dequantRowInto(dst.slice(), w, row);
     }
 
+    /// `g.ctl.tok[r]` 那几行展开进连续排布的 `dst`（见 `VTable.dequantRows`）。
+    /// CPU 后端里控制块就是一个普通值，没有 capture 问题。
+    fn vDequantRows(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow) void {
+        _ = ctx;
+        const cols = w.cols();
+        const rows: usize = g.ctl.rows;
+        std.debug.assert(dst.len >= rows * cols);
+        for (0..rows) |r| {
+            dequantRowInto(dst.slice()[r * cols ..][0..cols], w, g.ctl.tok[r]);
+        }
+    }
+
     fn vMatvec(g: backend.Graph, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
         _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
@@ -1564,6 +1576,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         .allocScratchK = vAllocScratchK,
         .freeScratch = vFreeScratch,
         .dequantRow = vDequantRow,
+        .dequantRows = vDequantRows,
         .matvec = vMatvec,
         .matvecPair = vMatvecPair,
         .matvecBatchK = vMatvecBatchK,

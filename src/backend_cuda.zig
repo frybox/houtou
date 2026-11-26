@@ -89,9 +89,10 @@ const Kernels = struct {
     /// 一行，共 `cols` 个元素。行偏移由调用方在设备侧做指针算术完成（见
     /// `vDequantRow`），所以这里只需要 `cols`。
     extern fn q35_launch_dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int;
-    /// 同上，但行号从每步控制块读（`ctl[XD_CTL_TOKEN]`）。MTP 草稿块的嵌入用：
-    /// 那一行的行号每轮都变，不能作为 kernel 实参录进图。
-    extern fn q35_launch_dequantize_row_dtoken(ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
+    /// 多行行反量化，行号从每步控制块读（第 r 行是 `ctl[XD_CTL_TOK + r]`）。
+    /// 需要把 embedding 放进图里时用：行号每步都变，不能作为 kernel 实参。
+    /// `scratch` 是调用方常驻的设备缓冲，用来放展开出来的块偏移表。
+    extern fn q35_launch_dequantize_rows_ctl(ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     /// 表驱动的量化 matvec：`d_out[t*rows + r] = W[r] . act_t`。
     /// 实参顺序照 api.h：rows、cols、tokens，**然后**才是 ttype。
@@ -334,11 +335,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
     }
-    /// 行号从每步控制块读的行反量化（MTP 草稿块的嵌入）。见 `api.h`：
-    /// 行号若是实参，录进图之后重放永远嵌入第一轮那个 token。
-    fn dequantize_row_dtoken(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    /// 多行行反量化，行号从每步控制块读。见 `api.h`。
+    fn dequantize_rows_ctl(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
-        return Kernels.q35_launch_dequantize_row_dtoken(ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, stream);
+        return Kernels.q35_launch_dequantize_rows_ctl(ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, rows, scratch, scratch_ints, stream);
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
@@ -580,9 +580,9 @@ const Launch = if (cuda_linked) struct {
         _ = .{ ttype, d_src_row, d_dst, cols, stream };
         return stubNoCudaKernels();
     }
-    fn dequantize_row_dtoken(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    fn dequantize_rows_ctl(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
         _ = g;
-        _ = .{ ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, stream };
+        _ = .{ ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, rows, scratch, scratch_ints, stream };
         return stubNoCudaKernels();
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
@@ -1683,6 +1683,9 @@ pub const CudaBackend = struct {
     /// Quantized activations (Q8_0 or Q8_K, whichever the weight type needs).
     d_xq: ?*anyopaque = null,
     d_xq_bytes: usize = 0,
+    /// `dequantRows` 的块偏移表（`rows * nblocks` 个 int）。常驻，capture 内不分配。
+    d_row_off: ?*anyopaque = null,
+    d_row_off_bytes: usize = 0,
     /// Second activation buffer holding the `block_q8_1_mmq` reshape, written by
     /// the same quantization pass.  Only allocated when a dp4a type is launched
     /// (see `q35_mmq_dp4a_wants`); the mma path never touches it.  Both buffers
@@ -2626,6 +2629,13 @@ pub const CudaBackend = struct {
         try ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, max_cols * @sizeOf(f32));
         try ensureBuf(&cu.lib, &self.d_deq, &self.d_deq_bytes, max_cols * @sizeOf(f32));
         try ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, @sizeOf(c_int));
+        // `dequantRows` 的块偏移表：`ctl_tokens` 行 × 该行最多 `max_cols/32`
+        // 个块。**必须在这里预留**：capture 期间 `ensureBuf` 会真的
+        // `cudaMalloc`，那是非法操作，会让整张图的 capture 失效
+        // （实测：`rmsnorm_rows launch failed: operation failed due to a
+        // previous error during capture`）。
+        try ensureBuf(&cu.lib, &self.d_row_off, &self.d_row_off_bytes,
+            backend.ctl_tokens * ((max_cols + 31) / 32) * @sizeOf(c_int));
         // The reservation is what makes capture safe, so it is also what arms the
         // feature: before this point the XG phase stays `.off` because a capture
         // that early would have to allocate scratch inside the graph.
@@ -3364,22 +3374,9 @@ pub const CudaBackend = struct {
         // namespace of those declarations -- see `Kernels` at the top of the file.
         const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
-        // 草稿块（`nextn` 图）的嵌入行号每轮都变。它不能作为实参：录进图之后
-        // 重放永远嵌入第一轮那个 token，所以改成从设备控制块读
-        // （`ctl[XD_CTL_TOKEN]`），实参只剩模型常量。decode 的嵌入在图外，
-        // 行号照旧走指针算术。
-        const rc = if (g.kind == .nextn and self.graphActive(g) and self.ctl_dev != null)
-            kern.dequantize_row_dtoken(
-                g,
-                @intCast(@backingInt(w.ttype)),
-                @ptrCast(e.dev),
-                d_out,
-                @intCast(cols),
-                @intCast(row_bytes),
-                self.ctl_dev.?,
-                self.launchStream(),
-            )
-        else blk: {
+        // 单行路径把行基址作为实参 —— 它**必须在图外调用**（录进图会永远读
+        // 录制那一行）。图内的多行嵌入走 `vDequantRows`。
+        const rc = blk: {
             const d_row = src + row * row_bytes;
             break :blk kern.dequantize_row(g,
                 @intCast(@backingInt(w.ttype)),
@@ -7269,6 +7266,70 @@ pub const CudaBackend = struct {
         vDequantRow_body(g, ctx, dstBuf, w, row);
     }
 
+    /// `VTable.dequantRows`：`g.ctl.rows` 行，行号取 `g.ctl.tok[r]`。
+    ///
+    /// 两条发射：先把 `ctl.tok` 在设备上展开成每块的源偏移表，再按类型解量化。
+    /// 两者实参全是模型常量，所以整条路径可以录进图。
+    fn vDequantRows(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow) void {
+        const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
+        const t0 = self.slotEnter();
+        defer self.slotExit(.dequant_row, t0);
+        if (graphGate(g)) return;
+
+        const rows: usize = g.ctl.rows;
+        const cols = w.cols();
+        if (rows == 0) return;
+        std.debug.assert(dstBuf.len >= rows * cols);
+
+        if (!self.gpuReady() or self.ctl_dev == null) {
+            // 没有设备控制块（或没有 GPU）时退回逐行：CPU 侧读 `g.ctl.tok` 安全。
+            cpu_mod.CpuBackend.vtable.dequantRows(g, @ptrCast(&self.cpu), dstBuf, w);
+            return;
+        }
+        const e = self.findDev(w.data.ptr) orelse {
+            std.debug.print("cuda backend: dequantRows: a '{s}' weight is not resident on the device\n", .{@tagName(w.ttype)});
+            self.clearDevBuf(dstBuf);
+            return;
+        };
+        const out: ?[*]f32 = dBufPtr(dstBuf) orelse {
+            std.debug.print("cuda backend: dequantRows needs a device destination\n", .{});
+            return;
+        };
+        const cu = &self.cu.?;
+        // 偏移表：rows * (cols / block_elems) 个 int。常驻缓冲，capture 内不分配。
+        const blk_elems: usize = gguf.blockElems(w.ttype);
+        if (blk_elems == 0 or cols % blk_elems != 0) {
+            self.clearDevBuf(dstBuf);
+            return;
+        }
+        const nblk = cols / blk_elems;
+        const need: usize = rows * nblk * @sizeOf(c_int);
+        ensureBuf(&cu.lib, &self.d_row_off, &self.d_row_off_bytes, need) catch {
+            self.clearDevBuf(dstBuf);
+            return;
+        };
+        const scratch: [*]c_int = @ptrCast(@alignCast(self.d_row_off.?));
+        const rc = Launch.dequantize_rows_ctl(
+            g,
+            @intCast(@backingInt(w.ttype)),
+            @ptrCast(e.dev),
+            out,
+            @intCast(cols),
+            @intCast(w.rowBytes()),
+            self.ctl_dev.?,
+            @intCast(rows),
+            scratch,
+            @intCast(need / @sizeOf(c_int)),
+            self.launchStream(),
+        );
+        if (rc == cudart.cudaSuccess) return;
+        if (self.capturing(g)) self.graphAbandon(g, "dequantize_rows_ctl launch failed");
+        self.ewLaunchFail("dequantize_rows_ctl", rc);
+        self.clearDevBuf(dstBuf);
+    }
+
     /// The `matvec` slot, timed (`$QWEN35_PROF`).
     fn vMatvec(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
@@ -8128,6 +8189,7 @@ pub const vtable = backend.Exec.VTable{
     .loadLinear = CudaBackend.vLoadLinear,
     .freeLinear = CudaBackend.vFreeLinear,
     .dequantRow = CudaBackend.vDequantRow,
+    .dequantRows = CudaBackend.vDequantRows,
     .matvec = CudaBackend.vMatvec,
     .matvecPair = CudaBackend.vMatvecPair,
     .matvecBatchK = CudaBackend.vMatvecBatchK,

@@ -1715,6 +1715,27 @@ pub const Engine = struct {
     /// `forwardLogits` 的 anchor 也是同样的道理（放在 embedding 之后）。
     fn embedChunk(self: *Engine, tokens: []const u32) void {
         const hidden: usize = self.cfg.hidden;
+        // `$QWEN35_EMB_ROWS=1`（A/B）：走多行设备端路径。只对 `tokens.len <=
+        // ctl_tokens` 成立（控制块的行号数组只有那么长）；prefill 的 k 可达
+        // 1024，那里只能逐行。
+        const use_rows = @import("../cudart.zig").environ_map != null and
+            @import("../cudart.zig").environ_map.?.get("QWEN35_EMB_ROWS") != null and
+            tokens.len <= backend.ctl_tokens;
+        if (use_rows) {
+            switch (self.token_embd) {
+                .quant => |qrow| {
+                    var tt: [backend.ctl_tokens]u32 = @splat(0);
+                    for (tokens, 0..) |t, i| tt[i] = t;
+                    self.exec.dequantRows(.{
+                        .kind = self.graph.kind,
+                        .ctl = .{ .rows = @intCast(tokens.len), .tok = tt },
+                        .slot = self.graph.slot,
+                    }, self.xK.span(0, tokens.len * hidden), qrow);
+                    return;
+                },
+                .f32 => {},
+            }
+        }
         for (tokens, 0..) |t, i| self.embedTo(t, self.xK.span(i * hidden, hidden));
     }
 
@@ -1766,12 +1787,11 @@ pub const Engine = struct {
         // 这里只用 `self.graph` 的当前值（默认直通图 = 每个算子照原样发射），
         // 于是同一个函数在"直发"和"被外层 span 收进去"两种情形下都成立。
         //
-        // **embedding 由调用方在开 span 之前完成**（`embedChunk`）。放在这里
-        // 会踩 capture 的语义：capture 期间 op 不执行，`embedTo` 的 dequantize
-        // 节点被录进图而 `xK` 保持上一轮的内容，于是整块前向算在旧输入上
-        // （实测 verify：`x1K` 与直发差 3.7 倍，接受率 0%）。
-        // `forwardLogits` 早就有同一条规矩（它把 anchor 放在 embedding 之后），
-        // 这里补上。
+        // embedding 在 span **内**做：行号从设备控制块读（`g.ctl.tok[r]`），
+        // 实参全是模型常量，所以 capture 期间也成立 —— 重放时嵌入的是当步的
+        // token，而不是录制那一轮的行。调用方负责在 `graphBegin` 的 ctl 里填好
+        // `tok[0..k]`；直通图上没人读 ctl，后端退回逐行 path。
+        self.embedChunk(tokens);
 
         // `self.layers` has one extra slot when the model ships a nextn block
         // (see `nSlots`); a normal forward must stop at the decoder layers, or
@@ -1931,10 +1951,10 @@ pub const Engine = struct {
         //
         // `$QWEN35_VERIFY_NOSPAN=1`（调试）：完全不碰图，`self.graph` 保持直通。
         // 用来把"图机制有问题"与"图的内容有问题"分开。
-        // embedding 必须在开 capture 之前完成（见 `embedChunk`）。
-        self.embedChunk(tokens);
         const nospan = @import("../cudart.zig").environ_map != null and
             @import("../cudart.zig").environ_map.?.get("QWEN35_VERIFY_NOSPAN") != null;
+        var tok: [backend.ctl_tokens]u32 = @splat(0);
+        for (tokens, 0..) |t, i| tok[i] = t;
         if (!nospan) {
             self.graph = self.exec.graphBegin(.verify, .{
                 .pos = pos0,
@@ -1942,6 +1962,7 @@ pub const Engine = struct {
                 .kv_slot = pos0,
                 .attn_slot = pos0,
                 .rows = @intCast(k),
+                .tok = tok,
             }, graph_slot_chunk);
         }
         defer {
@@ -2590,7 +2611,11 @@ pub const Engine = struct {
             .kv_slot = draft_pos,
             .attn_slot = draft_pos,
             .rows = 1,
-            .tok = next_token,
+            .tok = blk: {
+                var tt: [backend.ctl_tokens]u32 = @splat(0);
+                tt[0] = next_token;
+                break :blk tt;
+            },
         }, graph_slot_nextn);
         defer {
             self.exec.graphEnd(&self.graph);
@@ -3412,10 +3437,7 @@ pub const Engine = struct {
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
-                    blk: {
-                        self.embedChunk(prompt[i .. i + n]);
-                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
-                    };
+                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
                 i += n;
             }
         }
@@ -3572,10 +3594,7 @@ pub const Engine = struct {
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
-                    blk: {
-                        self.embedChunk(prompt[i .. i + n]);
-                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
-                    };
+                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
                 i += n;
             }
         }

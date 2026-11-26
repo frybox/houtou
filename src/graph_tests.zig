@@ -102,16 +102,19 @@ test "GraphCtl is a 64-byte control block" {
     try std.testing.expectEqual(@as(usize, 4), @alignOf(reg.GraphCtl));
 }
 
-test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 同为 6 个 int32" {
-    // 设备控制块是 `int32_t[XD_CTL_INTS]`。Zig 侧多一个字段就是读写相邻内存，
-    // 少一个则 `tok` 读不到（MTP 草稿块会永远嵌入第一轮那个 token）。
-    try std.testing.expectEqual(@as(usize, 6), @sizeOf(backend.GraphCtl) / 4);
+test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 保持一致" {
+    // 设备控制块是 `int32_t[XD_CTL_INTS]` = `XD_CTL_TOK(5) + XD_CTL_TOKENS(16)`
+    // = 21。Zig 侧多一个字段就是读写相邻内存，少一个则 `tok` 读不到。
+    try std.testing.expectEqual(@as(usize, 21), @sizeOf(backend.GraphCtl) / 4);
     try std.testing.expectEqual(@as(usize, 4), @alignOf(backend.GraphCtl));
-    // 字段顺序即控制块布局：tok 必须是第 6 个（下标 5）。
+    // 字段顺序即布局：tok 从第 6 个 int（下标 5）开始，是 16 个一组的数组。
     var ctl = backend.GraphCtl{};
-    ctl.tok = 12345;
+    ctl.tok[0] = 12345;
+    ctl.tok[15] = 678;
     const ints: [*]const i32 = @ptrCast(&ctl);
     try std.testing.expectEqual(@as(i32, 12345), ints[5]);
+    try std.testing.expectEqual(@as(i32, 678), ints[5 + 15]);
+    try std.testing.expectEqual(@as(usize, 16), backend.ctl_tokens);
 }
 
 test "xd.Slot matches xd.h's xd_slot" {

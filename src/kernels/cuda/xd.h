@@ -152,13 +152,18 @@ static_assert(offsetof(struct xd_node, derived) == 1200, "xd_node.derived moved"
 // Field meanings mirror `backend.GraphCtl` (src/backend.zig) field for field;
 // the static_asserts below are the cross-language check.
 // ---------------------------------------------------------------------------
+// 嵌入行号数组的长度。一次块前向最多读多少行 embedding 由引擎的
+// `spec_verify_rows` 决定（现在 16）；`backend.zig` 的 `GraphCtl` 用同一个数字，
+// 两边的 comptime 断言把它钉住。
+#define XD_CTL_TOKENS    16
+
 #define XD_CTL_POS       0   // rope phase base (row 0 of this step)
 #define XD_CTL_BASE_BITS 1   // bit pattern of the rope theta
 #define XD_CTL_KV_SLOT   2   // first KV row written by this step
 #define XD_CTL_ATTN_SLOT 3   // last KV row full attention must cover
 #define XD_CTL_ROWS      4   // rows this step produces
-#define XD_CTL_TOKEN     5   // 草稿块嵌入的 token id（只有 nextn 图用）
-#define XD_CTL_INTS      6
+#define XD_CTL_TOK       5   // 本步各行的嵌入 token id（`XD_CTL_TOKENS` 个）
+#define XD_CTL_INTS      (XD_CTL_TOK + XD_CTL_TOKENS)
 
 static_assert(sizeof(int) == 4, "the control block is an int32 array");
 

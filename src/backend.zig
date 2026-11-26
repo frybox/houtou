@@ -187,17 +187,26 @@ pub const GraphCtl = extern struct {
     attn_slot: u32 = 0,
     /// Rows this step produces (1 for decode, k for a verify chunk).
     rows: u32 = 1,
-    /// 草稿块的嵌入 token。MTP 的 `nextnPredict` 每轮/每链步换一个，而它是对
-    /// 着**设备**权重做嵌入查表的（`embedTo`），所以地址不能烘进捕捉下来的
-    /// kernel 实参 —— 否则重放永远嵌入第一轮那个 token。只在
-    /// `GraphKind.nextn` 的图里有意义，其余图填 0。
-    tok: u32 = 0,
+    /// 本步各行的嵌入 token id：第 r 行读 `tok[r]`。
+    ///
+    /// 为什么是数组：embedding 查表是**按行选源地址**的，行号若作为 kernel
+    /// 实参，录进图之后重放永远嵌入录制那一轮的行。让行号走控制块、由 kernel
+    /// 在设备上读，节点实参才能全是模型常量。`rows` 给出有效前缀，其余填 0。
+    tok: [ctl_tokens]u32 = @splat(0),
 };
 
+/// 每步控制块里嵌入行号数组的长度。与 `src/kernels/cuda/xd.h` 的
+/// `XD_CTL_TOKENS` 是同一个事实（两边的 comptime / static_assert 互相钉住）。
+///
+/// 这个数不是随手取的：一次块前向最多读多少行 embedding 由引擎的
+/// `spec_verify_rows` 决定（16），而 `logitsK`、GDN 状态快照槽数也都是按它
+/// 预留的。取同一个上界，行号数组就不可能比块短。
+pub const ctl_tokens: usize = 16;
+
 comptime {
-    // The device block is a `int32_t[GRAPH_CTL_INTS]`; this must stay 6 ints
-    // wide.  Widening it needs the .cu side's array size changed in step.
-    std.debug.assert(@sizeOf(GraphCtl) == 6 * @sizeOf(i32));
+    // The device block is a `int32_t[XD_CTL_INTS]` = 5 + XD_CTL_TOKENS = 21.
+    // This must stay in step with `src/kernels/cuda/xd.h`.
+    std.debug.assert(@sizeOf(GraphCtl) == (5 + ctl_tokens) * @sizeOf(i32));
     std.debug.assert(@alignOf(GraphCtl) == 4);
 }
 
@@ -311,6 +320,11 @@ pub const Exec = struct {
         /// Expand one row of a packed weight into `dst` (f32, `cols` wide).
         /// Used by the embedding lookup, which needs values rather than dots.
         dequantRow: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void,
+
+        /// 展开 `g.ctl.rows` 行到连续排布的 `dst`，第 r 行是 `g.ctl.tok[r]` 的
+        /// embedding。行号走**设备控制块**，所以这条路径可以录进图；循环调用
+        /// `dequantRow` 做不到这一点（行号会被烘成录制时的值）。
+        dequantRows: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, w: QuantRow) void,
 
         // ---- matvec ---------------------------------------------------------
         /// `out = W * x` with `W` packed, `x` `w.cols()` f32 values.  Both
@@ -751,6 +765,10 @@ pub const Exec = struct {
     }
     pub fn dequantRow(self: Exec, g: Graph, dst: Buf, w: QuantRow, row: usize) void {
         self.vtable.dequantRow(g, self.ptr, dst, w, row);
+    }
+    /// 展开 `g.ctl.rows` 行，行号取 `g.ctl.tok[r]`（见 `VTable.dequantRows`）。
+    pub fn dequantRows(self: Exec, g: Graph, dst: Buf, w: QuantRow) void {
+        self.vtable.dequantRows(g, self.ptr, dst, w);
     }
     pub fn matvec(self: Exec, g: Graph, out: Buf, w: LinearW, x: Buf) void {
         self.vtable.matvec(g, self.ptr, out, w, x);

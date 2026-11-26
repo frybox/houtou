@@ -158,10 +158,12 @@ __global__ void q35_k_kv_quant(const float *__restrict__ x,
 // block_q8_0 -> 32 floats.  quant_dequant.zig has no q8_0 dequant of its own;
 // the reference is the CPU dequantRowInto q8_0 bypass, i.e. d * qs[k].
 __global__ void q35_k_dequantize_q8_0(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q8_0;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q8_0);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
     const float d = q35_ld_scale(sb);
     const signed char *qs = (const signed char *)(sb + 2);
@@ -173,10 +175,12 @@ __global__ void q35_k_dequantize_q8_0(const unsigned char *__restrict__ src,
 //   y[j]    = ((qs[j] & 0xF) - 8) * d
 //   y[16+j] = ((qs[j] >>  4) - 8) * d
 __global__ void q35_k_dequantize_q4_0(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q4_0;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q4_0);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
     const float d = q35_ld_scale(sb);
 #pragma unroll
@@ -190,10 +194,12 @@ __global__ void q35_k_dequantize_q4_0(const unsigned char *__restrict__ src,
 // block_q4_1 -> 32 floats.  quant_dequant.zig:92 dequantQ4_1.
 //   y = q*d + m   (multiply then add, both rounded)
 __global__ void q35_k_dequantize_q4_1(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q4_1;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q4_1);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
     const float d = q35_ld_scale(sb);
     const float m = q35_ld_scale(sb + 2);
@@ -208,10 +214,12 @@ __global__ void q35_k_dequantize_q4_1(const unsigned char *__restrict__ src,
 // block_iq4_nl -> 32 floats.  quant_dequant.zig:347 dequantIQ4NL.
 //   y = d * kvalues_iq4nl[nibble]      (no -8 bias; nonlinear table)
 __global__ void q35_k_dequantize_iq4_nl(const unsigned char *__restrict__ src,
-                                        float *__restrict__ dst, int nblocks) {
+                                        float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ4_NL;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ4_NL);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
     const float d = q35_ld_scale(sb);
 #pragma unroll
@@ -226,20 +234,24 @@ __global__ void q35_k_dequantize_iq4_nl(const unsigned char *__restrict__ src,
 // bf16 -> f32 is exact (truncated high half of an f32: a pure 16-bit shift,
 // kernels32.c:1105 k32_bf16_to_f32).
 __global__ void q35_k_dequantize_f16(const unsigned char *__restrict__ src,
-                                     float *__restrict__ dst, int nblocks) {
+                                     float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * 64;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(64);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
 #pragma unroll
     for (int k = 0; k < 32; ++k) db[k] = q35_f16_at(sb, 2 * k);
 }
 
 __global__ void q35_k_dequantize_bf16(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * 64;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(64);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * 32;
 #pragma unroll
     for (int k = 0; k < 32; ++k) {
@@ -265,10 +277,12 @@ __global__ void q35_k_copy_f32(const float *__restrict__ src, float *__restrict_
 //   scale/min alternation (sc0 -> bytes 0..15, sc1 -> bytes 16..31) and that
 //   the low nibble of scales[] is the scale, the high nibble the min.
 __global__ void q35_k_dequantize_q2_k(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q2_K;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q2_K);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 80);
     const float min = q35_f16_at(sb, 82);
@@ -301,10 +315,12 @@ __global__ void q35_k_dequantize_q2_k(const unsigned char *__restrict__ src,
 //   minus 32, and the 2-bit value becomes `2bit - 4` when the hmask bit is
 //   clear, `2bit` when it is set.
 __global__ void q35_k_dequantize_q3_k(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q3_K;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q3_K);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d_all = q35_f16_at(sb, 108);
     const unsigned char *q = sb + 32;
@@ -344,10 +360,12 @@ __global__ void q35_k_dequantize_q3_k(const unsigned char *__restrict__ src,
 //   144 B = d @0 (f16) | dmin @2 (f16) | scales[12] @4 | qs[128] @16
 //   y = d1*q4 - m1 (low nibble), d2*q4 - m2 (high nibble), 4 chunks of 64.
 __global__ void q35_k_dequantize_q4_k(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q4_K;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q4_K);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const float min = q35_f16_at(sb, 2);
@@ -378,10 +396,12 @@ __global__ void q35_k_dequantize_q4_k(const unsigned char *__restrict__ src,
 //   bm1 starts at 1 and bm2 at 2, both <<= 2 per chunk (bit pairs per 64-elem
 //   group), so the 5th bit came from qh[l] & {1,2,4,8} then {16,32,64,128}.
 __global__ void q35_k_dequantize_q5_k(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q5_K;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q5_K);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const float min = q35_f16_at(sb, 2);
@@ -420,10 +440,12 @@ __global__ void q35_k_dequantize_q5_k(const unsigned char *__restrict__ src,
 //   Six-bit values are (4 low bits from ql) | (2 high bits from qh) - 32, and
 //   the per-16-element scale index is scb + is + {0,2,4,6}.
 __global__ void q35_k_dequantize_q6_k(const unsigned char *__restrict__ src,
-                                      float *__restrict__ dst, int nblocks) {
+                                      float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_Q6_K;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_Q6_K);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 208);
     const unsigned char *ql = sb;
@@ -455,10 +477,12 @@ __global__ void q35_k_dequantize_q6_k(const unsigned char *__restrict__ src,
 //   ls = 4 low bits of scales_l[ib/2] (shifted by 4*(ib%2)) | 2 bits of
 //   scales_h (shifted by 2*ib) << 4, then (ls - 32) scales d.
 __global__ void q35_k_dequantize_iq4_xs(const unsigned char *__restrict__ src,
-                                        float *__restrict__ dst, int nblocks) {
+                                        float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ4_XS;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ4_XS);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned int sh = (unsigned int)q35_ld_u16(sb + 2);
@@ -485,10 +509,12 @@ __global__ void q35_k_dequantize_iq4_xs(const unsigned char *__restrict__ src,
 //   signs = ksigns_iq2xs[(aux32 >> 7*l) & 127]; grid = iq3xxs_grid[qs[...]]
 // Byte j of the packed u32 is value j (little-endian, hence the >> 8*j below).
 __global__ void q35_k_dequantize_iq3_xxs(const unsigned char *__restrict__ src,
-                                         float *__restrict__ dst, int nblocks) {
+                                         float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ3_XXS;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ3_XXS);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned char *qs = sb + 2;
@@ -519,10 +545,12 @@ __global__ void q35_k_dequantize_iq3_xxs(const unsigned char *__restrict__ src,
 //   qh bit 0x100 selects the grid high bit; db1 from the low nibble of
 //   scales, db2 from the high nibble; each p covers 64 elements.
 __global__ void q35_k_dequantize_iq3_s(const unsigned char *__restrict__ src,
-                                       float *__restrict__ dst, int nblocks) {
+                                       float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ3_S;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ3_S);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned char *qs = sb + 2;
@@ -561,10 +589,12 @@ __global__ void q35_k_dequantize_iq3_s(const unsigned char *__restrict__ src,
 //   66 B = d @0 (f16) | qs[32] (as u16) @2
 //   db = d * (0.5 + (aux1>>28)) * 0.25 ; 8 bytes per grid entry.
 __global__ void q35_k_dequantize_iq2_xxs(const unsigned char *__restrict__ src,
-                                         float *__restrict__ dst, int nblocks) {
+                                         float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ2_XXS;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ2_XXS);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned char *qs = sb + 2;
@@ -593,10 +623,12 @@ __global__ void q35_k_dequantize_iq2_xxs(const unsigned char *__restrict__ src,
 //   integer `2*nibble+1` form the dot product uses (both are equal in exact
 //   arithmetic; the dequant reference is the float one, so we match that here).
 __global__ void q35_k_dequantize_iq2_xs(const unsigned char *__restrict__ src,
-                                        float *__restrict__ dst, int nblocks) {
+                                        float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ2_XS;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ2_XS);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned char *qs16 = sb + 2;
@@ -626,10 +658,12 @@ __global__ void q35_k_dequantize_iq2_xs(const unsigned char *__restrict__ src,
 //   Signs live inside qs at +32 (row[34..66]); the grid index takes 2 bits of
 //   qh[ib32] at 8-2*l (mask 0x300, so a 10-bit index into iq2s_grid[1024]).
 __global__ void q35_k_dequantize_iq2_s(const unsigned char *__restrict__ src,
-                                       float *__restrict__ dst, int nblocks) {
+                                       float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ2_S;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ2_S);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     size_t y = 0;
@@ -659,10 +693,12 @@ __global__ void q35_k_dequantize_iq2_s(const unsigned char *__restrict__ src,
 //   y = dl * (grid + delta), dl = d*(2*((qh>>12)&7)+1), delta = +-0.125.
 //   The grid entry is SIGNED (int8 +-1-packed), hence the signed char cast.
 __global__ void q35_k_dequantize_iq1_s(const unsigned char *__restrict__ src,
-                                       float *__restrict__ dst, int nblocks) {
+                                       float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ1_S;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ1_S);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const float d = q35_f16_at(sb, 0);
     const unsigned char *qs = sb + 2;
@@ -690,10 +726,12 @@ __global__ void q35_k_dequantize_iq1_s(const unsigned char *__restrict__ src,
 //   (iq1m_scale_t); per-32 scales are 3-bit at 6*(ib%2)+{0,3}; deltas come from
 //   qh bits 0x08/0x80.
 __global__ void q35_k_dequantize_iq1_m(const unsigned char *__restrict__ src,
-                                       float *__restrict__ dst, int nblocks) {
+                                       float *__restrict__ dst, int nblocks,
+                                      const int *__restrict__ d_blk_off) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    const unsigned char *sb = src + (size_t)b * Q35_BYTES_IQ1_M;
+    const size_t blk_off = d_blk_off ? (size_t)d_blk_off[b] : (size_t)b * (size_t)(Q35_BYTES_IQ1_M);
+    const unsigned char *sb = src + blk_off;
     float *db = dst + (size_t)b * Q35_QK_K;
     const unsigned int s0 = (unsigned int)q35_ld_u16(sb + 48);
     const unsigned int s1 = (unsigned int)q35_ld_u16(sb + 50);
@@ -886,65 +924,65 @@ static int q35_launch_dequantize_impl(int ttype, const void *d_src_v, float *d_d
     const int blocks = (nblocks + threads - 1) / threads;
     switch (ttype) {
         case Q35_TT_Q8_0:
-            q35_k_dequantize_q8_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q8_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q4_0:
-            q35_k_dequantize_q4_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q4_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q4_1:
-            q35_k_dequantize_q4_1<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q4_1<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ4_NL:
-            q35_k_dequantize_iq4_nl<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq4_nl<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_F16:
-            q35_k_dequantize_f16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_f16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_BF16:
-            q35_k_dequantize_bf16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_bf16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_F32:
             q35_k_copy_f32<<<blocks, threads, 0, stream>>>((const float *)d_src_v, d_dst,
                                                            nblocks);
             break;
         case Q35_TT_Q2_K:
-            q35_k_dequantize_q2_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q2_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q3_K:
-            q35_k_dequantize_q3_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q3_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q4_K:
-            q35_k_dequantize_q4_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q4_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q5_K:
-            q35_k_dequantize_q5_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q5_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_Q6_K:
-            q35_k_dequantize_q6_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_q6_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ4_XS:
-            q35_k_dequantize_iq4_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq4_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ3_XXS:
-            q35_k_dequantize_iq3_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq3_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ3_S:
-            q35_k_dequantize_iq3_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq3_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ2_XXS:
-            q35_k_dequantize_iq2_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq2_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ2_XS:
-            q35_k_dequantize_iq2_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq2_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ2_S:
-            q35_k_dequantize_iq2_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq2_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ1_S:
-            q35_k_dequantize_iq1_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq1_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         case Q35_TT_IQ1_M:
-            q35_k_dequantize_iq1_m<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks);
+            q35_k_dequantize_iq1_m<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, nullptr);
             break;
         default:
             return (int)cudaErrorInvalidValue;
@@ -984,6 +1022,40 @@ extern "C" int q35_quant_geom(int ttype, int *block_elems, int *block_bytes) {
     }
 }
 
+// 同 `q35_launch_dequantize_impl`，但每块的源偏移来自设备表 `d_blk_off`
+// （由 `q35_k_row_block_off` 展开）。`nblocks` 这里是 total = rows * 该行块数。
+static int q35_launch_dequantize_impl_off(int ttype, const unsigned char *d_src,
+                                          float *d_dst, int nblocks,
+                                          const int *d_blk_off, void *stream_v) {
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    if (nblocks <= 0) return (int)cudaSuccess;
+    const int threads = 128;
+    const int blocks = (nblocks + threads - 1) / threads;
+    switch (ttype) {
+        case Q35_TT_Q8_0:    q35_k_dequantize_q8_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q4_0:    q35_k_dequantize_q4_0<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q4_1:    q35_k_dequantize_q4_1<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ4_NL:  q35_k_dequantize_iq4_nl<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_F16:     q35_k_dequantize_f16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_BF16:    q35_k_dequantize_bf16<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q2_K:    q35_k_dequantize_q2_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q3_K:    q35_k_dequantize_q3_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q4_K:    q35_k_dequantize_q4_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q5_K:    q35_k_dequantize_q5_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_Q6_K:    q35_k_dequantize_q6_k<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ4_XS:  q35_k_dequantize_iq4_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ3_XXS: q35_k_dequantize_iq3_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ3_S:   q35_k_dequantize_iq3_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ2_XXS: q35_k_dequantize_iq2_xxs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ2_XS:  q35_k_dequantize_iq2_xs<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ2_S:   q35_k_dequantize_iq2_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ1_S:   q35_k_dequantize_iq1_s<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        case Q35_TT_IQ1_M:   q35_k_dequantize_iq1_m<<<blocks, threads, 0, stream>>>(d_src, d_dst, nblocks, d_blk_off); break;
+        default:             return (int)cudaErrorInvalidValue;
+    }
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_dequantize(int ttype, const void *d_src, float *d_dst,
                                      int nblocks, void *stream) {
     return q35_launch_dequantize_impl(ttype, d_src, d_dst, nblocks, stream);
@@ -1006,33 +1078,62 @@ extern "C" int q35_launch_dequantize_row(int ttype, const void *d_src_row,
                                       stream);
 }
 
-// 行号由**设备控制块**给出：`ctl[XD_CTL_TOKEN]` 是行号，行基址 = 表基址 +
-// 行号 * `row_bytes`。给 MTP 草稿块的嵌入用（见 api.h）。
+// 把 `ctl[XD_CTL_TOK + r]` 展开成"第 r 行、第 b 块的源字节偏移"表。
 //
-// 为什么不能直接用 `q35_launch_dequantize_row`：那条路把行基址作为 kernel 实参，
-// 而草稿块每个链步都换一个 token —— 录进图之后重放永远嵌入第一轮那一个。
-// 这里实参是 `d_src_base`/`row_bytes`/`cols`/`ctl`，四个都是模型常量。
+// 为什么要有这个 kernel：`d_ctl` 是**设备**指针，主机侧解引用它直接段错误
+// （这条路径此前从未真正跑过 —— 调用点被 `graphDirect` 绕过）。行号只能在
+// GPU 上读，所以先在这里展开成一张表，再交给各类型的解码 kernel。
 //
-// `ttype == Q35_TT_F32` 没有反量化 kernel（源就是 f32），由下面的拷贝分支处理。
-extern "C" int q35_launch_dequantize_row_dtoken(int ttype, const void *d_src_base,
-                                                float *d_dst, int cols, int row_bytes,
-                                                const int *d_ctl, void *stream_v) {
-    if (cols <= 0) return (int)cudaSuccess;
-    if (d_ctl == nullptr || row_bytes <= 0) return (int)cudaErrorInvalidValue;
-    const int row = d_ctl[XD_CTL_TOKEN];
-    const unsigned char *src = (const unsigned char *)d_src_base + (size_t)row * (size_t)row_bytes;
-    if (ttype == Q35_TT_F32) {
-        const int threads = 128;
-        const int blocks = (cols + threads - 1) / threads;
-        q35_k_copy_f32<<<blocks, threads, 0, (cudaStream_t)stream_v>>>(
-            (const float *)src, d_dst, (cols + 31) / 32);
-        return (int)cudaGetLastError();
+// 表布局：`out[r * nblocks + b] = tok[r] * row_bytes + b * block_bytes`。
+__global__ void q35_k_row_block_off(const int *__restrict__ d_ctl, int rows,
+                                    int nblocks, int row_bytes, int block_bytes,
+                                    int *__restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * nblocks;
+    if (i >= total) return;
+    const int r = i / nblocks;
+    const int b = i - r * nblocks;
+    out[i] = d_ctl[XD_CTL_TOK + r] * row_bytes + b * block_bytes;
+}
+
+// 行反量化，行号来自设备控制块（第 r 行是 `ctl[XD_CTL_TOK + r]`）。
+//
+// `d_dst` 是连续排布的 `rows` 行，每行 `cols` 个 float。三个参数
+// （`d_src_base`/`row_bytes`/`cols`/`d_ctl`/`rows`）全是模型常量，所以整条
+// 路径可以录进图 —— 这是 embedding 能留在 capture 区间里的前提。
+//
+// `*scratch` 是调用方常驻的设备缓冲（至少 `rows * nblocks` 个 int），用来放
+// 展开出来的偏移表；由后端在 `allocScratch` 时按上界分配，capture 内不分配。
+extern "C" int q35_launch_dequantize_rows_ctl(int ttype, const void *d_src_base,
+                                              float *d_dst, int cols, int row_bytes,
+                                              const int *d_ctl, int rows,
+                                              int *scratch, int scratch_ints,
+                                              void *stream_v) {
+    if (cols <= 0 || rows <= 0) return (int)cudaSuccess;
+    if (d_ctl == nullptr || row_bytes <= 0 || d_dst == nullptr || d_src_base == nullptr) {
+        return (int)cudaErrorInvalidValue;
     }
+    if (rows > XD_CTL_TOKENS) return (int)cudaErrorInvalidValue;
     int block_elems = 0, block_bytes = 0;
     if (!q35_quant_geom(ttype, &block_elems, &block_bytes)) return (int)cudaErrorInvalidValue;
-    (void)block_bytes;
     if (cols % block_elems != 0) return (int)cudaErrorInvalidValue;
-    return q35_launch_dequantize_impl(ttype, src, d_dst, cols / block_elems, stream_v);
+    const int nblocks = cols / block_elems;
+    const int total = rows * nblocks;
+    if (scratch == nullptr || scratch_ints < total) return (int)cudaErrorInvalidValue;
+    // f32 embedding 表在 GGUF 里基本不存在（`token_embd` 总是量化的），
+    // `q35_quant_geom` 对它的 block_bytes 是 128，偏移表照样成立，
+    // 但 F32 走的是拷贝 kernel 不是解量化，这里直接拒绝让上层退 CPU。
+    if (ttype == Q35_TT_F32) return (int)cudaErrorInvalidValue;
+    {
+        const int threads = 128;
+        const int blocks = (total + threads - 1) / threads;
+        q35_k_row_block_off<<<blocks, threads, 0, (cudaStream_t)stream_v>>>(
+            d_ctl, rows, nblocks, row_bytes, block_bytes, scratch);
+        const cudaError_t rc = cudaGetLastError();
+        if (rc != cudaSuccess) return (int)rc;
+    }
+    return q35_launch_dequantize_impl_off(ttype, (const unsigned char *)d_src_base, d_dst,
+                                          total, scratch, stream_v);
 }
 
 // ---------------------------------------------------------------------------
