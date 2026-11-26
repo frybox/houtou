@@ -1841,8 +1841,15 @@ pub const Engine = struct {
                 if (li < self.gdn_in.len) {
                     const gi = &self.gdn_in[li];
                     if (gi.qkv.len >= k * conv_dim and gi.gamma.len >= k * 2 * nv) {
-                        self.exec.copyRange(self.graph, gi.qkv.span(0, k * conv_dim), self.qkvK.span(0, k * conv_dim));
-                        self.exec.copyRange(self.graph, gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
+                        // 长度同样不能是主机实参（见 tap 那段）：图活跃时按
+                        // `ctl.rows` 拷，直通时用 `k`。
+                        if (self.graph.ptr != null) {
+                            self.exec.copyRowsCtl(self.graph, gi.qkv, self.qkvK, conv_dim);
+                            self.exec.copyRowsCtl(self.graph, gi.gamma, self.abK, 2 * nv);
+                        } else {
+                            self.exec.copyRange(self.graph, gi.qkv.span(0, k * conv_dim), self.qkvK.span(0, k * conv_dim));
+                            self.exec.copyRange(self.graph, gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
+                        }
                     }
                 }
                 // Chunk-wide GDN prelude: conv+silu, gamma/beta and the
@@ -1898,11 +1905,20 @@ pub const Engine = struct {
                         // hidden，接受率塌掉（实测 62.5% → 12.5%）并很快 EOS。
                         // 目标区按 `nbatch` 给上界（它本来就那么大），实际写多少
                         // 由 ctl.rows 决定。
-                        self.exec.copyRowsCtl(self.graph,
-                            self.tap_hidden.span(ti * self.nbatch * hidden, self.nbatch * hidden),
-                            self.xK.span(0, self.nbatch * hidden),
-                            hidden,
-                        );
+                        // 图活跃时行数取控制块（`copyRowsCtl`），直通时用 `k`
+                        // —— 直通图的 ctl 是默认值，`rows` 恒为 1。
+                        if (self.graph.ptr != null) {
+                            self.exec.copyRowsCtl(self.graph,
+                                self.tap_hidden.span(ti * self.nbatch * hidden, self.nbatch * hidden),
+                                self.xK.span(0, self.nbatch * hidden),
+                                hidden,
+                            );
+                        } else {
+                            self.exec.copyRange(self.graph,
+                                self.tap_hidden.span(ti * self.nbatch * hidden, k * hidden),
+                                self.xK.span(0, k * hidden),
+                            );
+                        }
                         break;
                     }
                 }
