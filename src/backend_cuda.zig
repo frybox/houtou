@@ -2647,7 +2647,9 @@ pub const CudaBackend = struct {
             s.xd_phase = .off;
             return;
         }
-        if (cudart.getenv("QWEN35_XD_NODES") != null) dumpGraphNodes(cu, graph.?);
+        if (cudart.getenv("QWEN35_XD_NODES") != null) {
+            dumpGraphNodes(cu, graph.?);
+        }
         // 源图可以立刻销毁：本实现不保留任何节点句柄（无 op 表、无 apply），
         // 重放只认 `gexec`。参照项目里只有 ds4 保留 `graph`，那是因为它要用
         // `cudaGraphAddKernelNode` 手工改图。
@@ -3777,12 +3779,14 @@ pub const CudaBackend = struct {
                 if (wants_mmq) {
                     ensureBuf(&cu.lib, &self.d_xqm, &self.d_xqm_bytes, @as(usize, @intCast(total_blocks)) * @as(usize, @intCast(Launch.mmq_act_block_bytes()))) catch return oomMsg("batchK mmq activations");
                 }
+                // 同上：量化也必须落在 `launchStream()` 上，否则重放时
+                // `d_xq` 里是录制那一轮的激活。
                 const rc = if (q8_0_act)
-                    kern.quantize_q8_0(base_act, @ptrCast(base_xq), @intCast(total_blocks), null)
+                    kern.quantize_q8_0(base_act, @ptrCast(base_xq), @intCast(total_blocks), self.launchStream())
                 else if (wants_mmq)
-                    kern.quantize_q8_k_mmq(base_act, @ptrCast(base_xq), self.d_xqm, @intCast(total_blocks), null)
+                    kern.quantize_q8_k_mmq(base_act, @ptrCast(base_xq), self.d_xqm, @intCast(total_blocks), self.launchStream())
                 else
-                    kern.quantize_q8_k(base_act, @ptrCast(base_xq), @intCast(total_blocks), null);
+                    kern.quantize_q8_k(base_act, @ptrCast(base_xq), @intCast(total_blocks), self.launchStream());
                 if (rc != cudart.cudaSuccess) {
                     // No single token index to blame any more: report the whole
                     // quantize that failed (all k rows, nb_tok blocks each).
@@ -3815,7 +3819,12 @@ pub const CudaBackend = struct {
                     @intCast(cols),
                     @intCast(k),
                     @intCast(@backingInt(q.ttype)),
-                    null,
+                    // **必须走 `launchStream()`**：capture 跑在 `g_stream` 上，
+                    // 传 `null`（旧版默认流）的 launch 不会被录进图 —— 实测
+                    // verify 一次有 497 次 `matvecBatchK` 全部在 `.rec` 阶段，
+                    // 图里却只有 **1** 个 matvec 节点，于是重放只跑了一次矩阵乘，
+                    // 结果错得不多不少刚好是"缺了一大半层"的样子。
+                    self.launchStream(),
                 );
                 if (rc_mm != cudart.cudaSuccess) {
                     std.debug.print("cuda backend: mul_mat_vec({s}, K={d}) launch failed: {s}\n", .{
