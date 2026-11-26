@@ -47,26 +47,80 @@
 // dotq.cuh so that mmq.cu (the prefill tile kernel) can use the exact same
 // definitions instead of a second copy (AGENTS.md: one source for one fact).
 #include "dotq.cuh"
-// Largest `tokens` the cooperative warp-per-row kernels accept.
+// Largest `tokens` the cooperative warp-per-row kernels accept, **per type**.
 //
-// 8 matches llama.cpp's `MMVQ_MAX_BATCH_SIZE`, which is the batch at which its
-// `mul_mat_vec_q` hands over to the tiled GEMM: below it the per-row kernels
-// win because the tile cannot be filled.  Read once (this is on the per-matvec
-// path); `$QWEN35_COOP_MAX_TOKENS` overrides for A/B, and 1 reproduces the old
+// This is the crossover between the two prefill matvec implementations, and it
+// is a measurement, not a preference.  The mma tile stages a 16-row slab, so it
+// pays a fixed cost (staging + barriers + SM drain) that only amortises once the
+// batch fills the tile; the warp-per-row kernel has no such cost but reads the
+// weights K times instead of once.  Measured on the 27B IQ3_XXS ffn shape
+// (`rows=5120 cols=17408`, RTX 4090 D, 200 iterations per point):
+//
+//   k           4        5        6        7        8
+//   IQ3_XXS   0.75x    0.97x    1.17x    1.36x    1.54x   (tile_us / wpr_us)
+//   IQ4_XS    0.64x    0.81x    0.97x    1.13x    1.30x
+//
+// So IQ3_XXS flips over at k=6 and IQ4_XS at k=7.  A single constant of 5 would
+// cost IQ4_XS 19% at k=5 and 3% at k=6, which is exactly the range speculative
+// decoding lives in (verify blocks are 2..max_draft+1 rows).
+//
+// The value is the largest `tokens` that still goes to warp-per-row, so it is
+// `flip - 1`.  Types not listed use `Q35_COOP_MAX_DEFAULT`; that default is the
+// most conservative measured crossover, so an unmeasured type never pays the
+// tile's fixed cost on a batch too small to amortise it.
+//
+// `$QWEN35_COOP_MAX_TOKENS` overrides every type for A/B; `$QWEN35_COOP_MAX_TOKENS_<TT>`
+// (TT = the `Q35_TT_*` numeric tag) overrides one.  1 reproduces the old
 // single-token-only dispatch.
-static int q35_coop_max_tokens() {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    cached = 8;
+#define Q35_COOP_MAX_DEFAULT 4
+
+static int q35_coop_max_tokens(int ttype) {
+    static const struct { int ttype; int max_tokens; } table[] = {
+        // Measured crossovers minus one (see the comment above).
+        { Q35_TT_IQ3_XXS, 5 },
+        { Q35_TT_IQ4_XS,  6 },
+    };
+    // `$QWEN35_COOPDBG`: print the decision the FIRST time each type is seen, so
+    // "which kernel ran for this type" is a fact rather than an inference.
+    const bool dbg = getenv("QWEN35_COOPDBG") != nullptr;
     const char *v = getenv("QWEN35_COOP_MAX_TOKENS");
     if (v != nullptr) {
         const int n = atoi(v);
-        if (n >= 1) cached = n;
+        if (n >= 1) {
+            if (dbg) fprintf(stderr, "[coop] ttype=%d max_tokens=%d ($QWEN35_COOP_MAX_TOKENS)\n", ttype, n);
+            return n;
+        }
     }
-    if (getenv("QWEN35_COOPDBG")) {
-        fprintf(stderr, "[coop] max_tokens=%d\n", cached);
+    // Per-type override: `QWEN35_COOP_MAX_TOKENS_<tag>`.  Built by hand rather
+    // than with snprintf so this file keeps its existing include set.
+    char key[64];
+    {
+        const char *pfx = "QWEN35_COOP_MAX_TOKENS_";
+        size_t n = 0;
+        while (pfx[n] != '\0' && n < sizeof key - 1) { key[n] = pfx[n]; ++n; }
+        char digits[12];
+        size_t nd = 0;
+        int t = ttype < 0 ? -ttype : ttype;
+        do { digits[nd++] = (char)('0' + t % 10); t /= 10; } while (t != 0 && nd < sizeof digits);
+        if (ttype < 0 && n < sizeof key - 1) key[n++] = '-';
+        while (nd > 0 && n < sizeof key - 1) key[n++] = digits[--nd];
+        key[n] = '\0';
     }
-    return cached;
+    if (getenv(key) != nullptr) {
+        const int n = atoi(getenv(key));
+        if (n >= 1) {
+            if (dbg) fprintf(stderr, "[coop] ttype=%d max_tokens=%d (%s)\n", ttype, n, key);
+            return n;
+        }
+    }
+    for (size_t i = 0; i < sizeof table / sizeof table[0]; ++i) {
+        if (table[i].ttype == ttype) {
+            if (dbg) fprintf(stderr, "[coop] ttype=%d max_tokens=%d (table)\n", ttype, table[i].max_tokens);
+            return table[i].max_tokens;
+        }
+    }
+    if (dbg) fprintf(stderr, "[coop] ttype=%d max_tokens=%d (default)\n", ttype, Q35_COOP_MAX_DEFAULT);
+    return Q35_COOP_MAX_DEFAULT;
 }
 
 
@@ -866,16 +920,14 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     if (info.block_elems == 0) return (int)cudaErrorInvalidValue;
     if (cols % info.block_elems != 0) return (int)cudaErrorInvalidValue;
 
-    // Prefill only: a single token has nothing to reuse, and the warp-per-row
-    // kernel already coalesces it (below).
-    //
-    // SMALL BATCHES SKIP THE TILE TOO.  The tile kernel stages a 16-row slab and
-    // runs tensor-core mma over it, which is right for a prefill chunk and wrong
-    // for the 2..8 rows a speculative verify sends: five rows leave 69% of the
-    // tile empty AND the mma still pays its fixed staging + barrier cost.  Those
-    // sizes go to the cooperative warp-per-row kernels below instead, which is
-    // what `Q35_COOP_MAX_TOKENS` gates.
-    if (tokens > q35_coop_max_tokens() && q35_mmq_enabled() && q35_launch_mul_mat_vec_tile != 0) {
+    // SMALL BATCHES SKIP THE TILE.  The tile kernel stages a 16-row slab and runs
+    // tensor-core mma over it, so it pays a fixed cost (staging + barriers + SM
+    // drain) that only amortises once the batch fills the slab; the warp-per-row
+    // kernel has no such cost but re-reads the weights `tokens` times.  Where the
+    // two cross is a measurement and it is NOT the same for every type — see
+    // `q35_coop_max_tokens(ttype)`, which carries the numbers.  Sizes at or below
+    // that per-type crossover go to the cooperative warp-per-row kernels below.
+    if (tokens > q35_coop_max_tokens(ttype) && q35_mmq_enabled() && q35_launch_mul_mat_vec_tile != 0) {
         const int rc = q35_launch_mul_mat_vec_tile(d_w, d_xq, d_out, rows, cols,
                                                    tokens, ttype, stream_v);
         if (rc == (int)cudaSuccess) return rc;   // the tile kernel owns the output
@@ -892,12 +944,13 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     }
     const int total = rows * tokens;
     const int nblk = cols / info.block_elems;
-    // The warp-per-row mapping wins only for single-token decoding: with a
-    // prefill chunk the tile is reused across `tokens`, and the per-token
-    // `__syncwarp()` plus lane-0 fold cost more than the coalescing saves
-    // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s).  Keep the thread-per-row
-    // kernel for tokens > 1, where each token already fills the SMs.
-    if (tokens <= q35_coop_max_tokens()) {
+    // The warp-per-row mapping wins at small batches: below the per-type
+    // crossover the tile cannot be filled, and the per-token `__syncwarp()` plus
+    // lane-0 fold is cheaper than the fixed staging cost it saves.  Beyond the
+    // crossover the tile reuses each weight read across `tokens` and wins instead
+    // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s when it was forced to stay
+    // on this kernel at k=525).
+    if (tokens <= q35_coop_max_tokens(ttype)) {
         // K-split kernel first: it needs a type with a `_part` body and a block
         // whose sub-block count divides `SPLIT` evenly.  `q35_split()` returns
         // the wanted lane count; clamp to the largest divisor of the type's unit

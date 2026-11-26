@@ -226,6 +226,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_MVLIST` | **仅 CUDA 后端**。打印每个 matvec 调用的 `[mvl] <type> rows= cols=`。用来算「一 token 里每种类型多少流量」，是决定优化优先级的唯一可靠依据（按 launch 次数或按代码直觉都会排错序） |
 | `QWEN35_CUDA_RPB` | **仅 CUDA 后端**。decode coop 内核的 rows-per-warp（1..32，默认 1）。实测 1 最优，2/4/8/16 单调变差（47.5 → 46.8 → 45.9 → 43.5 → 38.9 tok/s）。加行/block 会减少 block 数，并行度损失大于局部性收益。 |
 | `QWEN35_CUDA_MEMONLY` | **仅 CUDA 后端**。只搬权重不做点积，测「纯访存下限」。27B IQ3_XXS 实测 27.0 tok/s → 说明瓶颈是访问模式而非设备带宽（4090D 理论 ~1000 GB/s，实测各类型 130–660） |
+| `QWEN35_COOP_MAX_TOKENS` / `_<TT>` / `QWEN35_COOPDBG` | **仅 CUDA 后端**。prefill matvec 在「warp-per-row」与「mma tile」之间的切换点，**按量化类型**给（值 = 仍走 warp-per-row 的最大 tokens = 实测拐点 − 1）。默认见 `q35_coop_max_tokens()` 的表：IQ3_XXS=5、IQ4_XS=6，其余 4。`_<TT>` 是单类型覆盖（TT = `Q35_TT_*` 数值 tag）。`QWEN35_COOPDBG=1` 对每个类型打一行 `[coop] ttype= max_tokens= (table/default)`，确认路由**真的**生效只看这一行 |
 
 调试方法论：
 0. **CUDA 侧的坑（2026-11 全部踩过，逐条都有代价）**：
