@@ -1020,12 +1020,6 @@ pub const CpuBackend = struct {
         _ = g;
     }
 
-    /// CPU 后端没有图，直发段与普通段没有区别。
-    fn vGraphDirect(ctx: *anyopaque, on: bool) void {
-        _ = ctx;
-        _ = on;
-    }
-
     fn vName(ctx: *anyopaque) []const u8 {
         _ = ctx;
         return "cpu";
@@ -1624,7 +1618,6 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         .sampledToken = vSampledToken,
         .graphBegin = vGraphBegin,
         .graphEnd = vGraphEnd,
-        .graphDirect = vGraphDirect,
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,

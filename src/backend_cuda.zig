@@ -305,7 +305,24 @@ inline fn xg_push_slot(slot: u8) u8 {
 }
 var xg_backend: ?*CudaBackend = null;
 
+/// `$QWEN35_GATEDBG` 的累计计数：`graphGate` 被调用多少次、其中多少次是
+/// "图已重放"（即跳过发射）。
+var g_gate_stat: struct { calls: u64 = 0, replayed: u64 = 0, last_kind: []const u8 = "" } = .{};
+/// `$QWEN35_GATEDBG`：`matvecBatchK` 被调用多少次、实际发射多少次。
+var g_bk_stat: struct { calls: u64 = 0, launches: u64 = 0 } = .{};
+
 fn graphGate(g: backend.Graph) bool {
+    // `$QWEN35_GATEDBG`：统计每张图被 gate 跳过多少次、以及最后一次是哪个槽
+    // 的什么 phase。用来回答"capture 里的 op 到底有没有发射"。
+    if (cudart.getenv("QWEN35_GATEDBG") != null) {
+        const st = &g_gate_stat;
+        st.calls += 1;
+        if (g.replayed) st.replayed += 1;
+        st.last_kind = @tagName(g.kind);
+        if (cudart.getenv("QWEN35_GATEDBG").?[0] == '2' and g.replayed) {
+            std.debug.print("[gate] REPLAYED kind={s} slot={d}\n", .{ @tagName(g.kind), g.slot });
+        }
+    }
     // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
     if (g.kind == .nextn) {
         const self = xg_backend orelse return g.replayed;
@@ -1797,7 +1814,6 @@ pub const CudaBackend = struct {
     sample_sp: ?*sampler.Sampler = null,
 
     /// 见 `gOpGate`：非 graph 管辖段。
-    g_direct: bool = false,
 
     /// 设备端的一个 int：当前 KV 写入的起始行号。`q35_launch_kv_quant_dslot`
     /// 从它读行号，所以 graph 捕获下来的指针在重放时仍然有效（每 token 只需
@@ -2537,10 +2553,6 @@ pub const CudaBackend = struct {
     /// Without this the host path re-runs the whole step on the default stream
     /// next to the graph -- see `g_op_seen`.
     fn gOpGate(self: *CudaBackend, g: backend.Graph, seen: *bool) bool {
-        // `g_direct`：当前这段代码不在任何 graph 的管辖范围内（MTP 的 draft
-        // 循环就是这样跑的）。它必须真正执行，而不是被当成"已由 graph 重放
-        // 吸收"而跳过 —— 否则 draft 什么都不算，verify 拿到垃圾。
-        if (self.g_direct) return false;
         switch (self.gs(g.slot).state) {
             .rec => {
                 seen.* = true;
@@ -2556,8 +2568,7 @@ pub const CudaBackend = struct {
     /// for this token so the caller falls back to direct launches.  `why` is
     /// printed once (not per token) -- a per-token flood would bury the real
     /// message and cost measurable time in the very path being measured.
-    /// 后端级：放弃**任何**正在录的槽。只给拿不到具体图的路径用
-    /// （`dGraphDirect` 进入直发段时）。
+    /// 后端级：放弃**任何**正在录的槽。只给拿不到具体图的路径用。
     fn graphAbandonAny(self: *CudaBackend, why: []const u8) void {
         var i: u8 = 0;
         while (i < self.g_slots.len) : (i += 1) {
@@ -2844,12 +2855,25 @@ pub const CudaBackend = struct {
         std.debug.print("[xg] graph has {d} nodes ({d} non-kernel kernels, {d} distinct funcs)\n", .{
             got, non_kernel, counts.count(),
         });
+        // `$QWEN35_XD_NODES=2`：按 func 地址列出每个函数有多少节点。总数对不上
+        // 期望时，这一步直接指出"少了哪一类 op"，比逐个 ablation 快得多。
+        if (cudart.getenv("QWEN35_XD_NODES")) |v| {
+            if (v.len > 0 and v[0] == '2') {
+                var it = counts.iterator();
+                while (it.next()) |ent| {
+                    std.debug.print("[xg]   func 0x{x}: {d}\n", .{ ent.key_ptr.*, ent.value_ptr.* });
+                }
+            }
+        }
     }
 
     fn xdFinishCapture(self: *CudaBackend, s: *GraphSlot) void {
         const cu = &(self.cu orelse return);
         if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
             std.debug.print("[xg] finish capture, phase={s}\n", .{@tagName(s.xd_phase)});
+        }
+        if (cudart.getenv("QWEN35_GATEDBG") != null) {
+            std.debug.print("[gate] total={d} replayed={d} batchK_calls={d}\n", .{ g_gate_stat.calls, g_gate_stat.replayed, g_bk_stat.calls });
         }
         var graph: ?*anyopaque = null;
         s.xd_capturing = false;
@@ -3816,6 +3840,7 @@ pub const CudaBackend = struct {
             return;
         }
         const cu = &self.cu.?;
+        g_bk_stat.calls += 1;
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
 
         // Which device output to write: the caller's own region (normal) or the
@@ -5327,26 +5352,6 @@ pub const CudaBackend = struct {
         // 下面的 CPU 回退路径才需要。
         if (self.cu == null or logits.len == 0) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
-        }
-        // 直发段（MTP 草稿块）里的采样：没有图在管这一段，所以参数走阻塞 H2D
-        // 发布，kernel 照常发射，结果立刻 D2H 读回 —— 与图外 decode 完全同一条
-        // 路径，只是没有 capture 能让它被录进去。
-        if (self.g_direct) {
-            if (!self.ensureSampleBufs()) {
-                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
-            }
-            const pdx = dBufPtr(logits) orelse
-                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
-            self.sample_sp = sp;
-            self.sample_vocab = logits.len;
-            if (!self.publishSampleCtl(logits.len, sp, null)) return 0;
-            const rc_s = Launch.sample(backend.Graph.direct, pdx, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, null);
-            if (rc_s != cudart.cudaSuccess) {
-                self.ewLaunchFail("sample (direct)", rc_s);
-                return 0;
-            }
-            self.sampled = self.collectSampledToken(sp);
-            return self.sampled;
         }
         // 活的 S1 图在上一次重放时已经在 `g_stream` 上跑过采样器了；仍然由
         // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
@@ -7096,34 +7101,6 @@ pub const CudaBackend = struct {
         self.cpu.exec().setThreads(io, nt);
     }
 
-    /// 进入/离开"图外的直发段"（MTP 草稿块）。见 `VTable.graphDirect`。
-    ///
-    /// 进入：关掉当前正在录的 capture（把已录的节点丢掉、改用直发，原因见
-    /// `graphAbandon`），并让每种 kind 的图都转成 `.off` —— 草稿块每轮换嵌入
-    /// token，它的节点实参无法固化成常量，录进去只会重放第一轮。
-    ///
-    /// 这不只是"少录一段"的问题：草稿块跑在 verify 的 `forwardChunk` 调用栈
-    /// **里面**，旧机制下它的节点会被记进 verify 那张图（实测：第一轮就验证出
-    /// token 0 而不是 119016）。整段直发还它本来该有的样子。
-    ///
-    /// 离开：清掉"图断了"的标记。下一次 `graphReserve` 会重新把 decode 置回
-    /// `.rec`（幂等），于是草稿块的代价不泄漏到 decode。
-    fn dGraphDirect(ctx: *anyopaque, on: bool) void {
-        const self = self_(ctx);
-        if (on) {
-            // **只置标记，不动任何槽。**
-            //
-            // 这段的语义是"接下来这些 op 不属于任何可重放单元"，不是"把已有
-            // 的图作废"。以前这里会 `GraphExecDestroy` 全部槽并把 `xd_phase`
-            // 归 `.off` —— 而 MTP 的整段 `generateSpec` 都在这个 span 里，
-            // 于是 verify 的图永远建不起来（实测 `[xg] graphBegin kind=chunk
-            // slot=1 phase=off`，一次都没录过）。真要把某个槽作废，用
-            // `graphAbandon` 或把那个槽的 phase 单独置掉。
-            self.g_direct = true;
-            return;
-        }
-        self.g_direct = false;
-    }
 
     /// prefill 循环的结束点：主机侧唯一能确知"prefill 已经做完"的地方。这里记录
     /// 的 event 仍然排在默认流里每一个 prefill kernel 之后，所以等这个结束 event
@@ -7137,13 +7114,6 @@ pub const CudaBackend = struct {
     // "Close a decode step"），它们描述的是已被删除的 S1 生命周期（含已经不存在
     // 的 warm 阶段），重构后没有对应函数。真正的开/关逻辑见 `dGraphBegin` 与
     // `dGraphEnd`。
-
-    /// `VTable.selectGraphSlot`：切换 graph 状态槽。0 = decode，1 = verify。
-    ///
-    /// 两份 graph 形状不同（1 行 vs k 行），共用一槽会让
-    /// `graphUpdateRequired` 每次切换都为真，等于每步重捕获。
-    /// `VTable.graphDirect`：进入/离开"非 graph 管辖"段。MTP 的 draft 循环在
-    /// verify 的 graph 之外运行，这段里的每个 op 都必须真正执行。
 
 
     fn dProfPhase(ctx: *anyopaque, on: bool) void {
@@ -8204,7 +8174,6 @@ pub const vtable = backend.Exec.VTable{
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
     .graphBegin = CudaBackend.dGraphBegin,
     .graphEnd = CudaBackend.dGraphEnd,
-    .graphDirect = CudaBackend.dGraphDirect,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .profReport = CudaBackend.dProfReport,

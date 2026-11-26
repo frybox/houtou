@@ -2597,13 +2597,10 @@ pub const Engine = struct {
         // （`pos`/`kv_slot`/`attn_slot` 三个标量，同样走控制块），所以第一次
         // 之后每轮就是一次 `GraphLaunch`。
         //
-        // 草稿块的算子本身 capture 安全：嵌入走 `dequantize_row_dtoken`（行号从
+        // 草稿块的算子本身 capture 安全：嵌入走 `dequantize_rows_ctl`（行号从
         // 控制块读），其余是 matvec / rmsnorm / attention 的设备位置形态。
-        // 但**在 CUDA 上它仍在直发段里跑**：`main.zig` 的 MTP 分支先用
-        // `graphDirect(true)` 把整段草稿包起来，于是这里的 `graphBegin` 拿到的是
-        // 直通图 —— 原因见 `VTable.graphDirect`（草稿块跑在 verify 的调用栈里，
-        // 旧机制会把它录进 verify 那张图）。`.nextn` 这一 kind 因此只在没有
-        // CUDA 图的后端上真正成立；控制块的 `tok` 字段留给将来直接建这张图用。
+        // 它和 verify 是**串行**的两段（`generateSpec` 先 draft 再 verify），
+        // 不再套在 verify 的调用栈里，所以不会污染那张图。
         const saved = self.graph;
         self.graph = self.exec.graphBegin(.nextn, .{
             .pos = draft_pos,
@@ -3065,14 +3062,6 @@ pub const Engine = struct {
     /// Which backend this engine drives (debug/verification helpers use it).
     pub fn backendKind(self: *const Engine) backend.Kind {
         return self.backend_kind;
-    }
-
-    /// 进入/离开"图外直发段"。`main.zig` 的 MTP 分支用它把草稿块整段排除在
-    /// 任何 capture 之外：草稿块每轮换嵌入 token，录进图只会重放第一轮，而它
-    /// 又跑在 verify 的调用栈里，会把 verify 那张图一起污染。
-    /// 见 `backend.VTable.graphDirect`。
-    pub fn graphDirect(self: *Engine, on: bool) void {
-        self.exec.graphDirect(on);
     }
 
     /// Allocate a one-row hidden-state buffer (debug/verification helper).

@@ -670,14 +670,6 @@ pub const Exec = struct {
         graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl, slot: u8) Graph,
         graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
 
-        /// 进入/离开"图外的直发段"。
-        ///
-        /// 段内每个算子都真实发射，且没有任何 capture 在此期间打开 —— 这样
-        /// 一整套不属于任何可重放单元的算子（MTP 草稿块就是一个：它每轮换嵌入
-        /// token，节点实参无法固化成常量）就不会被前后某个 `graphBegin` 顺带
-        /// 录进去。默认实现是空操作（CPU 后端没有图）。
-        graphDirect: *const fn (ctx: *anyopaque, on: bool) void,
-
         /// The token this step's `sample` produced, valid AFTER `graphEnd`.
         ///
         /// `sample` runs INSIDE the graph span (it is the graph's last node) so a
@@ -966,10 +958,6 @@ pub const Exec = struct {
     }
     pub fn graphEnd(self: Exec, g: *Graph) void {
         self.vtable.graphEnd(self.ptr, g);
-    }
-    /// Enter / leave the "direct, never captured" span.  See `VTable.graphDirect`.
-    pub fn graphDirect(self: Exec, on: bool) void {
-        self.vtable.graphDirect(self.ptr, on);
     }
     /// See `VTable.sampledToken`: valid only after `graphEnd`.
     pub fn sampledToken(self: Exec) u32 {
