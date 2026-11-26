@@ -579,7 +579,13 @@ pub const Engine = struct {
     ///
     /// 做成字段而不是逐层传参：层内的辅助函数有 15 层深，否则它们都得为了往下
     /// 传这一个参数而多一个形参。
-    graph: backend.Graph = .{},
+    ///
+    /// 初值是**直通**图（`ptr == null`），但控制块不空：`embedTo` 在图活跃时
+    /// 从 `ctl.tok[0]` 取行号（见 `VTable.dequantRow`），所以任何调用
+    /// `embedTo` 的路径都必须先把当步的 `pos`/`tok` 写进来 —— `step` 由
+    /// `graphBegin` 填，其余单行入口用 `directCtl`。`kind`/`slot` 与 `step`
+    /// 用的一致，CPU 后端因此不需要分叉。
+    graph: backend.Graph = .{ .kind = .decode, .slot = graph_slot_decode },
     /// `step` 产出的 token。在图的范围之内写出，好让后端能在设备上采样
     /// （`Exec.sample`），随后由 `step` 读取。
     sampled: u32 = 0,
@@ -882,6 +888,25 @@ pub const Engine = struct {
     pub const graph_slot_decode: u8 = 0;
     pub const graph_slot_chunk: u8 = 1;
     pub const graph_slot_nextn: u8 = 2;
+
+    /// `forwardLogits` 在**没有 span** 时用的控制块。
+    ///
+    /// 嵌入的行号在图活跃时取自 `ctl.tok[0]`（见 `embedTo`）。prefill 的尾巴
+    /// 块、自检与调试路径直接调 `forwardLogits`，手里没有后端发出的句柄，
+    /// 但位置是已知的主机标量，所以在这里拼一个直通控制块 —— 它是**值**，
+    /// CPU 后端直接读，CUDA 的直通路径不发图也不发布它，行为与改动前相同。
+    fn directCtl(self: *Engine, pos: u32, token: u32, rows: u32) backend.GraphCtl {
+        var tt: [backend.ctl_tokens]u32 = @splat(0);
+        tt[0] = token;
+        return .{
+            .pos = pos,
+            .rope_base_bits = @bitCast(self.cfg.rope_freq_base),
+            .kv_slot = pos,
+            .attn_slot = pos,
+            .rows = rows,
+            .tok = tt,
+        };
+    }
 
     /// GDN 状态快照槽数 K。一次 verify 块最多 `spec_verify_rows` 行，接受
     /// `rows <= verify_rows - 1` 行，而槽 `rows-1` 是"跑完第 rows 行之后"，
@@ -1638,35 +1663,49 @@ pub const Engine = struct {
         // `pos`/`slot` 在动。所以设备后端可以录一次、之后重放，而它需要被告知
         // 这段区间的起止 —— 它看不到模型的控制流，只看得到单个算子。
         //
-        // embedding 在开图**之前**：查表在主机上选行（`base + token *
-        // row_bytes`），录进图会永远重读录制那一行。
-        self.embedTo(token, self.x.span(0, c.hidden));
+        // embedding 是 span **内**的第一个 op：本步的 token 先写进控制块的
+        // `tok[0]`，后端在设备上按它选行（见 `embedTo`），于是节点实参全是
+        // 模型常量，重放时嵌的是当步的 token。行号若留在主机侧当实参，录进图
+        // 之后会永远重读录制那一行。
         self.graph = self.exec.graphBegin(.decode, .{
             .pos = pos,
             .rope_base_bits = @bitCast(c.rope_freq_base),
             .kv_slot = pos,
             .attn_slot = pos,
             .rows = 1,
+            .tok = blk: {
+                var tt: [backend.ctl_tokens]u32 = @splat(0);
+                tt[0] = token;
+                break :blk tt;
+            },
         }, graph_slot_decode);
+        self.embedTo(token, self.x.span(0, c.hidden));
         // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是
         // 一次普通调用。读回 token 的那次 D2H 必须在 `graphEnd` **之后**：
         // capture 期间不能拷贝，录进图又会让每一 token 都读回录制时的那个 id。
         _ = self.forwardLogits(token, pos);
         self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
         self.exec.graphEnd(&self.graph);
-        self.graph = .{};
+        // 收尾后回到直通控制块：`forwardLogits` 是公开入口，其它调用点（prefill
+        // 尾巴、自检）靠它拿到当步的 `tok`/`pos`，而不是一个清零的结构。
+        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
         return self.exec.sampledToken();
     }
 
     /// 单 token 前向，**自带 embedding**。给调试/自检路径用（它们只想要
-    /// logits，不关心 span）。生产路径不用它：`step` 自己先 `embedTo`
-    /// 再开图，因为 embedding 必须在 capture 之外。
+    /// logits，不关心 span）。它自己拼一个直通控制块，因为这里没有后端发出的
+    /// 句柄 —— 见 `directCtl`。
     pub fn forwardTokenEmbedded(self: *Engine, token: u32, pos: u32) Buf {
+        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
         self.embedTo(token, self.x.span(0, self.cfg.hidden));
         return self.forwardLogits(token, pos);
     }
 
     /// 把 `token` 的 embedding 行反量化进 `dst`（宽度为 hidden）。
+    ///
+    /// 调用方必须**先** `graphBegin`（把 `token` 写进 `ctl.tok[0]`）再调它：
+    /// 图活跃时行号由后端从设备控制块读（见 `VTable.dequantRow`），重放时嵌的
+    /// 是当步的 token，而不是录制那一轮的行。直通图（prefill、CPU）用实参。
     fn embedTo(self: *Engine, token: u32, dst: Buf) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len == hidden);
@@ -1935,6 +1974,7 @@ pub const Engine = struct {
         // 这一路只在草稿块为空时出现（`generateSpec` 的 `room > 0` 挡住了它），
         // 保留是因为 `forwardChunkVerify` 是个 public 入口。
         if (k == 1) {
+            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0, tokens[0], 1) };
             self.embedTo(tokens[0], self.x.span(0, hidden));
             _ = self.forwardLogits(tokens[0], pos0);
             self.exec.copyRange(self.graph, self.logitsK.span(0, c.vocab), self.logits);
@@ -2593,7 +2633,8 @@ pub const Engine = struct {
         // 之后每轮就是一次 `GraphLaunch`。
         //
         // 草稿块的算子本身 capture 安全：嵌入走 `dequantize_rows_ctl`（行号从
-        // 控制块读），其余是 matvec / rmsnorm / attention 的设备位置形态。
+        // 控制块读，`tok[0]` 就是本轮要嵌的 token），其余是 matvec / rmsnorm /
+        // attention 的设备位置形态。
         // 它和 verify 是**串行**的两段（`generateSpec` 先 draft 再 verify），
         // 不再套在 verify 的调用栈里，所以不会污染那张图。
         const saved = self.graph;
@@ -2814,6 +2855,7 @@ pub const Engine = struct {
                 }
             }
             for (tokens, 0..) |t, r| {
+                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
             }
@@ -2837,6 +2879,7 @@ pub const Engine = struct {
             self.exec.copyOut(self.graph, self.spec_dbg_a, self.gdn[0].state);
             self.specRestoreSnapshot();
             for (tokens, 0..) |t, r| {
+                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
             }
@@ -3412,6 +3455,7 @@ pub const Engine = struct {
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| {
+                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 last_logits = self.forwardLogits(t, @intCast(i));
             }
@@ -3431,6 +3475,7 @@ pub const Engine = struct {
                 // 不开 span、也不选行。
                 if (n == 1) {
                     last_logits = blk: {
+                        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
                         self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
                         break :blk self.forwardLogits(prompt[i], @intCast(i));
                     };
@@ -3586,6 +3631,7 @@ pub const Engine = struct {
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| {
+                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 last_logits = self.forwardLogits(t, @intCast(i));
             }
@@ -3600,6 +3646,7 @@ pub const Engine = struct {
                 // 不开 span、也不选行。
                 if (n == 1) {
                     last_logits = blk: {
+                        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
                         self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
                         break :blk self.forwardLogits(prompt[i], @intCast(i));
                     };

@@ -3165,9 +3165,36 @@ pub const CudaBackend = struct {
         // namespace of those declarations -- see `Kernels` at the top of the file.
         const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
-        // 单行路径把行基址作为实参 —— 它**必须在图外调用**（录进图会永远读
-        // 录制那一行）。图内的多行嵌入走 `vDequantRows`。
+        // 行基址在本路径是主机实参，录进图会永远读录制那一行。所以图活跃时
+        // 改走控制块：`row` 换成本步的 `tok[0]`，行号由 kernel 在设备上展开
+        // （与 `vDequantRows` 同一条路径，只是行数固定 1）。这里的 `row` 只在
+        // 直通（含 CPU 回退）时使用。
+        //
+        // 调用方必须先 `graphBegin` 再调本槽，否则 `g.ctl.tok[0]` 还是上一轮
+        // 的值 —— 嵌入必须是 span **内**的第一个 op。
+        const gated = g.ptr != null and self.ctl_dev != null and
+            row < w.rows and cols % gguf.blockElems(w.ttype) == 0 and gguf.blockElems(w.ttype) != 0;
         const rc = blk: {
+            if (gated) {
+                const nblk = cols / gguf.blockElems(w.ttype);
+                ensureBuf(&cu.lib, &self.d_row_off, &self.d_row_off_bytes, nblk * @sizeOf(c_int)) catch {
+                    self.clearDevBuf(dstBuf);
+                    return;
+                };
+                break :blk Launch.dequantize_rows_ctl(
+                    g,
+                    @intCast(@backingInt(w.ttype)),
+                    @ptrCast(e.dev),
+                    d_out,
+                    @intCast(cols),
+                    @intCast(row_bytes),
+                    self.ctl_dev.?,
+                    1,
+                    @ptrCast(@alignCast(self.d_row_off.?)),
+                    @intCast(nblk),
+                    self.launchStream(),
+                );
+            }
             const d_row = src + row * row_bytes;
             break :blk kern.dequantize_row(g,
                 @intCast(@backingInt(w.ttype)),

@@ -895,10 +895,13 @@ pub const CpuBackend = struct {
         @memcpy(dst.slice()[0..n], src.slice()[0..n]);
     }
 
+    /// 图活跃时行号取控制块的 `tok[0]`：调用方先 `graphBegin` 再调本槽，嵌入
+    /// 是 span 内的第一个 op，重放时嵌的才是当步的 token。直通图（CPU 的常态）
+    /// 仍用实参 `row`。
     fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
-        _ = g;
         _ = ctx;
-        dequantRowInto(dst.slice(), w, row);
+        const r: usize = if (g.ptr != null) g.ctl.tok[0] else row;
+        dequantRowInto(dst.slice(), w, r);
     }
 
     /// `g.ctl.tok[r]` 那几行展开进连续排布的 `dst`（见 `VTable.dequantRows`）。
