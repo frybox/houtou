@@ -2851,12 +2851,30 @@ pub const CudaBackend = struct {
         s.xd_phase = .live;
         // capture 只记录不执行：这一 token 至今没有任何 kernel 跑过，必须
         // launch 一次，否则 KV/GDN 状态都停在上一个 token。
+        //
+        // 而且**必须把结果排序回默认流**：`GraphLaunch` 落在 `g_stream` 上、
+        // 是异步的，而 `launchStream()` 在图活着时返回默认流，于是图之后的所有
+        // 工作（调用方的 argmax、下一层）会和它并发。`xdReplay` 早就做了这道
+        // 排序（见那里注释里的"旧机制参数全冻结、每次跑出不同 token"），这里
+        // 一直漏着：漏掉它时**录制那一轮就已经算错**，而不是只有重放轮错。
         const lrc = cu.lib.GraphLaunch(gexec_new, self.g_stream.?);
         if (lrc != cudart.cudaSuccess) {
             self.ewLaunchFail("xg: first launch", lrc);
             s.xd_phase = .off;
             _ = cu.lib.GraphExecDestroy(gexec_new.?);
             s.xd_gexec = null;
+            return;
+        }
+        if (self.g_ev_out) |ev| {
+            if (cu.lib.EventRecord(ev, self.g_stream.?) == cudart.cudaSuccess) {
+                _ = cu.lib.StreamWaitEvent(null, ev, 0);
+                _ = cu.lib.EventSynchronize(ev);
+            }
+        } else {
+            // 没有事件句柄（`ensureEvents` 只在 profiling 时建）时退化成一次
+            // 流同步：录制一轮本来就只发生一次，这点代价可以接受，而漏掉排序
+            // 会直接产出错值。
+            _ = cu.lib.StreamSynchronize(self.g_stream.?);
         }
     }
 

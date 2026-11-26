@@ -1935,8 +1935,7 @@ pub const Engine = struct {
         self.in_spec_verify = true;
         defer self.in_spec_verify = false;
         // 这一段落在 `.verify` span 里，但后端默认**不把 `.verify` 录成图**
-        // （见 `dGraphBegin` 的说明：k 行前向的逐轮标量还没有全部搬到设备
-        // 控制块）。`$QWEN35_XD_VERIFY=1` 可以打开，用来继续那条工作。
+        // （见 `dGraphBegin` 的说明）。
         _ = self.forwardChunk(tokens, pos0);
         // Normalise every row and project them all through lm_head.
         self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
