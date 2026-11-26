@@ -1036,7 +1036,7 @@ fn runInference(
         e.reset();
         var ref_logits: []f32 = &.{};
         for (toks, 0..) |tk, ti| {
-            _ = e.forwardLogits(tk, @intCast(ti));
+            _ = e.forwardTokenEmbedded(tk, @intCast(ti));
         }
         ref_logits = try arena.dupe(f32, e.logits.slice());
 
@@ -1166,7 +1166,7 @@ fn runInference(
             // teacher-forced token wrong).  The tap then holds the last-layer
             // hidden state of every prompt row.
             _ = if (plen == 1)
-                e.forwardLogits(seq[0], 0)
+                e.forwardTokenEmbedded(seq[0], 0)
             else
                 e.forwardChunk(seq[0..plen], 0);
             const pre_plane = try e.specTapNormedPlane(0, plen);
@@ -1181,7 +1181,7 @@ fn runInference(
                 const tk = seq[n - 1];
                 // 单 token 不是块：`forwardChunk` 只处理 k > 1（它不预留单行
                 // 路径，单行要走 `forwardLogits` 的逐 token 前向）。
-                _ = e.forwardLogits(tk, @intCast(n - 1));
+                _ = e.forwardTokenEmbedded(tk, @intCast(n - 1));
                 hiddens[n - 1] = try e.specTapNormedPlane(0, 1);
                 // greedy pick from the target's own logits
                 var best: u32 = 0;
@@ -1598,7 +1598,7 @@ fn runInference(
                     // `forwardChunk` 只处理 k > 1（它和处理单行的
                     // `forwardLogits` 是并列的两种形状，互不代劳）。
                     if (n_ctx == 1) {
-                        _ = e.forwardLogits(prompt[0], 0);
+                        _ = e.forwardTokenEmbedded(prompt[0], 0);
                     } else {
                         _ = e.forwardChunk(prompt[0..n_ctx], 0);
                     }
@@ -1770,7 +1770,7 @@ fn runInference(
                     var lg_buf = if (plen == 0)
                         e.logits
                     else if (plen == 1)
-                        e.forwardLogits(prompt[0], 0)
+                        e.forwardTokenEmbedded(prompt[0], 0)
                     else
                         e.forwardChunk(prompt[0..plen], 0);
                     var truth: [32]u32 = undefined;
@@ -1789,7 +1789,7 @@ fn runInference(
                         }
                         truth[ntruth] = best;
                         if (best == chain[ntruth]) hits += 1;
-                        lg_buf = e.forwardLogits(best, @intCast(pos));
+                        lg_buf = e.forwardTokenEmbedded(best, @intCast(pos));
                         pos += 1;
                     }
                     try out.print("SPEC-DRAFT truth:", .{});

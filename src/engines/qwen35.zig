@@ -1544,25 +1544,15 @@ pub const Engine = struct {
     /// the host dereference that forced a D2H of the whole vocabulary per token.)
     /// No sampling, no PRNG draw.  Prefill uses this so the sampler's coin
     /// stream is untouched by the prompt.
+    /// **不开 span**：`step` 才是 `.decode` 的开启点。这个函数只读
+    /// `self.graph`（默认直通图 = 每个算子照原样发射），于是同一个函数在
+    /// "直发"（prefill 的尾巴块）和"被 `step` 的 span 收进去"两种情形下都
+    /// 成立。它不做采样 —— 采样器由 `step` 在图内调用。
     pub fn forwardLogits(self: *Engine, token: u32, pos: u32) Buf {
-        return self.forwardLogitsSampled(token, pos, null);
-    }
-
-    /// `forwardLogits` plus an OPTIONAL sampler that runs inside the graph span.
-    ///
-    /// The sampler must be the last node of a replayable step: on a device
-    /// backend it is part of the captured graph (llama.cpp keeps it in the same
-    /// `ggml_cgraph`), so a replayed token needs no host-side launch between the
-    /// graph and the token id.  The returned id is only valid once `graphEnd`
-    /// has run, which is why the caller reads it from the engine rather than
-    /// from this call's return value.
-    ///
-    /// **这一版仍然自己开 span**，不是设计上的终态：`forwardLogits` 的调用方
-    /// 有两个（decode 的 `step` 与 prefill 的尾巴块），后者一律直发。等 span
-    /// 的开启权完全移给调用方之后，这里只剩"读 `self.graph`"。
-    pub fn forwardLogitsSampled(self: *Engine, token: u32, pos: u32, sp: ?*sampler.Sampler) Buf {
+        // `token` 只在这一步的 embedding 里用到，而 embedding 归调用方
+        // （见 `step` / prefill 循环）。保留参数是为了签名和调用点一致。
+        _ = token;
         const c = self.cfg;
-        const hidden: usize = c.hidden;
         const io = self.io;
         if (prof) {
             prof_gdn = 0;
@@ -1571,44 +1561,8 @@ pub const Engine = struct {
             prof_lm = 0;
             prof_emb = 0;
         }
-        const te = Io.Clock.Timestamp.now(io, .awake);
-        // embedding 查表：把该 token 那一行直接反量化进 x
-        self.embedTo(token, self.x.span(0, hidden));
-        if (prof) prof_emb += profNs(io, te);
-
-        // 一次 decode 步骤 —— 从第一层到 logits —— 是整个引擎里唯一一段"kernel
-        // 在跑之前就已知"的区间：权重已常驻、每个形状固定、只有 `pos`/`slot` 在动。
-        // 所以设备后端可以把它录一次、之后重放，而它需要被告知这段区间的起止 ——
-        // 它看不到模型的控制流，只看得到单个算子。
-        //
-        // 边界的**起点刻意放在 embedding 查表之后**：那次查表在**主机**上选行
-        // （`base + token * row_bytes`），被捕获的 dequantize 节点会永远重读第一个
-        // token 那一行。反量化一行只要几微秒，把它挡在图外没有可测量的代价，却
-        // 消掉了一整类陈旧数据问题。
-        //
-        // 边界的**终点**是下面的 `graphEnd`。当调用方要求采样
-        // （`forwardLogitsSampled`）时，采样器作为区间内的**最后一个**算子运行 ——
-        // 这才让设备后端能把它放进捕获下来的图（llama.cpp 也把采样器当作模型图
-        // 的一个节点），而不是事后再付一次发射 + 全词表 D2H。
-        //
-        // 打开这一趟的图。从这里到 `graphEnd` 是一个可重放单元：同样的权重、
-        // 同样的缓冲，`pos` 是唯一会动的标量。不能（或不愿）录制的后端返回直通图，
-        // 于是每个算子都照原样执行。
-        // `rope_base_bits` 在这里就给真值。它是**模型常量**（不是逐 token 的
-        // 量），所以放进控制块完全安全；不给的话 `rope64Rows` 每次都会因为
-        // "值变了"而再发一次 H2D —— 而那次拷贝落在 capture 区间内，会被录成
-        // 图里的一个 memcpy 节点，重放时把录制那一步的 ctl 内容写回设备块。
-        // 实测：`QWEN35_XD_NODES` 报出 2 个 non-kernel 节点，正是它。
-        // `forwardLogitsSampled` 是**唯一**打开 `.decode` span 的地方（调用方
-        // 是 `step`）。`forwardLogits` 本身不开 span：prefill 的尾巴块也要调它，
-        // 而 prefill 一律直发（见 `GraphKind` 的注释）。
-        self.graph = self.exec.graphBegin(.decode, .{
-            .pos = pos,
-            .rope_base_bits = @bitCast(c.rope_freq_base),
-            .kv_slot = pos,
-            .attn_slot = pos,
-            .rows = 1,
-        }, graph_slot_decode);
+        // embedding 由 `step` 在开图之前做好（查表在主机上选行，录进图会
+        // 永远重读录制那一行）；prefill 的尾巴块也由调用方自己做。
         // 模型带 nextn 块时 `self.layers` 会多出一个槽（见 `nSlots`）；普通的
         // 前向必须停在 decoder 层，否则每个 token 都会把草稿头当作第 64 层再跑
         // 一遍。
@@ -1662,16 +1616,6 @@ pub const Engine = struct {
                 .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
             }
         }
-        // 采样是图里的**最后一个节点**：kernel 写设备控制块，读回 token 的
-        // 那次 D2H 留在图外（`graphEnd` 之后由后端做）。capture 期间不能拷贝，
-        // 重放期间更不能不拷 —— 把 D2H 录进图会让每一 token 都读回录制时的
-        // 那个 id。CPU 后端里 `sample` 就是一次普通调用，`sampled` 直接是结果。
-        if (sp) |sampler_obj| self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, sampler_obj);
-        self.exec.graphEnd(&self.graph);
-        self.graph = .{};
-        // 图关闭之后才拿得到真实 token（见 backend_cuda.zig 的 `dGraphEnd`）。
-        // CPU 后端与直接发射路径在 `sample` 里就填好了，这里是恒等。
-        self.sampled = self.exec.sampledToken();
         if (prof) prof_lm += profNs(io, b);
         return self.logits;
     }
@@ -1683,16 +1627,43 @@ pub const Engine = struct {
 
     /// 前向 + 采样一个 token。采样器的 temperature 为 0 时就是 greedy（argmax）
     /// —— 历史默认行为。
+    ///
+    /// **`.decode` span 的唯一开启点。** `forwardLogits` 只读 `self.graph`，
+    /// 采样器由这里在 span 内调用（图的最后一个节点），读回 token 的那次 D2H
+    /// 留在 `graphEnd` 之后。
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+        const c = self.cfg;
         // 一次 decode 步骤 —— 从 embedding 查表到 logits —— 是整个引擎里唯一
         // 一段"kernel 在跑之前就已知"的区间：权重已常驻、每个形状固定，只有
         // `pos`/`slot` 在动。所以设备后端可以录一次、之后重放，而它需要被告知
         // 这段区间的起止 —— 它看不到模型的控制流，只看得到单个算子。
         //
-        // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是一
-        // 次普通调用，`sampled` 就是它的结果。
-        _ = self.forwardLogitsSampled(token, pos, &self.sampler);
-        return self.sampled;
+        // embedding 在开图**之前**：查表在主机上选行（`base + token *
+        // row_bytes`），录进图会永远重读录制那一行。
+        self.embedTo(token, self.x.span(0, c.hidden));
+        self.graph = self.exec.graphBegin(.decode, .{
+            .pos = pos,
+            .rope_base_bits = @bitCast(c.rope_freq_base),
+            .kv_slot = pos,
+            .attn_slot = pos,
+            .rows = 1,
+        }, graph_slot_decode);
+        // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是
+        // 一次普通调用。读回 token 的那次 D2H 必须在 `graphEnd` **之后**：
+        // capture 期间不能拷贝，录进图又会让每一 token 都读回录制时的那个 id。
+        _ = self.forwardLogits(token, pos);
+        self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
+        self.exec.graphEnd(&self.graph);
+        self.graph = .{};
+        return self.exec.sampledToken();
+    }
+
+    /// 单 token 前向，**自带 embedding**。给调试/自检路径用（它们只想要
+    /// logits，不关心 span）。生产路径不用它：`step` 自己先 `embedTo`
+    /// 再开图，因为 embedding 必须在 capture 之外。
+    pub fn forwardTokenEmbedded(self: *Engine, token: u32, pos: u32) Buf {
+        self.embedTo(token, self.x.span(0, self.cfg.hidden));
+        return self.forwardLogits(token, pos);
     }
 
     /// 把 `token` 的 embedding 行反量化进 `dst`（宽度为 hidden）。
@@ -1964,6 +1935,7 @@ pub const Engine = struct {
         // 这一路只在草稿块为空时出现（`generateSpec` 的 `room > 0` 挡住了它），
         // 保留是因为 `forwardChunkVerify` 是个 public 入口。
         if (k == 1) {
+            self.embedTo(tokens[0], self.x.span(0, hidden));
             _ = self.forwardLogits(tokens[0], pos0);
             self.exec.copyRange(self.graph, self.logitsK.span(0, c.vocab), self.logits);
             return self.logitsK.span(0, c.vocab);
@@ -2841,7 +2813,10 @@ pub const Engine = struct {
                     g.conv_len = s.conv_len;
                 }
             }
-            for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            for (tokens, 0..) |t, r| {
+                self.embedTo(t, self.x.span(0, self.cfg.hidden));
+                _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            }
             return;
         }
         if (cudart_debug_rollback) {
@@ -2861,7 +2836,10 @@ pub const Engine = struct {
             self.specRollbackFast(rows);
             self.exec.copyOut(self.graph, self.spec_dbg_a, self.gdn[0].state);
             self.specRestoreSnapshot();
-            for (tokens, 0..) |t, r| _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            for (tokens, 0..) |t, r| {
+                self.embedTo(t, self.x.span(0, self.cfg.hidden));
+                _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
+            }
             self.exec.copyOut(self.graph, self.spec_dbg_b, self.gdn[0].state);
             var nd: usize = 0;
             var w: f32 = 0;
@@ -3433,7 +3411,10 @@ pub const Engine = struct {
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
-            for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
+            for (prompt, 0..) |t, i| {
+                self.embedTo(t, self.x.span(0, self.cfg.hidden));
+                last_logits = self.forwardLogits(t, @intCast(i));
+            }
         } else {
             // K-token batched prefill: every layer's weights are read once per
             // chunk (batched projections) and reused across the chunk's K
@@ -3446,10 +3427,19 @@ pub const Engine = struct {
                 // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`）。两种
                 // 形状是**并列**的：`forwardChunk` 只断言 k > 1、内部不转发，
                 // 单行一律由调用方走 `forwardLogits`。
-                last_logits = if (n == 1)
-                    self.forwardLogits(prompt[i], @intCast(i))
-                else
-                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                // embedding 归调用方：`forwardLogits` 和 `forwardChunk` 都
+                // 不开 span、也不选行。
+                if (n == 1) {
+                    last_logits = blk: {
+                        self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
+                        break :blk self.forwardLogits(prompt[i], @intCast(i));
+                    };
+                } else {
+                    last_logits = blk: {
+                        self.embedChunk(prompt[i .. i + n]);
+                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    };
+                }
                 i += n;
             }
         }
@@ -3595,7 +3585,10 @@ pub const Engine = struct {
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
-            for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
+            for (prompt, 0..) |t, i| {
+                self.embedTo(t, self.x.span(0, self.cfg.hidden));
+                last_logits = self.forwardLogits(t, @intCast(i));
+            }
         } else {
             var i: usize = 0;
             while (i < prompt.len) {
@@ -3603,10 +3596,19 @@ pub const Engine = struct {
                 // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`）。两种
                 // 形状是**并列**的：`forwardChunk` 只断言 k > 1、内部不转发，
                 // 单行一律由调用方走 `forwardLogits`。
-                last_logits = if (n == 1)
-                    self.forwardLogits(prompt[i], @intCast(i))
-                else
-                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                // embedding 归调用方：`forwardLogits` 和 `forwardChunk` 都
+                // 不开 span、也不选行。
+                if (n == 1) {
+                    last_logits = blk: {
+                        self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
+                        break :blk self.forwardLogits(prompt[i], @intCast(i));
+                    };
+                } else {
+                    last_logits = blk: {
+                        self.embedChunk(prompt[i .. i + n]);
+                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    };
+                }
                 i += n;
             }
         }
