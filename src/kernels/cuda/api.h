@@ -156,6 +156,12 @@ int q35_launch_scale_vec_strided(float *d_x, int offset, float s, int n,
                                  int tokens, int stride, void *stream);
 int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
+
+// 行数从每步控制块读（`ctl[XD_CTL_ROWS]`）的拷贝：拷 `rows * row_elems` 个
+// float。给"每行定宽、行数等于本步行数"的拷贝用（`forwardChunk` 的 tap），
+// 否则行数会随图录死，k 变化时不匹配。`cap_elems` 是目标区能装下的上界。
+int q35_launch_copy_range_rows_ctl(float *d_dst, const float *d_src, int row_elems,
+                                   const int *d_ctl, int cap_elems, void *stream);
 int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src, int heads, int hd, void *stream);
 // `tokens` rows of [q|gate] split in ONE launch (chunk-wide prefill).  Row t
 // starts at `t * 2 * heads * hd`; bit-identical to `tokens` calls above.

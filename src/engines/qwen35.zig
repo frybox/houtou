@@ -1892,9 +1892,16 @@ pub const Engine = struct {
             if (self.tap_hidden.len != 0) {
                 for (self.tap_layers, 0..) |tl, ti| {
                     if (tl == li) {
-                        self.exec.copyRange(self.graph, 
-                            self.tap_hidden.span(ti * self.nbatch * hidden, k * hidden),
-                            self.xK.span(0, k * hidden),
+                        // 行数走**设备控制块**（`copyRowsCtl`），不是 `k`。
+                        // `copyRange` 的长度是主机实参，录进图之后被烘死成录制
+                        // 那一轮的 k；k 从 2 变 3 时第三行不写，草稿头读到旧
+                        // hidden，接受率塌掉（实测 62.5% → 12.5%）并很快 EOS。
+                        // 目标区按 `nbatch` 给上界（它本来就那么大），实际写多少
+                        // 由 ctl.rows 决定。
+                        self.exec.copyRowsCtl(self.graph,
+                            self.tap_hidden.span(ti * self.nbatch * hidden, self.nbatch * hidden),
+                            self.xK.span(0, self.nbatch * hidden),
+                            hidden,
                         );
                         break;
                     }

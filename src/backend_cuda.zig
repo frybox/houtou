@@ -121,6 +121,8 @@ const Kernels = struct {
     extern fn q35_launch_l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_copy_range(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// 行数从每步控制块读的拷贝（见 `api.h`）。
+    extern fn q35_launch_copy_range_rows_ctl(d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -390,6 +392,10 @@ const Launch = if (cuda_linked) struct {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
+    fn copy_range_rows_ctl(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
+        if (graphGate(g)) return 0;
+        return Kernels.q35_launch_copy_range_rows_ctl(d_dst, d_src, row_elems, d_ctl, cap_elems, stream);
+    }
     fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         if (graphGate(g)) return 0;
         return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
@@ -639,6 +645,11 @@ const Launch = if (cuda_linked) struct {
     fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_dst, d_src, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn copy_range_rows_ctl(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
+        _ = g;
+        _ = .{ d_dst, d_src, row_elems, d_ctl, cap_elems, stream };
         return stubNoCudaKernels();
     }
     fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
@@ -6980,6 +6991,31 @@ pub const CudaBackend = struct {
     }
 
     /// The `dequantRow` slot, timed (`$QWEN35_PROF`).
+    /// `VTable.copyRowsCtl`：行数取设备控制块的 `rows`。
+    fn vCopyRowsCtl(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, row_elems: usize) void {
+        const self = self_(ctx);
+        const xg_prev = xg_push_slot(g.slot);
+        defer xg_cur_slot = xg_prev;
+        if (graphGate(g)) return;
+        if (row_elems == 0) return;
+        const cap = @min(dst.len, src.len);
+        if (cap == 0) return;
+        if (self.gpuReady() and self.ctl_dev != null) {
+            if (dBufPtr(dst)) |pd| {
+                if (dBufPtr(src)) |ps| {
+                    const rc = Launch.copy_range_rows_ctl(g, pd, ps, @intCast(row_elems),
+                        self.ctl_dev.?, @intCast(cap), self.launchStream());
+                    if (rc == cudart.cudaSuccess) return;
+                    if (self.capturing(g)) self.graphAbandon(g, "copy_range_rows_ctl launch failed");
+                    self.ewLaunchFail("copy_range_rows_ctl", rc);
+                }
+            }
+        }
+        // 没有 ctl 或没有 GPU：退回主机侧按同一个 rows 拷贝。
+        const n = @min(cap, @as(usize, g.ctl.rows) * row_elems);
+        @memcpy(dst.slice()[0..n], src.slice()[0..n]);
+    }
+
     fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
@@ -7911,6 +7947,7 @@ pub const vtable = backend.Exec.VTable{
     // Device: weights and every numeric kernel.
     .loadLinear = CudaBackend.vLoadLinear,
     .freeLinear = CudaBackend.vFreeLinear,
+    .copyRowsCtl = CudaBackend.vCopyRowsCtl,
     .dequantRow = CudaBackend.vDequantRow,
     .dequantRows = CudaBackend.vDequantRows,
     .matvec = CudaBackend.vMatvec,

@@ -585,6 +585,11 @@ pub const Exec = struct {
         /// Region-to-region copy (KV writes, GDN state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf) void,
+
+        /// 拷贝 `g.ctl.rows` 行、每行 `row_elems` 个 f32；`cap` 是 `dst` 能装下
+        /// 的上界。行数走**设备控制块**，所以录进图之后 k 变化仍然正确 ——
+        /// `copyRange` 的长度是主机实参，会被烘死成录制那一轮的 k。
+        copyRowsCtl: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void,
         /// `copyRange` whose destination advances once per token: the KV cache
         /// append, `dst = cache.k/v + slot * kv_dim`.
         ///
@@ -889,6 +894,11 @@ pub const Exec = struct {
     }
     pub fn copyRange(self: Exec, g: Graph, dst: Buf, src: Buf) void {
         self.vtable.copyRange(g, self.ptr, dst, src);
+    }
+
+    /// 拷贝 `g.ctl.rows` 行（每行 `row_elems` 个 f32），行数取设备控制块。
+    pub fn copyRowsCtl(self: Exec, g: Graph, dst: Buf, src: Buf, row_elems: usize) void {
+        self.vtable.copyRowsCtl(g, self.ptr, dst, src, row_elems);
     }
 
     /// Device -> host copy into a plain host slice.

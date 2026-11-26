@@ -886,6 +886,15 @@ pub const CpuBackend = struct {
         self.freeScratch();
     }
 
+    /// `g.ctl.rows` 行、每行 `row_elems` 个 f32（见 `VTable.copyRowsCtl`）。
+    /// CPU 后端里控制块是普通值，直接按它算长度。
+    fn vCopyRowsCtl(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void {
+        _ = ctx;
+        const n = @as(usize, g.ctl.rows) * row_elems;
+        std.debug.assert(n <= dst.len and n <= src.len);
+        @memcpy(dst.slice()[0..n], src.slice()[0..n]);
+    }
+
     fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
         _ = g;
         _ = ctx;
@@ -1569,6 +1578,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         .allocScratch = vAllocScratch,
         .allocScratchK = vAllocScratchK,
         .freeScratch = vFreeScratch,
+        .copyRowsCtl = vCopyRowsCtl,
         .dequantRow = vDequantRow,
         .dequantRows = vDequantRows,
         .matvec = vMatvec,

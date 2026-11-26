@@ -72,6 +72,24 @@ extern "C" __global__ void k_copy_range(float *__restrict__ dst, const float *__
     if (i < n) dst[i] = src[i];
 }
 
+// `k_copy_range` 的行数从**设备控制块**读（`XD_CTL_ROWS`）。
+//
+// 为什么要这一版：`matvec` 之外还有一批"每行固定宽、行数等于本步 rows"的
+// 拷贝（`forwardChunk` 的 tap_hidden 就是），行数若是主机实参，录进图之后
+// 被烘死成录制那一轮的 k —— k 从 2 变 3 时第三行不写，草稿头读到旧 hidden，
+// 表现为接受率突然塌掉（实测 62.5% → 12.5%）且很快 EOS。
+//
+// `row_elems` 与 `rows` 的乘积可能超过 grid 覆盖的范围，所以 kernel 内再判一次。
+extern "C" __global__ void k_copy_range_rows_ctl(float *__restrict__ dst,
+                                                 const float *__restrict__ src,
+                                                 int row_elems,
+                                                 const int *__restrict__ d_ctl,
+                                                 int cap_elems) {
+    const int n = d_ctl[XD_CTL_ROWS] * row_elems;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && i < cap_elems) dst[i] = src[i];
+}
+
 // `k_copy_range` with the destination row chosen on the DEVICE: `dst_base` is
 // the region base, `stride` the byte offset from an f32 base to the next row,
 // and the row index comes from the per-step control block (XD_CTL_KV_SLOT).
@@ -238,6 +256,15 @@ extern "C" int q35_launch_copy_range_dslot(float *d_dst_base, int dst_stride_flo
     if (n != rows * dst_stride_floats) return (int)cudaErrorInvalidValue;
     k_copy_range_dslot<<<gridFor(n), kThreads, 0, (cudaStream_t)stream_v>>>(
         d_dst_base, dst_stride_floats, d_src, rows, n, d_ctl);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int q35_launch_copy_range_rows_ctl(float *d_dst, const float *d_src,
+                                               int row_elems, const int *d_ctl,
+                                               int cap_elems, void *stream_v) {
+    if (row_elems <= 0 || cap_elems <= 0 || d_ctl == nullptr) return (int)cudaErrorInvalidValue;
+    k_copy_range_rows_ctl<<<gridFor(cap_elems), kThreads, 0, (cudaStream_t)stream_v>>>(
+        d_dst, d_src, row_elems, d_ctl, cap_elems);
     return (int)cudaGetLastError();
 }
 
