@@ -1165,60 +1165,6 @@ const DevRegion = struct { ptr: *anyopaque, len: usize };
 /// ~800 KiB -- acceptable for a backend that already holds the weights.
 ///
 /// Measured on the 27B (65 layers, 24 q-heads, 4 kv-heads, interval 4): a decode
-/// token captures **448 `rope64` + 16 `attn_decode` + 32 kv-append** nodes.  The
-/// earlier claim here ("128 rope64, room to spare") was off by 3.5x and made the
-/// 256 capacity silently reject the graph on every 27B run.  Exceeding the
-/// capacity is not a correctness problem: the graph path switches itself off and
-/// falls back to direct launches, so a too-small value is invisible in the exit
-/// code and only shows up as decode throughput.  0.8B needs 48.
-const graph_max_layers: usize = 1024;
-
-/// One flag per op class the captured decode step can contain.  See
-/// `CudaBackend.g_op_seen` for why the gating exists at all.
-const GhOpFlags = struct {
-    matvec: bool = false,
-    rmsnorm: bool = false,
-    rmsnorm_rows: bool = false,
-    add_resid: bool = false,
-    scale_vec: bool = false,
-    silu_in_place: bool = false,
-    mul_silu: bool = false,
-    mul_sigmoid: bool = false,
-    swiglu: bool = false,
-    softmax: bool = false,
-    zero_buf: bool = false,
-    gdn_step: bool = false,
-    gdn_step_rows: bool = false,
-    gdn_gamma: bool = false,
-    conv_step: bool = false,
-    attn_decode: bool = false,
-    rope64: bool = false,
-    rope64_rows: bool = false,
-    kv_append: bool = false,
-};
-
-/// Node budget for one captured decode step.  Used for the per-function arrays
-/// (a 0.8B decode step is ~800 nodes) and for the ordering buffers
-/// (`g_order_nodes`), which are the reason it is this large.
-const capture_nodes_max = 4096;
-
-/// See the `g_state` field comment in `CudaBackend` for the transitions.
-const GraphState = enum { off, warm, rec, live };
-
-/// How many argument slots `argHoldsU32`/`argHoldsInt` will inspect.  The
-/// widest launcher in this backend (`gdn_step_rows`) takes 19 arguments, so 24
-/// is comfortably above every real signature while keeping a linear scan of an
-/// argument array trivially cheap (it runs once per kernel node, once per
-/// process, at capture time).
-/// Largest kernel signature this backend launches.  `attn_decode`'s device
-/// kernel takes 13 arguments and `gdn_step_rows`' takes 17; 24 leaves headroom
-/// and costs `24 * 16` bytes per tracked node, i.e. nothing.
-const kernel_max_args: usize = 24;
-
-/// 一张 XG decode 图最多记录多少个 op。实测 27B 一个 decode token 的发射
-/// 次数约 3000（`QWEN35_PROF` 各 slot 的 calls 之和），4096 留出余量。
-
-
 /// 每步设备控制块里 `kv_slot` 的 int 下标（`xd.h` 的 `XD_CTL_KV_SLOT`）。
 ///
 /// 设备块是 `int32_t[6]`，字段顺序**必须**与 `backend.GraphCtl` 一致；那边
@@ -1238,11 +1184,6 @@ comptime {
 /// `graph_slot_*` 常量一致（引擎传进来，后端只做边界检查）。
 const graph_slot_count: usize = 3;
 
-/// One argument slot of a tracked kernel: `width` bytes of value storage, so a
-/// f32 (4) and a 64-bit pointer (8) both fit without a variant type.  Alignment
-/// is 8 because the widest thing stored is a pointer.
-const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
-
 /// One graph's captured state.
 ///
 /// Three instances exist:
@@ -1250,65 +1191,12 @@ const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
 ///   * slot 1 -- the VERIFY graph: one `forwardChunkVerify` (k rows).
 ///   * slot 2 -- the NEXTN graph: one MTP draft block (1 row).
 ///
-/// They cannot share one graph: the node set (and every `ne`/`nb` the
-/// backend compares in `graphUpdateRequired`) differs between a 1-row
-/// and a k-row forward, so a shared slot would re-capture on every
-/// switch.  The stream and the two ordering events ARE shared
-/// (`g_stream`/`g_ev`/`g_ev_out`): capture and replay on one stream is
-/// legal for any number of graphs.
+/// They cannot share one graph: the node set differs between a 1-row and a
+/// k-row forward, so a shared slot would re-capture on every switch.  The stream
+/// and the two ordering events ARE shared (`g_stream`/`g_ev`/`g_ev_out`):
+/// capture and replay on one stream is legal for any number of graphs.
 const GraphSlot = struct {
-    state: GraphState = .off,
-    rope_dyn: ?*anyopaque = null,
-    rope_dyn_pos: u32 = 0xFFFF_FFFF,
-    rope_dyn_base: f32 = 0.0,
-    attn_dyn: ?*anyopaque = null,
-    /// 设备端 int：attnChunk 的起始行。graph 重放时从它读。
-    d_attn_slot: ?*anyopaque = null,
-    /// Host 镜像，只有值变了才 H2D。
-    d_attn_slot_host: c_int = -1,
-    graph: ?*anyopaque = null,
-    exec: ?*anyopaque = null,
-    rope_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    rope_n: usize = 0,
-    attn_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    attn_n: usize = 0,
-    rope_args: [graph_max_layers]c_uint = @splat(0),
-    rope_base: [graph_max_layers]f32 = @splat(0),
-    attn_args: [graph_max_layers]c_int = @splat(0),
-    rope_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
-    attn_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
-    rope_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
-    attn_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
-    rope_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
-    attn_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
-    expect_rope: usize = 0,
-    expect_attn: usize = 0,
-    rec_pos: u32 = 0,
-    rec_slot: usize = 0,
-    base_captured: f32 = 0,
-    kv_dst_captured: [graph_max_layers]?*anyopaque = @splat(null),
-    kv_stride: [graph_max_layers]usize = @splat(0),
-    expect_kv: usize = 0,
-    order_nodes: [capture_nodes_max]?*anyopaque = undefined,
-    order_n: usize = 0,
-    cluster_n: usize = 0,
-    cluster_appends: usize = 0,
-    kv_partner: [graph_max_layers]usize = @splat(0),
-    kv_nodes: [graph_max_layers]?*anyopaque = @splat(null),
-    kv_n: usize = 0,
-    kv_params: [graph_max_layers]cudart.KernelNodeParams = @splat(undefined),
-    kv_argv: [graph_max_layers][kernel_max_args]ArgSlot = @splat(@splat(.{})),
-    kv_kptr: [graph_max_layers][kernel_max_args]?*anyopaque = @splat(@splat(null)),
-    kv_dst_cells: [graph_max_layers]?*anyopaque = @splat(null),
-    capturing: bool = false,
-    capturing_step: bool = false,
-    op_seen: GhOpFlags = .{},
-    failed: bool = false,
-
-    // ---- 显式计算图（XG，S3c）--------------------------------------------
-    //
-    // 与上面那批旧机制字段并存，直到 S3d 把它们删掉。`xd_phase` 非 `.off`
-    // 时走 XG 的路，旧字段一律不看。
+    // ---- 显式计算图（XG）-------------------------------------------------
     //
     // 没有 op 表、没有节点列表：capture 期间 op 照常发射，CUDA 自己记录，
     // 重放就是一次 `GraphLaunch`。这是 llama.cpp / ds4 / Strata 三者共同的
@@ -1902,112 +1790,10 @@ pub const CudaBackend = struct {
     /// Rows-per-head reduction factor for the split attention path
     /// (`$QWEN35_CUDA_ATTN_SPLIT`, 0 = off -> coalesced kernel).
     attn_split: usize = 0,
-    /// The captured graph, kept only between EndCapture and Instantiate.
-    /// Replayable instantiation.  This is the only thing used per token.
-    /// Kernel nodes to retarget every token, in the order they were launched.
-    /// Both are variables of the *decode step*, not of the model:
-    ///   - `rope64`'s `pos` advances once per token (one launch per layer);
-    ///   - `attn_decode`'s `slot` advances once per token (one launch per full
-    ///     attention layer).
-    /// Nothing else in a decode token changes its arguments -- `conv_step`
-    /// shifts its window IN the kernel (fixed pointers), the GDN state kernels
-    /// read fixed pointers, and matvec's operands are all fixed regions of the
-    /// KV cache / weights.  That was checked against every `Launch.*` call site
-    /// in this file, not assumed.
-    /// Argument blocks handed to `cudaGraphExecKernelNodeSetParams`.  Each is
-    /// the *value* of one changed argument (`pos`, `slot`), so these are four
-    /// bytes each and outlive the call only in the sense that the runtime
-    /// copies them -- but they must stay addressable between the `SetParams`
-    /// and it returning, which a plain field guarantees.
-    /// `rope64`'s `base` (theta), the OTHER per-token argument of that kernel.
-    /// It is not a constant of the model: the engine re-derives it each step
-    /// (context-length dependent RoPE scaling), so a snapshot would rotate
-    /// every replayed token with the capture token's theta.
-    /// Per-node parameter definitions captured at capture time (grid/block/func
-    /// plus a pointer to the argument array).  Rebuilt rather than mutated
-    /// because `cudaGraphKernelNodeGetParams` may return either a
-    /// `kernelParams` array or an `extra` blob and only the former is safe to
-    /// hand back to `SetParams`.
-    /// Owned copies of every tracked node's argument VALUES, one
-    /// `[kernel_max_args]ArgSlot` per node.  `cudaGraphKernelNodeGetParams`
-    /// hands back a `kernelParams` array that belongs to the runtime and that we
-    /// must not write through; instead the values are copied here at capture
-    /// time and the `kernelParams` pointer handed to `SetParams` points into
-    /// this array.  `pos`/`slot` occupy one slot each and that slot's pointer is
-    /// retargeted at `g_rope_args[i]`/`g_attn_args[i]`, so a later token only has
-    /// to store a new value in that field.
-    /// The pointers handed to `SetParams` as `kernelParams`: one per tracked
-    /// node, each pointing at that node's `g_*_argv[i]` row above.
-    /// How many `rope64` / `attn_decode` launches the engine issued while the
-    /// capture was open.  Reconciled against the number of matched nodes before
-    /// the graph is trusted: a shortfall means a launch produced no node we can
-    /// retarget, so replay would feed it a stale `pos`/`slot` -- wrong numbers,
-    /// no error.  See `graphBuild`.
-    /// `pos`/`slot` the capture recorded, used to prove the node identification
-    /// actually found the right nodes before trusting the graph (see
-    /// `graphSelfCheck`).
-    /// The rope64 `base`/theta the graph was CAPTURED with.  It is a model
-    /// constant (`rope_freq_base`), so the captured value stays right for every
-    /// replay -- recorded rather than assumed so a future RoPE regime change is
-    /// a visible mismatch instead of silent garbage.
-    /// KV-cache writes captured from `copyRange`.  Their DESTINATION pointer is
-    /// `cache.{k,v} + slot * kv_dim`, i.e. it advances by exactly one row per
-    /// token, so a plain snapshot would append every later token's k/v to the
-    /// capture token's slot -- each token then attends to a cache that never
-    /// grew, which is wrong numbers with no error at all.  `g_copy_base[i]` is
-    /// the address the capture used and `g_copy_stride[i]` the per-token byte
-    /// step, so replay can recompute it.
-    /// Destination of each KV append the capture issued, in order, plus its
-    /// byte stride per token (`kv_dim * sizeof(f32)`).  `g_kv_expect` is the
-    /// count the engine declared; it has to equal the number of nodes found, or
-    /// the graph is dropped (see `graphBuild`).
-    /// `g_order_nodes[0..g_order_n]` is the captured decode step's nodes in
-    /// EXECUTION order, recovered by `graphCaptureOrder` -- see the note there
-    /// for why the list `cudaGraphGetNodes` returns cannot be used as-is.
-
-    /// Append counter of the layer cluster currently being walked by
-    /// `graphBuild`: 0 before the cluster's first append, 1 after it.  See
-    /// `kvSlotFromCluster`.
-
-    /// For every KV append captured, the slot that the OTHER append of the same
-    /// layer group belongs to: during a capture the engine issues a group's two
-    /// appends consecutively, so the second one of a cluster is the partner of
-    /// the first (see `kvSlotFromCluster`).
-    /// Per-node cell holding the destination POINTER for `SetParams`.  A token
-    /// advances it by `g_kv_stride[i]` bytes, so this is the one argument that
-    /// `copyArgs` must leave pointing at our storage rather than copying.
-    /// True while a capture is being assembled for the token whose argument
-    /// values are (`g_rec_pos`, `g_rec_slot`); argmax's blocking copy and any
-    /// host fallback clear it so a doomed capture is abandoned instead of
-    /// instantiated.
-    /// True between `stepBegin` opening a capture and `stepEnd` closing it.
-    /// Distinct from `g_capturing`, which a mid-step abandonment clears: this
-    /// one records *ownership* of the open capture so `stepEnd` knows it has to
-    /// close something (or clean up after an abandonment) rather than being
-    /// called on an uncaptured step.
-    /// WHICH ops the captured graph actually contains.  Set during capture by
-    /// `gOpGate`, consumed during replay to suppress the host-side launch.
-    ///
-    /// This is not an optimisation -- it is what makes replay correct.  A
-    /// capture does NOT stop the engine: `forwardLogits` keeps calling every
-    /// op's body, and a body that launches unconditionally emits a second copy
-    /// of the same work onto the default stream while the graph replays the
-    /// first copy on `g_stream`.  The two then interleave on the same buffers
-    /// and the token's result is neither copy: measured 2026-11, 187 host
-    /// matvec launches per replayed token, and `gdn.k` already holding the
-    /// graph's output when the host path read it.  Recursive state (GDN) is
-    /// advanced TWICE per token that way, which is why the first replayed token
-    /// was already numerically wrong.
-    ///
-    /// Recording the flags from an actual capture (rather than guessing a list)
-    /// is deliberate: an op that never entered the graph must keep running on
-    /// the host, and one that did must not.
-    /// Counters, printed once when the graph first goes live and again at
-    /// deinit, so a report can state whether replay actually happened.
+    /// 已重放的 token 数 / 被放弃的 capture 数，打印一次用于确认重放**真的**
+    /// 发生过（而不是每步悄悄退回直发）。
     stat_g_replay: usize = 0,
     stat_g_abandon: usize = 0,
-    /// Set when `$QWEN35_CUDA_GRAPH` said "off" or the first capture failed;
-    /// makes the decision one-way so a per-token retry cannot thrash.
     // No gamma/beta staging buffer any more: `gdnGamma` writes both INTO
     // backend regions (`gamma_scratch`, and the b half of `ab` in place) and
     // `gdnStepRows` consumes them straight from those device pointers.  The
@@ -2499,10 +2285,7 @@ pub const CudaBackend = struct {
         if (cudart.getenv("QWEN35_XD_STREAMDBG") != null) {
             std.debug.print("[stream] -> DEFAULT (no slot in rec)\n", .{});
         }
-        return switch (self.gs(0).state) {
-            .rec => self.g_stream,
-            else => null,
-        };
+        return null;
     }
 
     /// True when a launch happening right now is being captured, i.e. when its
@@ -2532,7 +2315,7 @@ pub const CudaBackend = struct {
     /// 有没有任何一个槽是 `.live`（诊断路径用；decode 只看槽 0）。
     fn anySlotLive(self: *const CudaBackend) bool {
         for (self.g_slots) |s| {
-            if (s.state == .live) return true;
+            if (s.xd_phase == .live) return true;
         }
         return false;
     }
@@ -2543,24 +2326,6 @@ pub const CudaBackend = struct {
         if (g.slot >= self.g_slots.len) return false;
         const ph = self.g_slots[g.slot].xd_phase;
         return ph == .rec or ph == .live;
-    }
-
-    /// Suppress a host-side launch when the captured graph already contains it.
-    ///
-    /// Returns false while a capture is open (after recording that this op made
-    /// it into the graph) and false while no graph is live; returns true only
-    /// for a REPLAYED step, whose work the graph has already done on `g_stream`.
-    /// Without this the host path re-runs the whole step on the default stream
-    /// next to the graph -- see `g_op_seen`.
-    fn gOpGate(self: *CudaBackend, g: backend.Graph, seen: *bool) bool {
-        switch (self.gs(g.slot).state) {
-            .rec => {
-                seen.* = true;
-                return false;
-            },
-            .live => return seen.*,
-            else => return false,
-        }
     }
 
     /// Called from every place that would otherwise make a capture invalid:
@@ -5353,14 +5118,6 @@ pub const CudaBackend = struct {
         if (self.cu == null or logits.len == 0) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
         }
-        // 活的 S1 图在上一次重放时已经在 `g_stream` 上跑过采样器了；仍然由
-        // `sample` 把 token 交回去，所以下载发生在这里。（S3 会把这件事换成图
-        // 自己在 `graphEnd` 里读控制块；在新路径上支持捕获之前，S1 图从不为
-        // live，这个分支不可达。）
-        const replayed = self.gs(0).state == .live;
-        if (replayed) {
-            return self.collectSampledToken(sp);
-        }
         // XG 重放：图已在 `graphBegin` 里 launch 完，采样参数也已经在那里发布
         // 进设备控制块（见 `dGraphBegin`）。这里**什么都不能再写** —— 尤其不能
         // 再 `publishSampleCtl`，那条路径会把控制块整体重置，正好覆盖图刚写下的
@@ -5718,12 +5475,10 @@ pub const CudaBackend = struct {
                                     // 标量 `slot` 形态留给直接发射路径 —— 那里没有
                                     // 节点可重定向，较小的 shared 块是白拿的。
                                     // 判定必须覆盖**两套**机制：旧的 `state` 与
-                                    // XG 的 `xd_phase`。只认 `state` 时，XG 的
-                                    // `.live` 重放会落进标量 `slot` 分支 —— 那一
-                                    // 分支把 slot 当 kernel 实参，录进图后每次重放
+                                    // XG 的 `xd_phase`。重放时若落进标量 `slot`
+                                    // 分支，图里会把 slot 当 kernel 实参，每次重放
                                     // 都按录制那一步的 KV 长度算 attention。
-                                    const want_dyn = graphWanted() and
-                                        (self.gs(0).state == .live or self.gs(0).state == .rec or self.graphActive(g));
+                                    const want_dyn = graphWanted() and self.graphActive(g);
                                     if (want_dyn) {
                                         if (self.ensureCtl()) |pdyn| {
                                             // **不要**在这里发布 `slot`。capture 期间
@@ -6317,7 +6072,7 @@ pub const CudaBackend = struct {
         // -- the pairs would measure empty intervals.  The graph path reports
         // its own totals via `stat_ns_token_dev`; disable the pool instead of
         // printing a table of zeros.
-        if (self.gs(0).state == .live) return null;
+        if (self.gs(0).xd_phase == .live) return null;
         if (self.slot_depth != 0) return null;
         if (!self.gpuEvEnsure()) {
             self.gpu_ev_on = false;
