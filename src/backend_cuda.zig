@@ -3943,10 +3943,11 @@ pub const CudaBackend = struct {
                 const base_xq: [*]u8 = @ptrCast(self.d_xq.?);
                 const q8_0_act = actBlockElems(q.ttype) == gguf.blockElems(.q8_0);
                 const kern = Launch;
-                // `k >= 2` on this path (engine.forwardChunk routes k == 1 to
-                // the serial forward) and `cols >= 1` with cols a multiple of
-                // actBlockElems, so `total_blocks >= 2`: the merged count can
-                // never be 0 and can never be smaller than the per-token one.
+                // `k >= 2` on this path (the caller routes k == 1 to
+                // `forwardLogits`, which is a separate shape) and `cols >= 1`
+                // with cols a multiple of actBlockElems, so `total_blocks >= 2`:
+                // the merged count can never be 0 and can never be smaller than
+                // the per-token one.
                 const total_blocks = nb_tok * k;
                 std.debug.assert(k >= 2 and nb_tok >= 1);
                 // The dp4a kernel reads `block_q8_1_mmq`, not q8_K, and used to

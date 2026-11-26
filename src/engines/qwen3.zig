@@ -733,8 +733,12 @@ pub const Engine = struct {
         const k = tokens.len;
         // A single token is the serial path, and `forwardLogits` opens and
         // closes its own `stepBegin`/`stepEnd` span; delegating keeps the
-        // decode-graph boundary from leaking into the next step (same reason
-        // `qwen35.forwardChunk` special-cases k == 1).
+        // decode-graph boundary from leaking into the next step.
+        //
+        // 与 `qwen35.forwardChunk` 不同：那个引擎把两种形状做成并列（调用方
+        // 按行数分流，函数内部不转发），因为它的 prefill 循环本来就知道每块的
+        // 行数。这里保留退化路径是因为还有 `$QWEN35_NO_BATCH` 与 `n_batch == 0`
+        // 两族"没有块 scratch"的情形需要在函数内部处理。
         if (k == 0) return self.logits;
         // `$QWEN35_NO_BATCH`: force the per-token loop, for A/B against the
         // batched path (same switch the Qwen3.5 engine honours).

@@ -1165,7 +1165,10 @@ fn runInference(
             // would run the target over an EMPTY cache and make every subsequent
             // teacher-forced token wrong).  The tap then holds the last-layer
             // hidden state of every prompt row.
-            _ = e.forwardChunk(seq[0..plen], 0);
+            _ = if (plen == 1)
+                e.forwardLogits(seq[0], 0)
+            else
+                e.forwardChunk(seq[0..plen], 0);
             const pre_plane = try e.specTapNormedPlane(0, plen);
             for (0..plen) |hi| {
                 hiddens[hi] = pre_plane[hi * hidden ..][0..hidden];
@@ -1592,7 +1595,13 @@ fn runInference(
                 try e.specTapEnable(dc.target_layers);
                 const n_ctx = @min(ctx_rows, prompt.len);
                 if (n_ctx > 0) {
-                    _ = e.forwardChunk(prompt[0..n_ctx], 0);
+                    // `forwardChunk` 只处理 k > 1（它和处理单行的
+                    // `forwardLogits` 是并列的两种形状，互不代劳）。
+                    if (n_ctx == 1) {
+                        _ = e.forwardLogits(prompt[0], 0);
+                    } else {
+                        _ = e.forwardChunk(prompt[0..n_ctx], 0);
+                    }
                     for (0..dc.target_layers.len) |ti| {
                         const plane = e.specTapPlane(ti, n_ctx).slice();
                         for (0..n_ctx * dc.hidden) |k| {
@@ -1755,7 +1764,15 @@ fn runInference(
                     // garbage, and then "the truth" is nonsense rather than a
                     // reference (measured: truth repeated one id 5 times).
                     e.reset();
-                    var lg_buf = e.forwardChunk(prompt[0 .. prompt.len - 1], 0);
+                    // `prompt.len - 1` 可以是 1：`forwardChunk` 只处理 k > 1，
+                    // 单行要走 `forwardLogits`（两者并列，互不代劳）。
+                    const plen = prompt.len - 1;
+                    var lg_buf = if (plen == 0)
+                        e.logits
+                    else if (plen == 1)
+                        e.forwardLogits(prompt[0], 0)
+                    else
+                        e.forwardChunk(prompt[0..plen], 0);
                     var truth: [32]u32 = undefined;
                     var ntruth: usize = 0;
                     var hits: usize = 0;

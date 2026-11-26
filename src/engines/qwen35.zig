@@ -1721,18 +1721,25 @@ pub const Engine = struct {
     /// 相同。
     pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) Buf {
         const k = tokens.len;
-        // 单 token 不是"块"：它的正确实现是 `forwardLogits`（逐 token 的完整
-        // 前向），而那个函数会开一张 `.decode` 图。以前这里递归调它，于是同一个
-        // 槽里出现两次 `graphBegin` —— 第二次 `StreamBeginCapture` 被运行时拒绝
-        // （`cudaErrorStreamCaptureUnsupported`），第一次开下的 capture 永远没人关。
+        // `forwardChunk` 与 `forwardLogits` 是**并列**的两种形状：前者 k 行块、
+        // 后者单行 decode。二者互不调用 —— 谁被用由调用方（prefill 循环 /
+        // `step` / `forwardChunkVerify` / `nextnPredict`）按行数决定。
         //
-        // 现在 span 的开启权在调用方（`forwardChunk` 不开 span），所以递归本身
-        // 不再危险；但"块"这个形状对 1 行没有意义（所有 `matvecBatchK` 都会退化
-        // 成 1 行的 warp-per-row），走 `forwardLogits` 才是对的。prefill 的循环
-        // 也按 `n == 1` 分流，这里是兜底 —— ReleaseFast 下 `std.debug.assert`
-        // 会被编译掉，不能拿它当唯一防线。
-        std.debug.assert(k > 0 and k <= self.nbatch);
-        if (k <= 1) return self.forwardLogits(tokens[0], pos0);
+        // 这里不做 `k == 1` 的转发：让一个函数在内部改换成另一种形状，正是
+        // "同一个槽里出现两次 `graphBegin`"那类问题的来源（第二次
+        // `StreamBeginCapture` 会被运行时拒绝，第一次开下的 capture 永远没人关）。
+        // 断言是唯一的表达方式；调用方必须自己分流。
+        std.debug.assert(k > 1 and k <= self.nbatch);
+
+        // 位置**不从这里传**：每一层的位置都来自 `self.graph.ctl` 的设备控制块
+        // （`pos` / `kv_slot` / `attn_slot` / `rows`），由开 span 的那一方发布。
+        // 块内第 t 行的位置是 `pos + t`，由 kernel 从控制块推导。
+        //
+        // 这个参数因此没有消费者 —— 它保留有两个原因：调用方（prefill 循环、
+        // `forwardChunkVerify`）本来就持有它、传出去更便于阅读；而 `step` /
+        // `verify` / `nextn` 三者的 `pos0` 各自不同，签名一致才好对照。
+        // 一旦确认没有读者，可以连同调用点一起删掉。
+        _ = pos0;
 
         const c = self.cfg;
         const hidden: usize = c.hidden;
@@ -1896,6 +1903,18 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
 
+        // 单行不是"验证块"：没有任何东西要批量投影，直接当成一次 decode 行，
+        // 并且**不开 `.verify` span** —— 那张图的行数是 k，录进一行 decode 的
+        // 节点集合之后，下一轮真来 k 行就重放不成立。
+        //
+        // 这一路只在草稿块为空时出现（`generateSpec` 的 `room > 0` 挡住了它），
+        // 保留是因为 `forwardChunkVerify` 是个 public 入口。
+        if (k == 1) {
+            _ = self.forwardLogits(tokens[0], pos0);
+            self.exec.copyRange(self.graph, self.logitsK.span(0, c.vocab), self.logits);
+            return self.logitsK.span(0, c.vocab);
+        }
+
         // 控制块：`pos` 是这一块第一行的位置，`kv_slot`/`attn_slot` 同它，
         // `rows` 是 k（后端据此判断槽里那张图还成不成立）。
         self.graph = self.exec.graphBegin(.verify, .{
@@ -1915,15 +1934,6 @@ pub const Engine = struct {
         // 让 GDN 分支写每行的状态快照；`specRollbackAndReplay` 据此只改视图。
         self.in_spec_verify = true;
         defer self.in_spec_verify = false;
-        // k == 1 也交给 `forwardChunk`?不行 —— 它断言 k > 1。单行 verify 不是
-        // 块:直接做一次 decode 行,复用同一张 `.verify` 图会录进 decode 的节点
-        // 集合。这一路只在草稿块为空时出现,MTP 的循环不会走到(见 generateSpec
-        // 的 `room > 0`),所以在这里显式退回 `forwardLogits`。
-        if (k == 1) {
-            _ = self.forwardLogits(tokens[0], pos0);
-            self.exec.copyRange(self.graph, self.logitsK.span(0, c.vocab), self.logits);
-            return self.logitsK.span(0, c.vocab);
-        }
         // 这一段落在 `.verify` span 里，但后端默认**不把 `.verify` 录成图**
         // （见 `dGraphBegin` 的说明：k 行前向的逐轮标量还没有全部搬到设备
         // 控制块）。`$QWEN35_XD_VERIFY=1` 可以打开，用来继续那条工作。
@@ -3375,11 +3385,9 @@ pub const Engine = struct {
             var i: usize = 0;
             while (i < prompt.len) {
                 const n = @min(self.nbatch, prompt.len - i);
-                // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`），而
-                // `forwardChunk` 只处理 k > 1 —— 它在 k == 1 时是补码用的
-                // `forwardLogits`，不是块。分流放在这里而不是函数里，因为
-                // `forwardLogits` 会开一张 `.decode` 图，而 prefill 这一段
-                // 一律直发。
+                // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`）。两种
+                // 形状是**并列**的：`forwardChunk` 只断言 k > 1、内部不转发，
+                // 单行一律由调用方走 `forwardLogits`。
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
@@ -3534,11 +3542,9 @@ pub const Engine = struct {
             var i: usize = 0;
             while (i < prompt.len) {
                 const n = @min(self.nbatch, prompt.len - i);
-                // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`），而
-                // `forwardChunk` 只处理 k > 1 —— 它在 k == 1 时是补码用的
-                // `forwardLogits`，不是块。分流放在这里而不是函数里，因为
-                // `forwardLogits` 会开一张 `.decode` 图，而 prefill 这一段
-                // 一律直发。
+                // 尾巴块可能只有 1 个 token（`prompt.len % nbatch == 1`）。两种
+                // 形状是**并列**的：`forwardChunk` 只断言 k > 1、内部不转发，
+                // 单行一律由调用方走 `forwardLogits`。
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
