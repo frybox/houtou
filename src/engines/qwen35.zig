@@ -1708,10 +1708,19 @@ pub const Engine = struct {
         }
     }
 
+    /// 把 `tokens` 的 embedding 行展开进 `xK` 的前 `k` 行。
+    ///
+    /// **必须在开 capture 之前调用。** capture 期间 op 不执行，`dequantRow`
+    /// 会被录成节点而 `xK` 停在上一轮的内容，于是整块前向算在旧输入上。
+    /// `forwardLogits` 的 anchor 也是同样的道理（放在 embedding 之后）。
+    fn embedChunk(self: *Engine, tokens: []const u32) void {
+        const hidden: usize = self.cfg.hidden;
+        for (tokens, 0..) |t, i| self.embedTo(t, self.xK.span(i * hidden, hidden));
+    }
+
     // -----------------------------------------------------------------
     // K-token 批量 prefill 块
     // -----------------------------------------------------------------
-
     /// 从位置 `pos0` 开始跑 `tokens.len`（<= K）个 token 的 prefill，返回**最后
     /// 一个** token 的 logits。每个读权重的线性投影（qkv / gate / alpha-beta /
     /// q / k / v / out-proj / ffn gate-up-down）每块只执行**一次** K-token 批量
@@ -1756,9 +1765,13 @@ pub const Engine = struct {
         // `forwardChunkVerify`），只有后者要录制，而它自己会开 `.verify`。
         // 这里只用 `self.graph` 的当前值（默认直通图 = 每个算子照原样发射），
         // 于是同一个函数在"直发"和"被外层 span 收进去"两种情形下都成立。
-
-        var t: usize = 0;
-        while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
+        //
+        // **embedding 由调用方在开 span 之前完成**（`embedChunk`）。放在这里
+        // 会踩 capture 的语义：capture 期间 op 不执行，`embedTo` 的 dequantize
+        // 节点被录进图而 `xK` 保持上一轮的内容，于是整块前向算在旧输入上
+        // （实测 verify：`x1K` 与直发差 3.7 倍，接受率 0%）。
+        // `forwardLogits` 早就有同一条规矩（它把 anchor 放在 embedding 之后），
+        // 这里补上。
 
         // `self.layers` has one extra slot when the model ships a nextn block
         // (see `nSlots`); a normal forward must stop at the decoder layers, or
@@ -1793,7 +1806,6 @@ pub const Engine = struct {
                 // the RoPE identity) and every later row drifted -- 5.9e-3 in
                 // the first full-attention layer's output, enough to change the
                 // first sampled token of a 17-token prompt.
-                t = 0;
                 self.forwardFullChunk(lw, li, k);
                 self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
             } else {
@@ -1813,7 +1825,6 @@ pub const Engine = struct {
                         self.exec.copyRange(self.graph, gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
                     }
                 }
-                t = 0;
                 // Chunk-wide GDN prelude: conv+silu, gamma/beta and the
                 // l2norm/scale passes do not touch the running state, and
                 // `gdnStepRows` only READS qkv, so all of it can run before the
@@ -1917,16 +1928,27 @@ pub const Engine = struct {
 
         // 控制块：`pos` 是这一块第一行的位置，`kv_slot`/`attn_slot` 同它，
         // `rows` 是 k（后端据此判断槽里那张图还成不成立）。
-        self.graph = self.exec.graphBegin(.verify, .{
-            .pos = pos0,
-            .rope_base_bits = @bitCast(c.rope_freq_base),
-            .kv_slot = pos0,
-            .attn_slot = pos0,
-            .rows = @intCast(k),
-        }, graph_slot_chunk);
+        //
+        // `$QWEN35_VERIFY_NOSPAN=1`（调试）：完全不碰图，`self.graph` 保持直通。
+        // 用来把"图机制有问题"与"图的内容有问题"分开。
+        // embedding 必须在开 capture 之前完成（见 `embedChunk`）。
+        self.embedChunk(tokens);
+        const nospan = @import("../cudart.zig").environ_map != null and
+            @import("../cudart.zig").environ_map.?.get("QWEN35_VERIFY_NOSPAN") != null;
+        if (!nospan) {
+            self.graph = self.exec.graphBegin(.verify, .{
+                .pos = pos0,
+                .rope_base_bits = @bitCast(c.rope_freq_base),
+                .kv_slot = pos0,
+                .attn_slot = pos0,
+                .rows = @intCast(k),
+            }, graph_slot_chunk);
+        }
         defer {
-            self.exec.graphEnd(&self.graph);
-            self.graph = .{};
+            if (!nospan) {
+                self.exec.graphEnd(&self.graph);
+                self.graph = .{};
+            }
         }
 
         // Layers, exactly as `forwardChunk` runs them.  Row k-1 also gets its
@@ -3390,7 +3412,10 @@ pub const Engine = struct {
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
-                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    blk: {
+                        self.embedChunk(prompt[i .. i + n]);
+                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    };
                 i += n;
             }
         }
@@ -3547,7 +3572,10 @@ pub const Engine = struct {
                 last_logits = if (n == 1)
                     self.forwardLogits(prompt[i], @intCast(i))
                 else
-                    self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    blk: {
+                        self.embedChunk(prompt[i .. i + n]);
+                        break :blk self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                    };
                 i += n;
             }
         }

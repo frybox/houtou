@@ -2470,7 +2470,15 @@ pub const CudaBackend = struct {
         // 这里保持"任何槽在录就用图流"：capture 只有一条流，且同一时刻只
         // 允许一个槽进 `.rec`。真正需要区分"哪张图"的判断在 `capturing(g)`。
         for (self.g_slots) |s| {
-            if (s.xd_phase == .rec) return self.g_stream;
+            if (s.xd_phase == .rec) {
+                if (cudart.getenv("QWEN35_XD_STREAMDBG") != null) {
+                    std.debug.print("[stream] rec -> g_stream (slot.phase=rec)\n", .{});
+                }
+                return self.g_stream;
+            }
+        }
+        if (cudart.getenv("QWEN35_XD_STREAMDBG") != null) {
+            std.debug.print("[stream] -> DEFAULT (no slot in rec)\n", .{});
         }
         return switch (self.gs(0).state) {
             .rec => self.g_stream,
@@ -2647,8 +2655,17 @@ pub const CudaBackend = struct {
         const cu = &(self.cu orelse return);
         const st = self.g_stream orelse return;
         const ev = self.g_ev_out orelse return;
-        if (cu.lib.EventRecord(ev, null) != cudart.cudaSuccess) return;
-        _ = cu.lib.StreamWaitEvent(st, ev, 0);
+        const erc = cu.lib.EventRecord(ev, null);
+        if (erc != cudart.cudaSuccess) {
+            if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
+                std.debug.print("[xg] EventRecord(null) FAILED: {s}\n", .{std.mem.span(cu.lib.errStr(erc))});
+            }
+            return;
+        }
+        const wrc = cu.lib.StreamWaitEvent(st, ev, 0);
+        if (wrc != cudart.cudaSuccess and cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
+            std.debug.print("[xg] StreamWaitEvent(g_stream, ev) FAILED: {s}\n", .{std.mem.span(cu.lib.errStr(wrc))});
+        }
     }
 
     // ==== 显式计算图（XG）的状态机 ==========================================
@@ -2876,6 +2893,10 @@ pub const CudaBackend = struct {
             // 会直接产出错值。
             _ = cu.lib.StreamSynchronize(self.g_stream.?);
         }
+        // `$QWEN35_XD_FULLSYNC=1`（调试）：首次 launch 之后做一次全设备同步。
+        // 若它能消除"打开过 capture 之后结果随机"的问题，就说明还有一处流间
+        // 依赖没被排序。
+        if (cudart.getenv("QWEN35_XD_FULLSYNC") != null) _ = cu.lib.DeviceSynchronize();
     }
 
     /// 重放：先按序 `apply` 每个节点（刷新实参），再 launch，最后把默认流
