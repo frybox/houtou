@@ -1553,7 +1553,8 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         return self.sampled;
     }
 
-    fn vSampledToken(ctx: *anyopaque) u32 {
+    fn vSampledToken(ctx: *anyopaque, sp: *sampler.Sampler) u32 {
+        _ = sp;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         return self.sampled;
     }

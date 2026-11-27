@@ -580,12 +580,19 @@ pub const Engine = struct {
     /// 做成字段而不是逐层传参：层内的辅助函数有 15 层深，否则它们都得为了往下
     /// 传这一个参数而多一个形参。
     ///
-    /// 初值是**直通**图（`ptr == null`），但控制块不空：`embedTo` 在图活跃时
-    /// 从 `ctl.tok[0]` 取行号（见 `VTable.dequantRow`），所以任何调用
-    /// `embedTo` 的路径都必须先把当步的 `pos`/`tok` 写进来 —— `step` 由
-    /// `graphBegin` 填，其余单行入口用 `directCtl`。`kind`/`slot` 与 `step`
-    /// 用的一致，CPU 后端因此不需要分叉。
-    graph: backend.Graph = .{ .kind = .decode, .slot = graph_slot_decode },
+    /// **它不持有图。** 图存在后端按槽号索引的 `g_slots[slot].xd_gexec` 里，
+    /// 由 `hasGraph` / `beginRecord` / `launch` 管理。这个结构只是一个
+    /// **每次 op 调用时传下去的上下文**：`phase` 决定该 op 是照常发射、被录进
+    /// 图、还是被跳过，`ctl` 给出本步的标量，`slot` 指明动的是哪张图。
+    ///
+    /// 名字叫 `gctx` 而不是 `graph`，就是为了不让人误以为"给 `self.xxx` 赋值
+    /// 会换掉图"。重录/重放只看槽，跟这个字段无关。
+    ///
+    /// 初值是直通上下文（`phase == .direct`），但控制块不空：`embedTo` 在图
+    /// 活跃时从 `ctl.tok[0]` 取行号（见 `VTable.dequantRow`），所以任何调用
+    /// `embedTo` 的路径都必须先把当步的 `pos`/`tok` 写进来 —— 开 span 的一方
+    /// 用 `GraphCtlBuilder` 填，其余单行入口用 `directCtl`。
+    gctx: backend.Graph = .{ .kind = .decode, .slot = graph_slot_decode },
     /// `step` 产出的 token。在图的范围之内写出，好让后端能在设备上采样
     /// （`Exec.sample`），随后由 `step` 读取。
     sampled: u32 = 0,
@@ -1261,7 +1268,7 @@ pub const Engine = struct {
                 // backend memory (device under `--backend cuda`), so the reset
                 // goes through the backend: a host `@memset` cannot reach it.
                 // 所有块一起清零：快照块在写入前也会被读（见 `rs_idx`）。
-                exec.zeroBuf(e.graph, e.gdn[li].state_all);
+                exec.zeroBuf(e.gctx, e.gdn[li].state_all);
             }
             inited += 1;
         }
@@ -1627,7 +1634,7 @@ pub const Engine = struct {
     /// No sampling, no PRNG draw.  Prefill uses this so the sampler's coin
     /// stream is untouched by the prompt.
     /// **不开 span**：`step` 才是 `.decode` 的开启点。这个函数只读
-    /// `self.graph`（默认直通图 = 每个算子照原样发射），于是同一个函数在
+    /// `self.gctx`（默认直通图 = 每个算子照原样发射），于是同一个函数在
     /// "直发"（prefill 的尾巴块）和"被 `step` 的 span 收进去"两种情形下都
     /// 成立。它不做采样 —— 采样器由 `step` 在图内调用。
     pub fn forwardLogits(self: *Engine, token: u32, pos: u32) Buf {
@@ -1673,7 +1680,7 @@ pub const Engine = struct {
             if (self.tap_hidden.len != 0) {
                 for (self.tap_layers, 0..) |tl, ti| {
                     if (tl == li) {
-                        self.exec.copyRange(self.graph, 
+                        self.exec.copyRange(self.gctx, 
                             self.tap_hidden.span(ti * self.nbatch * self.cfg.hidden, self.cfg.hidden),
                             self.x.span(0, self.cfg.hidden),
                         );
@@ -1684,18 +1691,18 @@ pub const Engine = struct {
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
-        self.exec.rmsnorm(self.graph, self.x1, self.x, self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1, self.x, self.output_norm, c.rms_eps);
         // lm_head：有独立的 `output.weight` 就用它，否则用共享的 token_embd。
         // 两者都是 [vocab, hidden] 行优先。
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.gctx, self.logits, ow, self.x1),
             }
         } else {
             // 共享 lm_head：logits = W_emb @ x1，W_emb 为 [vocab, hidden] 行优先
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, self.x1),
             }
         }
         if (prof) prof_lm += profNs(io, b);
@@ -1710,7 +1717,7 @@ pub const Engine = struct {
     /// 前向 + 采样一个 token。采样器的 temperature 为 0 时就是 greedy（argmax）
     /// —— 历史默认行为。
     ///
-    /// **`.decode` span 的唯一开启点。** `forwardLogits` 只读 `self.graph`，
+    /// **`.decode` span 的唯一开启点。** `forwardLogits` 只读 `self.gctx`，
     /// 采样器由这里在 span 内调用（图的最后一个节点），读回 token 的那次 D2H
     /// 留在 `graphEnd` 之后。
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
@@ -1741,14 +1748,20 @@ pub const Engine = struct {
         const recorded = self.exec.hasGraph(graph_slot_decode);
         if (!recorded) {
             self.exec.beginRecord(graph_slot_decode);
-            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = ctl, .phase = .record };
+            self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = ctl, .phase = .record };
             self.buildDecode(token, pos);
             self.exec.endRecord(graph_slot_decode);
         }
         self.exec.launch(graph_slot_decode);
-        // 图外的直通路径（CPU 后端、图关闭）：`launch` 是空操作，这里已经算完。
-        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
-        return self.exec.sampledToken();
+        // 先取结果，再收尾：`sampledToken` 要的是**本步**的采样器（显式传入），
+        // 而不是 `gctx`。
+        const out = self.exec.sampledToken(&self.sampler);
+        // 收尾：换回直通上下文。`gctx` **不持有图** —— 图在后端按槽号索引的
+        // `g_slots[slot]` 里，下一次 `decode` 由 `hasGraph(slot)` 从槽里取，
+        // 所以这次重置与重放无关；它只保证 `decode` 返回之后，调用方
+        // （prefill 尾巴块、自检、回滚回放）发直通 op 时看到的是"没有图"。
+        self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
+        return out;
     }
 
     /// `decode` 的"构建"部分：embedding + 65 层 + sample 节点。
@@ -1759,14 +1772,14 @@ pub const Engine = struct {
         const c = self.cfg;
         self.embedTo(token, self.x.span(0, c.hidden));
         _ = self.forwardLogits(token, pos);
-        self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
+        self.sampled = self.exec.sample(self.gctx, self.logits, self.sample_scratch, &self.sampler);
     }
 
     /// 单 token 前向，**自带 embedding**。给调试/自检路径用（它们只想要
     /// logits，不关心 span）。它自己拼一个直通控制块，因为这里没有后端发出的
     /// 句柄 —— 见 `directCtl`。
     pub fn forwardTokenEmbedded(self: *Engine, token: u32, pos: u32) Buf {
-        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
+        self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
         self.embedTo(token, self.x.span(0, self.cfg.hidden));
         return self.forwardLogits(token, pos);
     }
@@ -1783,8 +1796,8 @@ pub const Engine = struct {
         // 所以它是一次后端调用：用哪个反量化器（CPU 上是 Zig 参照、GPU 上是设备
         // kernel）是后端的事。Q8_0 的 32 元素分帧也在那里处理，不在这里特判。
         switch (self.token_embd) {
-            .f32 => |m| self.exec.copyRange(self.graph, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
-            .quant => |qrow| self.exec.dequantRow(self.graph, dst, qrow, token),
+            .f32 => |m| self.exec.copyRange(self.gctx, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
+            .quant => |qrow| self.exec.dequantRow(self.gctx, dst, qrow, token),
         }
     }
 
@@ -1807,9 +1820,9 @@ pub const Engine = struct {
                     var tt: [backend.ctl_tokens]u32 = @splat(0);
                     for (tokens, 0..) |t, i| tt[i] = t;
                     self.exec.dequantRows(.{
-                        .kind = self.graph.kind,
+                        .kind = self.gctx.kind,
                         .ctl = .{ .rows = @intCast(tokens.len), .tok = tt },
-                        .slot = self.graph.slot,
+                        .slot = self.gctx.slot,
                     }, self.xK.span(0, tokens.len * hidden), qrow);
                     return;
                 },
@@ -1841,7 +1854,7 @@ pub const Engine = struct {
         // 断言是唯一的表达方式；调用方必须自己分流。
         std.debug.assert(k > 1 and k <= self.nbatch);
 
-        // 位置**不从这里传**：每一层的位置都来自 `self.graph.ctl` 的设备控制块
+        // 位置**不从这里传**：每一层的位置都来自 `self.gctx.ctl` 的设备控制块
         // （`pos` / `kv_slot` / `attn_slot` / `rows`），由开 span 的那一方发布。
         // 块内第 t 行的位置是 `pos + t`，由 kernel 从控制块推导。
         //
@@ -1864,7 +1877,7 @@ pub const Engine = struct {
 
         // **不开 span**：`forwardChunk` 有两个调用方（prefill 的块循环与
         // `forwardChunkVerify`），只有后者要录制，而它自己会开 `.verify`。
-        // 这里只用 `self.graph` 的当前值（默认直通图 = 每个算子照原样发射），
+        // 这里只用 `self.gctx` 的当前值（默认直通图 = 每个算子照原样发射），
         // 于是同一个函数在"直发"和"被外层 span 收进去"两种情形下都成立。
         //
         // embedding 在 span **内**做：行号从设备控制块读（`g.ctl.tok[r]`），
@@ -1884,12 +1897,12 @@ pub const Engine = struct {
             // is bit-identical to the per-token loop it replaces.  The
             // per-token loop issued `k` launches of a 5 us kernel per layer per
             // norm, which was 5.6% of prefill device time on 27B IQ3_XXS.
-            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.gctx, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
-                self.exec.matvecBatchK(self.graph, self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
-                self.exec.matvecBatchK(self.graph, self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
-                self.exec.matvecBatchK(self.graph, self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
                 // ---- RoPE ----
                 // MOVED: both q's and k's rotation now happen inside
                 // `forwardFullChunk`, AFTER the q_norm/k_norm pass.  Doing them
@@ -1907,12 +1920,12 @@ pub const Engine = struct {
                 // the first full-attention layer's output, enough to change the
                 // first sampled token of a 17-token prompt.
                 self.forwardFullChunk(lw, li, k);
-                self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
+                self.exec.matvecBatchK(self.gctx, self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
             } else {
-                self.exec.matvecBatchK(self.graph, self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
-                self.exec.matvecBatchK(self.graph, self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
-                self.exec.matvecBatchK(self.graph, self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
-                self.exec.matvecBatchK(self.graph, self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gctx, self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
                 // 为推测解码回滚保留 PRE-prelude 的投影。必须是原始行：
                 // 回滚只对 `rows` 个 token 重跑 prelude，而 prelude 会推进卷积
                 // 历史并就地重写 `qkv`/`ab`——这两样都无法从 POST-prelude 的
@@ -1923,12 +1936,12 @@ pub const Engine = struct {
                     if (gi.qkv.len >= k * conv_dim and gi.gamma.len >= k * 2 * nv) {
                         // 长度同样不能是主机实参（见 tap 那段）：图活跃时按
                         // `ctl.rows` 拷，直通时用 `k`。
-                        if (self.graph.ptr != null) {
-                            self.exec.copyRowsCtl(self.graph, gi.qkv, self.qkvK, conv_dim);
-                            self.exec.copyRowsCtl(self.graph, gi.gamma, self.abK, 2 * nv);
+                        if (self.gctx.ptr != null) {
+                            self.exec.copyRowsCtl(self.gctx, gi.qkv, self.qkvK, conv_dim);
+                            self.exec.copyRowsCtl(self.gctx, gi.gamma, self.abK, 2 * nv);
                         } else {
-                            self.exec.copyRange(self.graph, gi.qkv.span(0, k * conv_dim), self.qkvK.span(0, k * conv_dim));
-                            self.exec.copyRange(self.graph, gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
+                            self.exec.copyRange(self.gctx, gi.qkv.span(0, k * conv_dim), self.qkvK.span(0, k * conv_dim));
+                            self.exec.copyRange(self.gctx, gi.gamma.span(0, k * 2 * nv), self.abK.span(0, k * 2 * nv));
                         }
                     }
                 }
@@ -1944,7 +1957,7 @@ pub const Engine = struct {
                 // Chunk-wide gated RMSNorm + silu gate, hoisted out of the
                 // token loop above; `ssm_out` is the first reader of `goutK`.
                 self.forwardGdnGated(lw, k);
-                self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
+                self.exec.matvecBatchK(self.gctx, self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
             }
 
             // ---- residual add: the `k` rows are CONSECUTIVE (`xK`/`x2K` are
@@ -1952,20 +1965,20 @@ pub const Engine = struct {
             // per-token loop (one launch per token per layer: 3353 launches for
             // a 525-token prefill, which PROFILE showed at 2.7%).  `addResid` is
             // elementwise with no per-row state, so the merge is exact.
-            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.addResid(self.gctx, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
             // batched down, residual ----
-            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
-            self.exec.matvecBatchK(self.graph, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
-            self.exec.matvecBatchK(self.graph, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
+            self.exec.rmsnormRows(self.gctx, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
+            self.exec.matvecBatchK(self.gctx, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.gctx, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             // SwiGLU over the whole chunk: `gate[i] = silu(gate[i]) * up[i]` is
             // elementwise and each token's `n_ff` run is independent, so one
             // launch over `k * n_ff` is the same arithmetic as `k` launches of
             // an `n_ff`-long one.
-            self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
-            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
-            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.swiglu(self.gctx, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
+            self.exec.matvecBatchK(self.gctx, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
+            self.exec.addResid(self.gctx, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- speculative-decoding tap: copy this layer's OUTPUT hidden
             // state into row `ti` of `tap_hidden`.  Placed after the second
@@ -1987,14 +2000,14 @@ pub const Engine = struct {
                         // 由 ctl.rows 决定。
                         // 图活跃时行数取控制块（`copyRowsCtl`），直通时用 `k`
                         // —— 直通图的 ctl 是默认值，`rows` 恒为 1。
-                        if (self.graph.ptr != null) {
-                            self.exec.copyRowsCtl(self.graph,
+                        if (self.gctx.ptr != null) {
+                            self.exec.copyRowsCtl(self.gctx,
                                 self.tap_hidden.span(ti * self.nbatch * hidden, self.nbatch * hidden),
                                 self.xK.span(0, self.nbatch * hidden),
                                 hidden,
                             );
                         } else {
-                            self.exec.copyRange(self.graph,
+                            self.exec.copyRange(self.gctx,
                                 self.tap_hidden.span(ti * self.nbatch * hidden, k * hidden),
                                 self.xK.span(0, k * hidden),
                             );
@@ -2007,15 +2020,15 @@ pub const Engine = struct {
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
         // path, so the first sampled logits are bit-identical) ----
-        self.exec.rmsnorm(self.graph, self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.gctx, self.logits, ow, self.x1),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, self.x1),
             }
         }
         return self.logits;
@@ -2064,14 +2077,14 @@ pub const Engine = struct {
             // 回到直通句柄并带上本块末行的 ctl：调用方（`generateSpec` 的
             // `draft_fn`）随后还会发直通 op，而它们读 `ctl.tok[0]`。留空结构会
             // 把行号清零，嵌入变成 token 0（实测：MTP 接受率 56.5% → 41.7%）。
-            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0 + @as(u32, @intCast(k - 1)), tokens[k - 1], 1) };
+            self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0 + @as(u32, @intCast(k - 1)), tokens[k - 1], 1) };
         }
         if (verify_graphs) {
             // 先发布再构建：直通路径上构建期就要读控制块。
             self.exec.publishCtl(slot, ctl);
             if (!recorded) {
                 self.exec.beginRecord(slot);
-                self.graph = .{ .kind = .verify, .slot = slot, .ctl = ctl, .phase = .record };
+                self.gctx = .{ .kind = .verify, .slot = slot, .ctl = ctl, .phase = .record };
                 self.buildVerify(tokens, pos0, k);
                 self.exec.endRecord(slot);
             }
@@ -2081,7 +2094,7 @@ pub const Engine = struct {
             // 主机上把这一块再算一遍（实测：MTP 只出 3 个 token）。
             return self.logitsK.span(0, k * c.vocab);
         }
-        self.graph = .{ .kind = .verify, .slot = slot, .ctl = ctl };
+        self.gctx = .{ .kind = .verify, .slot = slot, .ctl = ctl };
         self.buildVerify(tokens, pos0, k);
         return self.logitsK.span(0, k * c.vocab);
     }
@@ -2095,16 +2108,16 @@ pub const Engine = struct {
         defer self.in_spec_verify = false;
         _ = self.forwardChunk(tokens, pos0);
         // Normalise every row and project them all through lm_head.
-        self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
         const w = self.output_weight orelse self.token_embd;
-        self.exec.matvecBatchK(self.graph, self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
+        self.exec.matvecBatchK(self.gctx, self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
     }
 
     /// Greedy argmax over the last logits.  Forwards to the backend so the logits
     /// never have to be readable from the host (doc comment on `Exec.argmax`);
     /// the engine no longer carries its own copy of this loop.
     pub fn argmax(self: *Engine) u32 {
-        return self.exec.argmax(self.graph, self.logits);
+        return self.exec.argmax(self.gctx, self.logits);
     }
 
     // ------------- GDN block (SPEC A, GDN_IMPL §2) -------------
@@ -2120,16 +2133,16 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
         const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
-        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // in_proj_qkv [hidden, conv_dim]：[Q|K|V] 连续排布（SPEC A1）；
         // Q、K 宽 nk*kd，V 宽 nv*kd
         const qkv = self.qkv.span(0, conv_dim);
-        self.exec.matvec(self.graph, qkv, lw.attn_qkv.?, self.x1);
+        self.exec.matvec(self.gctx, qkv, lw.attn_qkv.?, self.x1);
 
         // z 投影（attn_gate [hidden, value_dim]）
         const z = self.z.span(0, value_dim);
-        self.exec.matvec(self.graph, z, lw.attn_gate.?, self.x1);
+        self.exec.matvec(self.gctx, z, lw.attn_gate.?, self.x1);
 
         // a/b 投影：ssm_alpha 即 a（衰减），ssm_beta 即 b（beta 的输入），每个
         // **value head** 一个标量（C 参照里 gdn_a/gdn_b/A/dt 都按 gdn_vheads
@@ -2146,13 +2159,13 @@ pub const Engine = struct {
         // 带宽只有 60–85 GB/s —— 那是发射下限，不是带宽。这样的发射每 token 有
         // 96 次（约 0.3 ms，1.6%），减半到 48 次。
         const ab = self.ab.span(0, 2 * nv);
-        self.exec.matvecPair(self.graph, ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
+        self.exec.matvecPair(self.gctx, ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
 
         // 因果 conv1d，左侧补 K-1，之后接 silu（SPEC A2，C 参照 520-556）
         // convStep 对所有通道处理历史 + silu；beta/gamma 在其后基于**原始** a/b
         // 投影计算（不经过 conv）。
         const st = &self.gdn[li];
-        self.exec.convStep(self.graph, st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
+        self.exec.convStep(self.gctx, st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
 
         // beta = sigmoid(b)；g = A * softplus(a + dt_bias)，其中 A = ssm_a
         // （GGUF 的 ssm_a 已经是 -exp(A_log)，即负值，已核对）。
@@ -2167,7 +2180,7 @@ pub const Engine = struct {
         // 缓存；见 `VTable.gdnStepRows`。
         const beta = self.ab.span(nv, nv); // b half, overwritten with sigmoid(b)
         const gamma = self.gamma_scratch.span(0, nv);
-        self.exec.gdnGamma(self.graph, ab.span(0, nv), beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
+        self.exec.gdnGamma(self.gctx, ab.span(0, nv), beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
@@ -2200,7 +2213,7 @@ pub const Engine = struct {
             // 算术、同样的顺序 —— CPU
             // backend's `l2normQkScale` literally calls those three, and the
             // device kernel reproduces them per row.  See `backend.Exec`.
-            self.exec.l2normQkScale(self.graph, qkv, nk, kd, kq_dim, qscale);
+            self.exec.l2normQkScale(self.gctx, qkv, nk, kd, kq_dim, qscale);
         }
         // Fallback for a layout the batched passes above/below cannot express
         // (`nv` not a multiple of `nk`): the per-head form this function has
@@ -2211,10 +2224,10 @@ pub const Engine = struct {
                 const kh = h % nk;
                 const q_h = qkv.span(kh * kd, kd);
                 const k_h = qkv.span(kq_dim + kh * kd, kd);
-                self.exec.l2norm(self.graph, q_h);
-                self.exec.l2norm(self.graph, k_h);
+                self.exec.l2norm(self.gctx, q_h);
+                self.exec.l2norm(self.gctx, k_h);
                 const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-                self.exec.scaleVec(self.graph, q_h, qscale);
+                self.exec.scaleVec(self.gctx, q_h, qscale);
             }
         }
 
@@ -2232,7 +2245,7 @@ pub const Engine = struct {
         // now lives in the slot -- see `VTable.gdnStepRows`.  `km`/`delta` are
         // per-head slices of `nv*vd` scratch: with one shared `vd` buffer the
         // 48 blocks would race silently.
-        self.exec.gdnStepRows(self.graph, 
+        self.exec.gdnStepRows(self.gctx, 
             state,
             qkv.span(kq_dim, kq_dim),
             qkv.span(2 * kq_dim, value_dim),
@@ -2252,15 +2265,15 @@ pub const Engine = struct {
         //
         // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
         // shared `ssm_norm` row, so this is the three-condition batch.
-        self.exec.rmsnormRows(self.graph, gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
         // `mulSilu` is elementwise with no reduction and no per-row state, so the
         // `nv` heads collapse into this one call over the same `nv * vd` run --
         // unlike the norm merges above, there is no repeat-count subtlety here.
-        self.exec.mulSilu(self.graph, gout.span(0, value_dim), z.span(0, value_dim));
+        self.exec.mulSilu(self.gctx, gout.span(0, value_dim), z.span(0, value_dim));
 
         // out projection [2048 -> 1024]
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ssm_out.?, gout);
-        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), lw.ssm_out.?, gout);
+        self.exec.addResid(self.gctx, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     /// Whether the GDN per-head loop visits the q/k runs as `nk` contiguous
@@ -2348,7 +2361,7 @@ pub const Engine = struct {
 
         // [q|gate] split for the whole chunk in ONE launch (was `k` launches of
         // 24 heads each: 940 per 525-token prefill, 1.2% of device time).
-        self.exec.deinterleaveQGStrided(self.graph, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+        self.exec.deinterleaveQGStrided(self.gctx, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
             self.qkvK.span(0, k * 2 * q_dim), heads, hd, k);
 
         // q's RoPE, chunk-wide.  It CANNOT move up to `forwardChunk` with k's:
@@ -2383,19 +2396,19 @@ pub const Engine = struct {
         // `kvAppend`'s explicit `slot`/`rows` serve the same purpose: the
         // DECODE graph retargets a captured KV append row by row
         // (`g_op_seen.kv_append`), and prefill does not go through the graph.
-        self.exec.rmsnormRows(self.graph, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
+        self.exec.rmsnormRows(self.gctx, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
             lw.attn_q_norm, k * heads, c.rms_eps);
-        self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
+        self.exec.rmsnormRows(self.gctx, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
             lw.attn_k_norm, k * kv_heads, c.rms_eps);
-        self.exec.rope64Rows(self.graph, self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
-        self.exec.rope64Rows(self.graph, self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
-        self.exec.kvAppend(self.graph, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
-        self.exec.kvAppend(self.graph, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
+        self.exec.rope64Rows(self.gctx, self.qK.span(0, k * q_dim), @intCast(slot0), self.cfg.rope_freq_base, k, heads, hd);
+        self.exec.rope64Rows(self.gctx, self.kK.span(0, k * kv_dim), @intCast(slot0), self.cfg.rope_freq_base, k, kv_heads, hd);
+        self.exec.kvAppend(self.gctx, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
+        self.exec.kvAppend(self.gctx, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
         cache.len += @intCast(k);
 
         // Pass 2: scores -> softmax -> PV -> gate for all k rows, one launch.
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        self.exec.attnChunk(self.graph, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+        self.exec.attnChunk(self.gctx, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
             cache.k, cache.v,
             self.attn.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
             slot0, k, heads, gqa, hd, kv_dim, scale);
@@ -2432,7 +2445,7 @@ pub const Engine = struct {
         // sized `k * nv` by `forwardChunk`'s caller.  `st.conv` stays single-token
         // (the history is shared across the chunk, by design).
         const gamma = self.gdn_prefill_gamma.span(0, k * nv);
-        self.exec.gdnPrefillCore(self.graph, 
+        self.exec.gdnPrefillCore(self.gctx, 
             self.qkvK.span(0, k * conv_dim),
             st.conv,
             lw.ssm_conv1d,
@@ -2507,7 +2520,7 @@ pub const Engine = struct {
         // 其它情形（prefill、普通 decode）传空 snap，与改动前完全一致。
         const want_snap = self.in_spec_verify and self.gdn[li].state_all.len >= (spec_rs_seq + 1) * nv * kd * vd;
         if (want_snap) {
-            self.exec.gdnStepRowsSnap(self.graph, 
+            self.exec.gdnStepRowsSnap(self.gctx, 
                 self.gdn[li].state,
                 self.qkvK.span(kq_dim, k * conv_dim - kq_dim),
                 self.qkvK.span(2 * kq_dim, k * conv_dim - 2 * kq_dim),
@@ -2529,7 +2542,7 @@ pub const Engine = struct {
             );
             return;
         }
-        self.exec.gdnStepRowsChunk(self.graph, 
+        self.exec.gdnStepRowsChunk(self.gctx, 
             self.gdn[li].state,
             self.qkvK.span(kq_dim, k * conv_dim - kq_dim),
             self.qkvK.span(2 * kq_dim, k * conv_dim - 2 * kq_dim),
@@ -2572,8 +2585,8 @@ pub const Engine = struct {
         // The `nv` norm rows of a token are consecutive (`gout` is `nv * vd`
         // wide) with one shared `ssm_norm` row, so `k * nv` rows is the same
         // three-condition batch case, `k` tokens deep.
-        self.exec.rmsnormRows(self.graph, self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
-        self.exec.mulSilu(self.graph, self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
+        self.exec.rmsnormRows(self.gctx, self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
+        self.exec.mulSilu(self.gctx, self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
     }
 
     fn forwardFull(self: *Engine, lw: *LayerWeights, li: usize, pos: u32) void {
@@ -2586,20 +2599,20 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd; // 512
         const gqa: usize = heads / kv_heads; // 4
 
-        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // q_proj [1024, 4096]：先 view(8, 512) 再切块 -> 每头的 [q|gate]
         const qg = self.qkv.span(0, 2 * q_dim);
-        self.exec.matvec(self.graph, qg, lw.attn_q.?, self.x1);
+        self.exec.matvec(self.gctx, qg, lw.attn_q.?, self.x1);
         const q = self.q.span(0, q_dim);
         const gate = self.z.span(0, q_dim);
         // 批量拆分（见 `forwardFullCore`）：GGUF 的 `attn_q` 行是
         // `[h][q_head | gate_head]`，而 `q`/`gate` 都按 head 消费，所以这是一次
         // 任何单个 memcpy 都表达不了的布局变换 —— 这个 slot 一次发射就做完，而不是
         // `2*heads` 次。
-        self.exec.deinterleaveQG(self.graph, q, gate, qg, heads, hd);
-        self.exec.matvec(self.graph, self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
-        self.exec.matvec(self.graph, self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
+        self.exec.deinterleaveQG(self.gctx, q, gate, qg, heads, hd);
+        self.exec.matvec(self.gctx, self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
+        self.exec.matvec(self.gctx, self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 
         // q_norm/k_norm 在 RoPE **之前**（B12）；GGUF 权重已预折叠 (1+w)。
         //
@@ -2609,8 +2622,8 @@ pub const Engine = struct {
         // （`vRmsnormRows`），所以不可能改变任何一个数值。在 CUDA 上
         // `rmsnormRows` 是 capture 安全的（不受图门控），所以 decode 图在这里
         // 只看到一个节点，而不是 `heads` 个。
-        self.exec.rmsnormRows(self.graph, q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
-        self.exec.rmsnormRows(self.graph, self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
         // 对每个 q/k head 的前 64 个分量做 RoPE —— 每个张量**一次**调用，而不是
         // 每 head 一次。`rope64Rows(x, 1, heads, hd)` 正好就是它替代的逐 head
         // 循环（`k_rope64_rows` 让第 r 行在 `pos+r` 处旋转，而这里 rows == 1），
@@ -2622,8 +2635,8 @@ pub const Engine = struct {
         // 层 40 + 8 = 48 次 rope 发射、每 token 768 次，而 `k_rope64_dpos` 在 20
         // 个 token 里花了 12.84 ms / 6188 次调用 —— 每次调用 2.07 us 只为算 64 个
         // cos+sin，占全部非 matvec kernel 时间的 27.9%。
-        self.exec.rope64Rows(self.graph, q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
-        self.exec.rope64Rows(self.graph, self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
+        self.exec.rope64Rows(self.gctx, q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
+        self.exec.rope64Rows(self.gctx, self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
 
         // KV cache：把这个 token 的行量化进 cache（后端自己按它的布局定步长；
         // `slot` 是逐 token 的行号，decode 图不再重定向节点，而是让 kernel 从
@@ -2631,21 +2644,21 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.kvAppend(self.graph, cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
-        self.exec.kvAppend(self.graph, cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const gout = self.gdn_out.span(0, q_dim);
         // scores -> softmax -> PV -> sigmoid gate in one backend call
-        self.exec.attnDecode(self.graph, q.span(0, q_dim), gate.span(0, q_dim),
+        self.exec.attnDecode(self.gctx, q.span(0, q_dim), gate.span(0, q_dim),
             cache.k, cache.v,
             self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
         // o_proj [2048 -> 1024]
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.attn_output.?, gout);
-        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), lw.attn_output.?, gout);
+        self.exec.addResid(self.gctx, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     // ------------- nextn / MTP drafter (SPECULATIVE DECODING, stage 1) ------
@@ -2725,14 +2738,14 @@ pub const Engine = struct {
         const ctl = GraphCtlBuilder.decode(&c, next_token, draft_pos, &self.sampler);
         const recorded = self.exec.hasGraph(graph_slot_nextn);
         defer {
-            // 回到直通句柄，而不是某个"外层"图：调用方进来时 `self.graph`
+            // 回到直通句柄，而不是某个"外层"图：调用方进来时 `self.gctx`
             // 只可能是直通（见上面的串行约定）。
-            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(draft_pos, next_token, 1) };
+            self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(draft_pos, next_token, 1) };
         }
         self.exec.publishCtl(graph_slot_nextn, ctl);
         if (!recorded) {
             self.exec.beginRecord(graph_slot_nextn);
-            self.graph = .{ .kind = .nextn, .slot = graph_slot_nextn, .ctl = ctl, .phase = .record };
+            self.gctx = .{ .kind = .nextn, .slot = graph_slot_nextn, .ctl = ctl, .phase = .record };
             self.buildDraft(nn, hidden_buf, next_token, draft_pos, out_hidden);
             self.exec.endRecord(graph_slot_nextn);
         }
@@ -2758,13 +2771,13 @@ pub const Engine = struct {
         // and `pre_fc_norm_embedding` / `pre_fc_norm_hidden` are two distinct
         // modules in the reference.
         self.embedTo(next_token, self.x1.span(0, hidden));
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x1.span(0, hidden), nn.enorm, c.rms_eps);
-        self.exec.copyRange(self.graph, nn.input.span(0, hidden), self.x1.span(0, hidden));
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), hidden_buf.span(0, hidden), nn.hnorm, c.rms_eps);
-        self.exec.copyRange(self.graph, nn.input.span(hidden, hidden), self.x1.span(0, hidden));
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), self.x1.span(0, hidden), nn.enorm, c.rms_eps);
+        self.exec.copyRange(self.gctx, nn.input.span(0, hidden), self.x1.span(0, hidden));
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), hidden_buf.span(0, hidden), nn.hnorm, c.rms_eps);
+        self.exec.copyRange(self.gctx, nn.input.span(hidden, hidden), self.x1.span(0, hidden));
 
         // The projected value becomes the residual stream for the block.
-        self.exec.matvec(self.graph, self.x.span(0, hidden), nn.eh_proj, nn.input.span(0, 2 * hidden));
+        self.exec.matvec(self.gctx, self.x.span(0, hidden), nn.eh_proj, nn.input.span(0, 2 * hidden));
 
         // Full-attention layer + MLP, over the drafter's OWN KV cache.
         //
@@ -2779,19 +2792,19 @@ pub const Engine = struct {
         // model's lm_head on that normed value.  `output_norm` belongs to the
         // main stack and is already applied once for the target logits, so the
         // drafter's equivalent is `shared_head_norm` alone.
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), nn.shared_head_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), self.x.span(0, hidden), nn.shared_head_norm, c.rms_eps);
         // Hand the normed output back for the next chained step BEFORE it gets
         // overwritten by anything else in this function (nothing does, but the
         // copy makes the contract explicit and costs one `hidden` memcpy).
-        if (out_hidden) |oh| self.exec.copyRange(self.graph, oh.span(0, hidden), self.x1.span(0, hidden));
+        if (out_hidden) |oh| self.exec.copyRange(self.gctx, oh.span(0, hidden), self.x1.span(0, hidden));
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1.span(0, hidden)),
+                .quant, .f32 => self.exec.matvec(self.gctx, self.logits, ow, self.x1.span(0, hidden)),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1.span(0, hidden)),
-                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1.span(0, hidden)),
+                .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, self.x1.span(0, hidden)),
+                .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, self.x1.span(0, hidden)),
             }
         }
     }
@@ -2801,12 +2814,12 @@ pub const Engine = struct {
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        self.exec.rmsnorm(self.graph, self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        self.exec.matvec(self.graph, self.mlp_h, lw.ffn_gate, self.x1);
-        self.exec.matvec(self.graph, self.mlp_h1, lw.ffn_up, self.x1);
-        self.exec.swiglu(self.graph, self.mlp_h, self.mlp_h1);
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h);
-        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.rmsnorm(self.gctx, self.x1, self.x, lw.post_attention_norm, c.rms_eps);
+        self.exec.matvec(self.gctx, self.mlp_h, lw.ffn_gate, self.x1);
+        self.exec.matvec(self.gctx, self.mlp_h1, lw.ffn_up, self.x1);
+        self.exec.swiglu(self.gctx, self.mlp_h, self.mlp_h1);
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h);
+        self.exec.addResid(self.gctx, self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     // -----------------------------------------------------------------
@@ -2816,8 +2829,8 @@ pub const Engine = struct {
     pub fn reset(self: *Engine) void {
         for (self.kv) |*cache| cache.len = 0;
         for (self.gdn) |*st| {
-            if (st.conv.len > 0) self.exec.zeroBuf(self.graph, st.conv);
-            if (st.state.len > 0) self.exec.zeroBuf(self.graph, st.state);
+            if (st.conv.len > 0) self.exec.zeroBuf(self.gctx, st.conv);
+            if (st.state.len > 0) self.exec.zeroBuf(self.gctx, st.state);
             st.conv_len = 0;
         }
     }
@@ -2918,8 +2931,8 @@ pub const Engine = struct {
                 // backend's own address space (D2D on CUDA).  It used to be
                 // `copyOut` into a HOST slice, which is what made every
                 // speculative round push ~230 MB over PCIe.
-                if (g.conv.len > 0) self.exec.copyRange(self.graph, s.conv, g.conv);
-                if (g.state.len > 0) self.exec.copyRange(self.graph, s.state, g.state);
+                if (g.conv.len > 0) self.exec.copyRange(self.gctx, s.conv, g.conv);
+                if (g.state.len > 0) self.exec.copyRange(self.gctx, s.state, g.state);
                 s.conv_len = g.conv_len;
             }
         }
@@ -2944,13 +2957,13 @@ pub const Engine = struct {
                     const g = &self.gdn[i];
                     // 设备到设备，与 `specSnapshotTake` 对称。快照就是放在
                     // 后端内存里，所以这里永远不跨 PCIe。
-                    if (g.conv.len > 0) self.exec.copyRange(self.graph, g.conv, s.conv);
-                    if (g.state.len > 0) self.exec.copyRange(self.graph, g.state, s.state);
+                    if (g.conv.len > 0) self.exec.copyRange(self.gctx, g.conv, s.conv);
+                    if (g.state.len > 0) self.exec.copyRange(self.gctx, g.state, s.state);
                     g.conv_len = s.conv_len;
                 }
             }
             for (tokens, 0..) |t, r| {
-                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
+                self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
             }
@@ -2971,14 +2984,14 @@ pub const Engine = struct {
             }
             self.specRestoreSnapshot();
             self.specRollbackFast(rows);
-            self.exec.copyOut(self.graph, self.spec_dbg_a, self.gdn[0].state);
+            self.exec.copyOut(self.gctx, self.spec_dbg_a, self.gdn[0].state);
             self.specRestoreSnapshot();
             for (tokens, 0..) |t, r| {
-                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
+                self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos + @as(u32, @intCast(r)), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 _ = self.forwardLogits(t, pos + @as(u32, @intCast(r)));
             }
-            self.exec.copyOut(self.graph, self.spec_dbg_b, self.gdn[0].state);
+            self.exec.copyOut(self.gctx, self.spec_dbg_b, self.gdn[0].state);
             var nd: usize = 0;
             var w: f32 = 0;
             for (self.spec_dbg_a, self.spec_dbg_b) |x, y| {
@@ -3015,8 +3028,8 @@ pub const Engine = struct {
             if (i < self.kv.len) self.kv[i].len = sn.kv_len;
             if (i < self.gdn.len) {
                 const g = &self.gdn[i];
-                if (g.conv.len > 0) self.exec.copyRange(self.graph, g.conv, sn.conv);
-                if (g.state.len > 0) self.exec.copyRange(self.graph, g.state, sn.state);
+                if (g.conv.len > 0) self.exec.copyRange(self.gctx, g.conv, sn.conv);
+                if (g.state.len > 0) self.exec.copyRange(self.gctx, g.state, sn.state);
                 g.conv_len = sn.conv_len;
             }
         }
@@ -3040,7 +3053,7 @@ pub const Engine = struct {
             if (g.state.len == 0) continue;
             var used_snap = false;
             // 卷积历史必须从 verify 前恢复（它无法反推，见上面的注释）。
-            if (g.conv.len > 0) self.exec.copyRange(self.graph, g.conv, sn.conv);
+            if (g.conv.len > 0) self.exec.copyRange(self.gctx, g.conv, sn.conv);
             g.conv_len = sn.conv_len;
             // state：verify 的内核在**每行跑完后**把整份状态写进快照槽 `t`
             // （0 基，见 `q35_gdn_step_rows_chunk_kernel` 的 `slot t` 注释与
@@ -3059,12 +3072,12 @@ pub const Engine = struct {
                 g.rs_idx = @intCast(rows);
                 const src = g.state_all.span((snap_slab_base + rows - 1) * nv * kd * vd, nv * kd * vd);
                 g.state = g.state_all.span(0, nv * kd * vd);
-                self.exec.copyRange(self.graph, g.state, src);
+                self.exec.copyRange(self.gctx, g.state, src);
                 used_snap = true;
             } else {
                 // 行数超出快照容量（不该发生，verify 块 <= spec_verify_rows）：
                 // 退回"恢复快照 + 重跑递推"，正确但慢。
-                self.exec.copyRange(self.graph, g.state, sn.state);
+                self.exec.copyRange(self.gctx, g.state, sn.state);
                 used_snap = false;
             }
             if (i >= self.gdn_in.len) continue;
@@ -3075,9 +3088,9 @@ pub const Engine = struct {
             // 1. 用**恢复后的**卷积历史，对 accepted 行重跑 prelude。这一步让
             //    conv 前进 `rows` 步（而不是 verify 的 `k` 步），并就地重算
             //    gamma/beta。
-            self.exec.copyRange(self.graph, self.qkvK.span(0, rows * conv_dim), gi.qkv.span(0, rows * conv_dim));
-            self.exec.copyRange(self.graph, self.abK.span(0, rows * 2 * nv), gi.gamma.span(0, rows * 2 * nv));
-            self.exec.gdnPrefillCore(self.graph, 
+            self.exec.copyRange(self.gctx, self.qkvK.span(0, rows * conv_dim), gi.qkv.span(0, rows * conv_dim));
+            self.exec.copyRange(self.gctx, self.abK.span(0, rows * 2 * nv), gi.gamma.span(0, rows * 2 * nv));
+            self.exec.gdnPrefillCore(self.gctx, 
                 self.qkvK.span(0, rows * conv_dim),
                 g.conv,
                 lw.ssm_conv1d,
@@ -3101,7 +3114,7 @@ pub const Engine = struct {
             // 2. 状态递推只在快照分支没命中时才需要：那时 `g.state` 就是
             //    verify 前的快照，要重新推进 `rows` 行。用了快照就不做。
             if (used_snap) continue;
-            self.exec.gdnStepRowsChunk(self.graph, 
+            self.exec.gdnStepRowsChunk(self.gctx, 
                 g.state,
                 self.qkvK.span(kq_dim, rows * conv_dim - kq_dim),
                 self.qkvK.span(2 * kq_dim, rows * conv_dim - 2 * kq_dim),
@@ -3162,12 +3175,12 @@ pub const Engine = struct {
         // `x1` is engine scratch exactly `hidden` wide and is rewritten by every
         // forward anyway, so borrowing it here needs no new allocation.
         const row = self.x1;
-        self.exec.copyFromHost(self.graph, row, x[0..hidden]);
+        self.exec.copyFromHost(self.gctx, row, x[0..hidden]);
         switch (self.output_weight orelse self.token_embd) {
-            .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, row),
-            .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, row),
+            .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, row),
         }
-        self.exec.copyOut(self.graph, out[0..self.cfg.vocab], self.logits);
+        self.exec.copyOut(self.gctx, out[0..self.cfg.vocab], self.logits);
     }
 
     pub fn lmHead(self: *const Engine) LinearW {
@@ -3222,7 +3235,7 @@ pub const Engine = struct {
     /// On CUDA this is a device reduction that returns a 4-byte index, so the
     /// MTP drafter scores its proposals without a vocab-sized D2H per token.
     pub fn argmaxLogits(self: *Engine) u32 {
-        return self.exec.argmax(self.graph, self.logits);
+        return self.exec.argmax(self.gctx, self.logits);
     }
 
     /// Argmax of the current logits plus the top-1 softmax probability.
@@ -3232,7 +3245,7 @@ pub const Engine = struct {
     /// cheaply; every other backend reports 1.0, which disables the stop rather
     /// than changing behaviour.
     pub fn argmaxConfLogits(self: *Engine, p: *f32) u32 {
-        return self.exec.argmaxConf(self.graph, self.logits, p);
+        return self.exec.argmaxConf(self.gctx, self.logits, p);
     }
 
     /// Copy a host f32 row into `dst` (debug/verification helper).  See
@@ -3250,15 +3263,15 @@ pub const Engine = struct {
     /// the final layer's output and not some other layer's.
     pub fn logitsFromHidden(self: *Engine, h: backend.Buf) void {
         const c = self.cfg;
-        self.exec.rmsnorm(self.graph, self.x1, h, self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1, h, self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.graph, self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(self.gctx, self.logits, ow, self.x1),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, self.x1),
-                .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, self.x1),
+                .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, self.x1),
             }
         }
     }
@@ -3271,7 +3284,7 @@ pub const Engine = struct {
     pub fn copyLogitsToHost(self: *Engine, dst: []f32) !void {
         if (self.backend_kind != .cpu) return error.HostOnly;
         std.debug.assert(dst.len >= self.cfg.vocab);
-        self.exec.copyOut(self.graph, dst[0..self.cfg.vocab], self.logits);
+        self.exec.copyOut(self.gctx, dst[0..self.cfg.vocab], self.logits);
     }
 
     /// Read-back accessor for tests: the tap plane of `layers[i]`.
@@ -3331,7 +3344,7 @@ pub const Engine = struct {
         for (0..self.tap_layers.len) |ti| {
             const src = self.tap_hidden.span(ti * self.nbatch * hidden, hidden);
             const dst = self.ring[ti * ctx * hidden + at * hidden ..][0..hidden];
-            self.exec.copyOut(self.graph, dst, src);
+            self.exec.copyOut(self.gctx, dst, src);
         }
         self.ring_next = (at + 1) % ctx;
         if (self.ring_filled < ctx) self.ring_filled += 1;
@@ -3374,7 +3387,7 @@ pub const Engine = struct {
             const at = (self.ring_next + r) % ctx;
             for (0..self.tap_layers.len) |ti| {
                 const src = self.tap_hidden.span(ti * self.nbatch * hidden + (skip + r) * hidden, hidden);
-                self.exec.copyOut(self.graph, self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
+                self.exec.copyOut(self.gctx, self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
             }
         }
         self.ring_next = (self.ring_next + take) % ctx;
@@ -3408,7 +3421,7 @@ pub const Engine = struct {
         // `copyRange` decides the direction from the source alone (a device
         // source + a host destination is a device-to-device move as far as it
         // can tell, which writes through a host address).
-        self.exec.copyOut(self.graph, dst[0 .. rows * hidden], self.specTapPlane(i, rows));
+        self.exec.copyOut(self.gctx, dst[0 .. rows * hidden], self.specTapPlane(i, rows));
     }
 
     /// Tap plane `i`, first `rows` rows, each passed through `output_norm` --
@@ -3434,7 +3447,7 @@ pub const Engine = struct {
         @memcpy(src.slice()[0..c.hidden], h[0..c.hidden]);
         const lw = self.lmHead();
         const tmp = self.exec.allocBuf(c.vocab) catch unreachable;
-        self.exec.matvec(self.graph, tmp, lw, src);
+        self.exec.matvec(self.gctx, tmp, lw, src);
         @memcpy(out[0..c.vocab], tmp.slice()[0..c.vocab]);
     }
 
@@ -3464,7 +3477,7 @@ pub const Engine = struct {
         // Row `row` of plane `i`: the plane is `nbatch` rows, so the offset is
         // `row * hidden` inside it.
         const src = self.specTapPlane(i, self.nbatch).span(row * hidden, hidden);
-        self.exec.rmsnorm(self.graph, dst.span(0, hidden), src, self.output_norm, self.cfg.rms_eps);
+        self.exec.rmsnorm(self.gctx, dst.span(0, hidden), src, self.output_norm, self.cfg.rms_eps);
     }
 
     pub const GenResult = struct {
@@ -3550,7 +3563,7 @@ pub const Engine = struct {
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| {
-                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
+                self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 last_logits = self.forwardLogits(t, @intCast(i));
             }
@@ -3570,7 +3583,7 @@ pub const Engine = struct {
                 // 不开 span、也不选行。
                 if (n == 1) {
                     last_logits = blk: {
-                        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
+                        self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
                         self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
                         break :blk self.forwardLogits(prompt[i], @intCast(i));
                     };
@@ -3600,8 +3613,8 @@ pub const Engine = struct {
         var hit_context_limit = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
-        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
-        var next: u32 = self.exec.sampledToken();
+        _ = self.exec.sample(self.gctx, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken(&self.sampler);
         // Two independent limits: how many tokens the caller asked for, and how
         // many slots the KV cache has left.  `pos` advances regardless.
         while (generated < n_predict) {
@@ -3726,7 +3739,7 @@ pub const Engine = struct {
         var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| {
-                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
+                self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), t, 1) };
                 self.embedTo(t, self.x.span(0, self.cfg.hidden));
                 last_logits = self.forwardLogits(t, @intCast(i));
             }
@@ -3741,7 +3754,7 @@ pub const Engine = struct {
                 // 不开 span、也不选行。
                 if (n == 1) {
                     last_logits = blk: {
-                        self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
+                        self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(@intCast(i), prompt[i], 1) };
                         self.embedTo(prompt[i], self.x.span(0, self.cfg.hidden));
                         break :blk self.forwardLogits(prompt[i], @intCast(i));
                     };
@@ -3776,8 +3789,8 @@ pub const Engine = struct {
         var gen_ns: i96 = 0;
         var hit_eos = false;
         var hit_context_limit = false;
-        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
-        var next: u32 = self.exec.sampledToken();
+        _ = self.exec.sample(self.gctx, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken(&self.sampler);
         var proposed_total: usize = 0;
         var accepted_total: usize = 0;
         var rounds: usize = 0;
@@ -3857,7 +3870,7 @@ pub const Engine = struct {
                     // round's launches (measured: 6.5 ms of host wait per 9 us
                     // kernel).
                     var vpicks: [spec_verify_rows]u32 = undefined;
-                    self.exec.argmaxRows(self.graph, vlogits, n_verify, vpicks[0..n_verify]);
+                    self.exec.argmaxRows(self.gctx, vlogits, n_verify, vpicks[0..n_verify]);
                     self.specRingPush();
                     var committed: usize = 0;
                     var pending: u32 = vpicks[0];

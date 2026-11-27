@@ -758,7 +758,10 @@ pub const Exec = struct {
         /// this slot performs the one 4-byte read after the graph has been
         /// closed.  A backend that samples eagerly (the CPU one) returns the
         /// value `sample` already produced, i.e. an identity.
-        sampledToken: *const fn (ctx: *anyopaque) u32,
+        /// `sp` 是本步的采样器。**显式传进来而不是让后端记着上一步是谁**：
+        /// 重放轮不会执行 `sample`（它已在图里），如果后端靠上一次调用留下的
+        /// 指针，正确的代价就是"碰巧同一个对象"，换一个 sampler 就静默读错。
+        sampledToken: *const fn (ctx: *anyopaque, sp: *sampler.Sampler) u32,
 
         /// Mark a phase boundary in the pool's timing counters (no-op for a
         /// device backend, which reports its own timings).
@@ -1053,8 +1056,8 @@ pub const Exec = struct {
         self.vtable.launch(self.ptr, slot);
     }
     /// See `VTable.sampledToken`: valid only after `graphEnd`.
-    pub fn sampledToken(self: Exec) u32 {
-        return self.vtable.sampledToken(self.ptr);
+    pub fn sampledToken(self: Exec, sp: *sampler.Sampler) u32 {
+        return self.vtable.sampledToken(self.ptr, sp);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);

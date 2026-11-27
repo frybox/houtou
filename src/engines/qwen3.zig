@@ -70,7 +70,9 @@ pub const Engine = struct {
     ///
     /// A field rather than a parameter threading: the layer helpers are 15 deep
     /// and all of them would otherwise take it just to pass it on.
-    graph: backend.Graph = .{},
+    ///
+    /// 它**不持有图**（qwen3 从不建图）；只是每次 op 调用传下去的上下文。
+    gctx: backend.Graph = .{},
     backend_kind: backend.Kind,
 
     token_embd: LinearW,
@@ -302,7 +304,7 @@ pub const Engine = struct {
             const host = try alloc.alloc(f32, q_dim);
             defer alloc.free(host);
             @memset(host, std.math.inf(f32));
-            exec.copyFromHost(e.graph, e.ones.span(0, q_dim), host);
+            exec.copyFromHost(e.gctx, e.ones.span(0, q_dim), host);
         }
 
         e.sample_scratch = try exec.allocBuf(cfg.vocab);
@@ -332,7 +334,7 @@ pub const Engine = struct {
             const host = try alloc.alloc(f32, K * q_dim);
             defer alloc.free(host);
             @memset(host, std.math.inf(f32));
-            exec.copyFromHost(e.graph, e.gateK.span(0, K * q_dim), host);
+            exec.copyFromHost(e.gctx, e.gateK.span(0, K * q_dim), host);
         }
         try exec.allocScratchK(widest, K);
 
@@ -420,7 +422,7 @@ pub const Engine = struct {
     pub fn specTapPlaneToHost(self: *Engine, dst: []f32, i: usize, rows: usize) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len >= rows * hidden);
-        self.exec.copyOut(self.graph, dst[0 .. rows * hidden], self.specTapPlane(i, rows));
+        self.exec.copyOut(self.gctx, dst[0 .. rows * hidden], self.specTapPlane(i, rows));
     }
 
     /// Sequence length the draft's own KV may use (it shares the target's
@@ -444,12 +446,12 @@ pub const Engine = struct {
         // `x1` is engine scratch at least `hidden` wide and is rewritten by
         // every forward anyway, so borrowing it needs no new allocation.
         const row = self.x1.span(0, hidden);
-        self.exec.copyFromHost(self.graph, row, x[0..hidden]);
+        self.exec.copyFromHost(self.gctx, row, x[0..hidden]);
         switch (self.output_weight orelse self.token_embd) {
-            .quant => |qrow| self.exec.matvec(self.graph, self.logits, .{ .quant = qrow }, row),
-            .f32 => |m| self.exec.matvec(self.graph, self.logits, .{ .f32 = m }, row),
+            .quant => |qrow| self.exec.matvec(self.gctx, self.logits, .{ .quant = qrow }, row),
+            .f32 => |m| self.exec.matvec(self.gctx, self.logits, .{ .f32 = m }, row),
         }
-        self.exec.copyOut(self.graph, out[0..self.cfg.vocab], self.logits);
+        self.exec.copyOut(self.gctx, out[0..self.cfg.vocab], self.logits);
     }
 
     // ---- spec snapshot / rollback ----
@@ -529,7 +531,7 @@ pub const Engine = struct {
         for (0..self.tap_layers.len) |ti| {
             const src = self.tap_hidden.span(ti * self.n_batch * hidden, hidden);
             const dst = self.ring[ti * ctx * hidden + at * hidden ..][0..hidden];
-            self.exec.copyOut(self.graph, dst, src);
+            self.exec.copyOut(self.gctx, dst, src);
         }
         self.ring_next = (at + 1) % ctx;
         if (self.ring_filled < ctx) self.ring_filled += 1;
@@ -548,7 +550,7 @@ pub const Engine = struct {
             const at = (self.ring_next + r) % ctx;
             for (0..self.tap_layers.len) |ti| {
                 const src = self.tap_hidden.span(ti * self.n_batch * hidden + (skip + r) * hidden, hidden);
-                self.exec.copyOut(self.graph, self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
+                self.exec.copyOut(self.gctx, self.ring[ti * ctx * hidden + at * hidden ..][0..hidden], src);
             }
         }
         self.ring_next = (self.ring_next + take) % ctx;
@@ -602,8 +604,8 @@ pub const Engine = struct {
         // One row expanded to f32 is the only place this engine needs values
         // rather than a dot product; the dequantizer choice is the backend's.
         switch (self.token_embd) {
-            .f32 => |m| self.exec.copyRange(self.graph, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
-            .quant => |qrow| self.exec.dequantRow(self.graph, dst, qrow, token),
+            .f32 => |m| self.exec.copyRange(self.gctx, dst, Buf.wrap(m[token * hidden ..][0..hidden])),
+            .quant => |qrow| self.exec.dequantRow(self.gctx, dst, qrow, token),
         }
     }
 
@@ -620,48 +622,48 @@ pub const Engine = struct {
         const gqa: usize = heads / kv_heads;
 
         // ---- attention ----
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), self.x.span(0, hidden), lw.attn_norm, c.rms_eps);
 
         // Qwen3's `attn_q` is a plain [q_dim, hidden] projection: there is no
         // per-head [q|gate] interleave and no output gate (unlike Qwen3.5).
         const q = self.q.span(0, q_dim);
-        self.exec.matvec(self.graph, q, lw.attn_q, self.x1.span(0, hidden));
-        self.exec.matvec(self.graph, self.k.span(0, kv_dim), lw.attn_k, self.x1.span(0, hidden));
-        self.exec.matvec(self.graph, self.v.span(0, kv_dim), lw.attn_v, self.x1.span(0, hidden));
+        self.exec.matvec(self.gctx, q, lw.attn_q, self.x1.span(0, hidden));
+        self.exec.matvec(self.gctx, self.k.span(0, kv_dim), lw.attn_k, self.x1.span(0, hidden));
+        self.exec.matvec(self.gctx, self.v.span(0, kv_dim), lw.attn_v, self.x1.span(0, hidden));
 
         // Per-head RMSNorm over `head_dim` (=128 here, not the 256-wide kind
         // Qwen3.5 uses), then RoPE over the FULL head.
-        self.exec.rmsnormRows(self.graph, q, q, lw.attn_q_norm, heads, c.rms_eps);
-        self.exec.rmsnormRows(self.graph, self.k.span(0, kv_dim), self.k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
-        self.exec.ropeRows(self.graph, q, pos, c.rope_freq_base, 1, heads, hd, c.rotary_dim);
-        self.exec.ropeRows(self.graph, self.k.span(0, kv_dim), pos, c.rope_freq_base, 1, kv_heads, hd, c.rotary_dim);
+        self.exec.rmsnormRows(self.gctx, q, q, lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, self.k.span(0, kv_dim), self.k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
+        self.exec.ropeRows(self.gctx, q, pos, c.rope_freq_base, 1, heads, hd, c.rotary_dim);
+        self.exec.ropeRows(self.gctx, self.k.span(0, kv_dim), pos, c.rope_freq_base, 1, kv_heads, hd, c.rotary_dim);
 
         const cache = &self.kv[li];
         std.debug.assert(cache.len < self.max_ctx);
         const slot: usize = cache.len;
-        self.exec.kvAppend(self.graph, cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
-        self.exec.kvAppend(self.graph, cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.k, self.k.span(0, kv_dim), slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.v, self.v.span(0, kv_dim), slot, kv_dim, 1);
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const gout = self.gout.span(0, q_dim);
-        self.exec.attnDecode(self.graph, 
+        self.exec.attnDecode(self.gctx, 
             q, self.ones.span(0, q_dim),
             cache.k, cache.v,
             self.att.span(0, slot + 1), gout,
             slot, heads, gqa, hd, kv_dim, scale,
         );
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.attn_output, gout);
-        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), lw.attn_output, gout);
+        self.exec.addResid(self.gctx, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // ---- MLP ----
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), self.x.span(0, hidden), lw.post_attention_norm, c.rms_eps);
         const n_ff: usize = c.n_ff;
-        self.exec.matvec(self.graph, self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
-        self.exec.matvec(self.graph, self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
-        self.exec.swiglu(self.graph, self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
-        self.exec.addResid(self.graph, self.x.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.matvec(self.gctx, self.mlp_h.span(0, n_ff), lw.ffn_gate, self.x1.span(0, hidden));
+        self.exec.matvec(self.gctx, self.mlp_h1.span(0, n_ff), lw.ffn_up, self.x1.span(0, hidden));
+        self.exec.swiglu(self.gctx, self.mlp_h.span(0, n_ff), self.mlp_h1.span(0, n_ff));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), lw.ffn_down, self.mlp_h.span(0, n_ff));
+        self.exec.addResid(self.gctx, self.x.span(0, hidden), self.x2.span(0, hidden));
 
         // Speculative-decoding tap: this layer's OUTPUT hidden state, written
         // after BOTH residual adds so it is the value the next layer's norm
@@ -670,7 +672,7 @@ pub const Engine = struct {
         if (self.tap_hidden.len != 0) {
             for (self.tap_layers, 0..) |tl, ti| {
                 if (tl == @as(u32, @intCast(li))) {
-                    self.exec.copyRange(self.graph, 
+                    self.exec.copyRange(self.gctx, 
                         self.tap_hidden.span(ti * self.n_batch * hidden, hidden),
                         self.x.span(0, hidden),
                     );
@@ -685,15 +687,15 @@ pub const Engine = struct {
         const hidden: usize = c.hidden;
         self.embedTo(token, self.x.span(0, hidden));
         // qwen3 不建图：直通句柄，所有 op 照常发射。
-        self.graph = .{ .kind = .decode, .slot = 0 };
+        self.gctx = .{ .kind = .decode, .slot = 0 };
         for (self.layers, 0..) |*lw, li| self.layerForward(lw, li, pos);
-        self.exec.rmsnorm(self.graph, self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.x1.span(0, hidden), self.x.span(0, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
-            self.exec.matvec(self.graph, self.logits, ow, self.x1.span(0, hidden));
+            self.exec.matvec(self.gctx, self.logits, ow, self.x1.span(0, hidden));
         } else {
-            self.exec.matvec(self.graph, self.logits, self.token_embd, self.x1.span(0, hidden));
+            self.exec.matvec(self.gctx, self.logits, self.token_embd, self.x1.span(0, hidden));
         }
-        self.graph = .{};
+        self.gctx = .{};
         return self.logits;
     }
 
@@ -770,58 +772,58 @@ pub const Engine = struct {
             // One norm for the whole chunk; `rmsnormRows` is `k` consecutive
             // single-row blocks and reduces each row in the same order, so it
             // is bit-identical to the per-token call.
-            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
+            self.exec.rmsnormRows(self.gctx, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             // Plain [q_dim, hidden] projection: no `[q|gate]` interleave, so
             // `qK` is filled directly (Qwen3.5 has to deinterleave first, which
             // is why its RoPE lives inside `forwardFullChunk`).
-            self.exec.matvecBatchK(self.graph, self.qK.span(0, k * q_dim), lw.attn_q, self.x1K, k);
-            self.exec.matvecBatchK(self.graph, self.kK.span(0, k * kv_dim), lw.attn_k, self.x1K, k);
-            self.exec.matvecBatchK(self.graph, self.vK.span(0, k * kv_dim), lw.attn_v, self.x1K, k);
+            self.exec.matvecBatchK(self.gctx, self.qK.span(0, k * q_dim), lw.attn_q, self.x1K, k);
+            self.exec.matvecBatchK(self.gctx, self.kK.span(0, k * kv_dim), lw.attn_k, self.x1K, k);
+            self.exec.matvecBatchK(self.gctx, self.vK.span(0, k * kv_dim), lw.attn_v, self.x1K, k);
 
             // Per-head norm over `head_dim`, then RoPE over the FULL head.
             // Order matters: norm -> rope, as in `layerForward`; rotating first
             // and normalising after would renormalise the rotation away.
-            self.exec.rmsnormRows(self.graph, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
-            self.exec.rmsnormRows(self.graph, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
-            self.exec.ropeRows(self.graph, self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
-            self.exec.ropeRows(self.graph, self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
+            self.exec.rmsnormRows(self.gctx, self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim), lw.attn_q_norm, k * heads, c.rms_eps);
+            self.exec.rmsnormRows(self.gctx, self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim), lw.attn_k_norm, k * kv_heads, c.rms_eps);
+            self.exec.ropeRows(self.gctx, self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads, hd, c.rotary_dim);
+            self.exec.ropeRows(self.gctx, self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads, hd, c.rotary_dim);
 
             // KV cache: the chunk's `k` rows land contiguously at `slot0`, so
             // this is ONE strided append per tensor instead of `k` of them.
             const cache = &self.kv[li];
             std.debug.assert(cache.len + k <= self.max_ctx);
             const slot0: usize = cache.len;
-            self.exec.kvAppend(self.graph, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
-            self.exec.kvAppend(self.graph, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
+            self.exec.kvAppend(self.gctx, cache.k, self.kK.span(0, k * kv_dim), slot0, kv_dim, k);
+            self.exec.kvAppend(self.gctx, cache.v, self.vK.span(0, k * kv_dim), slot0, kv_dim, k);
             cache.len += @intCast(k);
 
             // scores -> softmax -> PV -> gate for all k rows in one launch.
             // `gateK` stays the all-`+inf` buffer (this architecture has no
             // attention output gate; `sigmoid(+inf) == 1`).
             const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-            self.exec.attnChunk(self.graph, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+            self.exec.attnChunk(self.gctx, self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
                 cache.k, cache.v,
                 self.att.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
                 slot0, k, heads, gqa, hd, kv_dim, scale);
 
-            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
-            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.matvecBatchK(self.gctx, self.x2K.span(0, k * hidden), lw.attn_output, self.goutK, k);
+            self.exec.addResid(self.gctx, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP ----
-            self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
-            self.exec.matvecBatchK(self.graph, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
-            self.exec.matvecBatchK(self.graph, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
-            self.exec.swiglu(self.graph, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
-            self.exec.matvecBatchK(self.graph, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
-            self.exec.addResid(self.graph, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
+            self.exec.rmsnormRows(self.gctx, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
+            self.exec.matvecBatchK(self.gctx, self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.gctx, self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
+            self.exec.swiglu(self.gctx, self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
+            self.exec.matvecBatchK(self.gctx, self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
+            self.exec.addResid(self.gctx, self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // Twin of `layerForward`'s tap, for the batched path: the whole
             // chunk's rows at once (they are contiguous, so one copy).
             if (self.tap_hidden.len != 0) {
                 for (self.tap_layers, 0..) |tl, ti| {
                     if (tl == @as(u32, @intCast(li))) {
-                        self.exec.copyRange(self.graph, 
+                        self.exec.copyRange(self.gctx, 
                             self.tap_hidden.span(ti * self.n_batch * hidden, k * hidden),
                             self.xK.span(0, k * hidden),
                         );
@@ -837,11 +839,11 @@ pub const Engine = struct {
         // (`rmsNorm` asserts all three lengths match); use a prefix view of it,
         // which is exactly `hidden` floats.
         const normed = self.x1.span(0, hidden);
-        self.exec.rmsnorm(self.graph, normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, normed, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
-            self.exec.matvec(self.graph, self.logits, ow, normed);
+            self.exec.matvec(self.gctx, self.logits, ow, normed);
         } else {
-            self.exec.matvec(self.graph, self.logits, self.token_embd, normed);
+            self.exec.matvec(self.gctx, self.logits, self.token_embd, normed);
         }
         return self.logits;
     }
@@ -928,8 +930,8 @@ pub const Engine = struct {
         var gen_ns: i96 = 0;
         var hit_eos = false;
         var hit_context_limit = false;
-        _ = self.exec.sample(self.graph, last_logits, self.sample_scratch, &self.sampler);
-        var next: u32 = self.exec.sampledToken();
+        _ = self.exec.sample(self.gctx, last_logits, self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sampledToken(&self.sampler);
         var proposed_total: usize = 0;
         var accepted_total: usize = 0;
         var rounds: usize = 0;
@@ -968,8 +970,8 @@ pub const Engine = struct {
                     var logits = self.forwardLogits(next, pos);
                     self.specRingPush();
                     var committed: usize = 0;
-                    _ = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
-                    var pending: u32 = self.exec.sampledToken();
+                    _ = self.exec.sample(self.gctx, logits, self.sample_scratch, &self.sampler);
+                    var pending: u32 = self.exec.sampledToken(&self.sampler);
                     if (self.spec_trace_dbg) {
                         std.debug.print("ROUND pos={d} anchor={d} draft[0]={d} target[0]={d} n={d}\n", .{
                             pos, next, draft_buf[0], pending, n_draft,
@@ -985,8 +987,8 @@ pub const Engine = struct {
                         const row_pos = block_pos + @as(u32, @intCast(committed));
                         logits = self.forwardLogits(cand, row_pos);
                         self.specRingPush();
-                        _ = self.exec.sample(self.graph, logits, self.sample_scratch, &self.sampler);
-                        pending = self.exec.sampledToken();
+                        _ = self.exec.sample(self.gctx, logits, self.sample_scratch, &self.sampler);
+                        pending = self.exec.sampledToken(&self.sampler);
                     }
                     accepted_total += committed;
                     if (committed < self.spec_pos_reached.len) self.spec_pos_reached[committed] += 1;
@@ -1094,8 +1096,8 @@ pub const Engine = struct {
     }
     fn dSample(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));
-        _ = e.exec.sample(e.graph, e.logits, e.sample_scratch, &e.sampler);
-        return e.exec.sampledToken();
+        _ = e.exec.sample(e.gctx, e.logits, e.sample_scratch, &e.sampler);
+        return e.exec.sampledToken(&e.sampler);
     }
     fn dMaxSeq(ctx: *anyopaque) u32 {
         const e: *Engine = @ptrCast(@alignCast(ctx));

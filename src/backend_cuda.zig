@@ -6771,9 +6771,12 @@ pub const CudaBackend = struct {
     /// 期间非法；把它录进图又会让每次重放都返回录制时那个 token（实测：
     /// 24 个 token 全是同一个 id）。`sample` 的 kernel 仍然是图的最后一个
     /// 节点，这里只负责把结果搬回主机。
-    fn dSampledToken(ctx: *anyopaque) u32 {
+    fn dSampledToken(ctx: *anyopaque, sp_in: *sampler.Sampler) u32 {
         const self = self_(ctx);
-        const sp = self.sample_sp orelse return self.sampled;
+        // 用**调用方传进来的**采样器，不用 `self.sample_sp`：后者只有 `sample`
+        // 被调用时才会更新，而重放轮 `sample` 在图里、主机侧根本不执行。
+        self.sample_sp = sp_in;
+        const sp = sp_in;
         // 采样 kernel 刚由图/默认流写出，读之前要确保它执行完。
         if (self.cu) |*cu| {
             if (self.g_stream) |st| _ = cu.lib.StreamSynchronize(st);
