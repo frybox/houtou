@@ -2587,7 +2587,7 @@ pub const CudaBackend = struct {
         // `$QWEN35_XD_NODES=2`：按 func 地址列出每个函数有多少节点。总数对不上
         // 期望时，这一步直接指出"少了哪一类 op"，比逐个 ablation 快得多。
         if (cudart.getenv("QWEN35_XD_NODES")) |v| {
-            if (v.len > 0 and v[0] == '2') {
+            if (v.len > 0 and std.mem.indexOfScalar(u8, v, '2') != null) {
                 var it = counts.iterator();
                 while (it.next()) |ent| {
                     std.debug.print("[xg]   func 0x{x}: {d}\n", .{ ent.key_ptr.*, ent.value_ptr.* });
