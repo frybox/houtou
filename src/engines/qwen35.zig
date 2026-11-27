@@ -1963,23 +1963,14 @@ pub const Engine = struct {
     /// 的一部分 —— 换一个 k 就是另一张图，由后端的槽按 `rows` 校验。
     pub fn forwardChunkVerify(self: *Engine, tokens: []const u32, pos0: u32) Buf {
         const k = tokens.len;
-        std.debug.assert(k > 0 and k <= self.nbatch and k <= spec_verify_rows);
+        // k == 1 是**非法输入**，不是一种退化形状：这张图按行数建槽（见
+        // `xdPhaseBegin` 的 `xd_rows` 校验），录进一行 decode 的节点集合后，
+        // 下一轮真来 k 行就重放不成立。`generateSpec` 只会传 >= 2（`vbuf` 的
+        // 首行固定是 anchor，且只有 `n_draft > 0` 才进这一路），其余调用点
+        // 也都在任何 span 之外；所以这里断言而不是转发。
+        std.debug.assert(k > 1 and k <= self.nbatch and k <= spec_verify_rows);
         const c = self.cfg;
         const hidden: usize = c.hidden;
-
-        // 单行不是"验证块"：没有任何东西要批量投影，直接当成一次 decode 行，
-        // 并且**不开 `.verify` span** —— 那张图的行数是 k，录进一行 decode 的
-        // 节点集合之后，下一轮真来 k 行就重放不成立。
-        //
-        // 这一路只在草稿块为空时出现（`generateSpec` 的 `room > 0` 挡住了它），
-        // 保留是因为 `forwardChunkVerify` 是个 public 入口。
-        if (k == 1) {
-            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0, tokens[0], 1) };
-            self.embedTo(tokens[0], self.x.span(0, hidden));
-            _ = self.forwardLogits(tokens[0], pos0);
-            self.exec.copyRange(self.graph, self.logitsK.span(0, c.vocab), self.logits);
-            return self.logitsK.span(0, c.vocab);
-        }
 
         // 控制块：`pos` 是这一块第一行的位置，`kv_slot`/`attn_slot` 同它，
         // `rows` 是 k（后端据此判断槽里那张图还成不成立）。
@@ -2003,7 +1994,11 @@ pub const Engine = struct {
         defer {
             if (!nospan) {
                 self.exec.graphEnd(&self.graph);
-                self.graph = .{};
+                // 回到直通句柄并带上本块末行的 ctl：`forwardChunkVerify` 返回后
+                // 调用方（`generateSpec` 的 `draft_fn`）还会发直通 op，而它们
+                // 读 `ctl.tok[0]`。留 `.{}` 会把行号清零，嵌入变成 token 0
+                // —— 实测：MTP 接受率从 56.5% 掉到 41.7%。
+                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0 + @as(u32, @intCast(k - 1)), tokens[k - 1], 1) };
             }
         }
 
@@ -2635,9 +2630,13 @@ pub const Engine = struct {
         // 草稿块的算子本身 capture 安全：嵌入走 `dequantize_rows_ctl`（行号从
         // 控制块读，`tok[0]` 就是本轮要嵌的 token），其余是 matvec / rmsnorm /
         // attention 的设备位置形态。
-        // 它和 verify 是**串行**的两段（`generateSpec` 先 draft 再 verify），
-        // 不再套在 verify 的调用栈里，所以不会污染那张图。
-        const saved = self.graph;
+        //
+        // **串行，不嵌套**：`generateSpec` 先 `draft_fn`（本函数）再
+        // `forwardChunkVerify`，两者在时间上分开；另外两个调用点
+        // （`main.zig` 的 SPEC-NEXTN 自检）也都在任何 span 之外。所以这里
+        // 不需要保存/恢复外层句柄 —— 那正是 `ctl_host` 只按后端存一份、
+        // 恢复时漏掉一半状态的来源（实测：草稿槽覆盖 pos 后 verify 的 rope
+        // 读到别人的 pos，MTP 接受率 0%）。
         self.graph = self.exec.graphBegin(.nextn, .{
             .pos = draft_pos,
             .rope_base_bits = @bitCast(c.rope_freq_base),
@@ -2652,7 +2651,9 @@ pub const Engine = struct {
         }, graph_slot_nextn);
         defer {
             self.exec.graphEnd(&self.graph);
-            self.graph = saved;
+            // 回到直通句柄，而不是某个"外层"图：调用方进来时 `self.graph`
+            // 只可能是直通（见上面的串行约定）。
+            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(draft_pos, next_token, 1) };
         }
 
         // h = eh_proj([enorm(e); hnorm(h)])  -- one matvec over a 2*hidden input.
