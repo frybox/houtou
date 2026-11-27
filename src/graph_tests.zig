@@ -1,106 +1,24 @@
-//! S1 的验收：显式计算图里「宿主侧能纯数据验证」的那一半。
+//! 显式计算图里「宿主侧能纯数据验证」的那一半。
 //!
-//! 这两部分都不需要 GPU，所以在 `make test`（没有 -Dcuda 的默认构建）里也跑：
+//! 不需要 GPU，所以在 `make test`（没有 -Dcuda 的默认构建）里也跑：
 //!
-//!   1. `graph_registry.zig` 的状态机：每个状态迁移恰好落在一个分支上，
-//!      并且 `live` 之后永远不再录制（录制一次重放 N 次才是收益的来源）。
-//!   2. `xd.zig` 的布局：`Slot` / `Node` 必须与 `xd.h` 的 C 结构二进制一致。
-//!      这两个结构是跨语言 ABI，布局错了就是「图里某个实参读到别的字节」的
-//!      静默错，只有在真机重放时才表现出来；这里用编译期的 size/align 断言把它
-//!      钉死。
+//!   * `xd.zig` 的布局：`Slot` / `Node` 必须与 `xd.h` 的 C 结构二进制一致。
+//!     这两个结构是跨语言 ABI，布局错了就是「图里某个实参读到别的字节」的
+//!     静默错，只有在真机重放时才表现出来；这里用 size/align/offset 断言把它
+//!     钉死。
+//!   * `backend.GraphCtl` 与设备控制块（`xd.h` 的 `XD_CTL_INTS`）的字段布局。
 //!
-//! 不在本文件里的：`xd_capture` / `xd_apply` 与 CUDA 的交互。那需要真机，
-//! 由 S3 的 `QWEN35_XD_STRICT=1`（replay 与 eager 逐位比对）承担。
+//! 状态机那部分（`graph_registry.zig`）已经删除：录制与重放现在是引擎侧的
+//! 显式动作（`beginRecord` / `endRecord` / `launch`），后端不再维护
+//! absent/warm/rec/live 这套自动推演。
 
 const std = @import("std");
-const reg = @import("graph_registry.zig");
 const xd = @import("xd.zig");
 const backend = @import("backend.zig");
 
 // ---------------------------------------------------------------------------
-// 状态机
-// ---------------------------------------------------------------------------
-
-test "registry: warm -> record -> replay, and never re-records" {
-    var r = reg.Registry.init();
-    defer r.deinit(std.testing.allocator);
-
-    const key = reg.Key{ .signature = 0x1234, .kind = .decode, .rows = 1 };
-    const e = try r.slot(std.testing.allocator, key);
-    try std.testing.expectEqual(reg.State.absent, e.state);
-    try std.testing.expectEqual(reg.Transition.direct, reg.resolve(e.state));
-
-    // 第 1 次：warm（直接发射），不录制。
-    e.state = .warm;
-    try std.testing.expectEqual(reg.Transition.record, reg.resolve(e.state));
-
-    // 第 2 次：录制成功。
-    e.state = reg.afterRecord(true);
-    try std.testing.expectEqual(reg.State.live, e.state);
-
-    // 第 3.. 次：全部重放，且状态不再迁移。
-    for (0..5) |_| {
-        try std.testing.expectEqual(reg.Transition.replay, reg.resolve(e.state));
-        e.state = reg.afterReplay(true, e.state);
-        try std.testing.expectEqual(reg.State.live, e.state);
-    }
-}
-
-test "registry: a failed record gives up permanently" {
-    var r = reg.Registry.init();
-    defer r.deinit(std.testing.allocator);
-    const e = try r.slot(std.testing.allocator, .{ .signature = 1, .kind = .decode, .rows = 1 });
-    e.state = .warm;
-    e.state = reg.afterRecord(false);
-    try std.testing.expectEqual(reg.State.failed, e.state);
-    // 失败之后永远是直接发射，不会再进录制/重放。
-    for (0..3) |_| try std.testing.expectEqual(reg.Transition.direct, reg.resolve(e.state));
-}
-
-test "registry: a failed replay abandons the graph" {
-    try std.testing.expectEqual(reg.State.failed, reg.afterReplay(false, .live));
-    // 失败之前的任何状态，失败后都一样是 failed。
-    try std.testing.expectEqual(reg.State.failed, reg.afterReplay(false, .warm));
-    // 成功不做迁移。
-    try std.testing.expectEqual(reg.State.live, reg.afterReplay(true, .live));
-}
-
-test "registry: entries are keyed by (signature, kind, rows)" {
-    var r = reg.Registry.init();
-    defer r.deinit(std.testing.allocator);
-
-    const a = try r.slot(std.testing.allocator, .{ .signature = 7, .kind = .decode, .rows = 1 });
-    a.node_count = 42;
-    const b = try r.slot(std.testing.allocator, .{ .signature = 7, .kind = .decode, .rows = 1 });
-    try std.testing.expect(a == b); // 同一个 key 返回同一个条目
-    try std.testing.expectEqual(@as(usize, 42), b.node_count);
-
-    // decode/rows=1 与 chunk/rows=1 是两张不同的图。
-    const c = try r.slot(std.testing.allocator, .{ .signature = 7, .kind = .chunk, .rows = 1 });
-    try std.testing.expect(a != c);
-    try std.testing.expectEqual(@as(usize, 2), r.entries.items.len);
-}
-
-test "registry: disableAll turns every graph into the direct path" {
-    var r = reg.Registry.init();
-    defer r.deinit(std.testing.allocator);
-    const e = try r.slot(std.testing.allocator, .{ .signature = 9, .kind = .decode, .rows = 1 });
-    e.state = .live;
-    r.disableAll();
-    try std.testing.expectEqual(reg.State.failed, e.state);
-    try std.testing.expectEqual(reg.Transition.direct, reg.resolve(e.state));
-}
-
-// ---------------------------------------------------------------------------
 // 跨语言布局
 // ---------------------------------------------------------------------------
-
-test "GraphCtl is a 64-byte control block" {
-    // `graph_registry.GraphCtl`（S1 的 registry 布局）仍然按 64 B 一次刷完；
-    // 真正接在设备上的那块是 `backend.GraphCtl`（6 个 int32），见下一条用例。
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(reg.GraphCtl));
-    try std.testing.expectEqual(@as(usize, 4), @alignOf(reg.GraphCtl));
-}
 
 test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 保持一致" {
     // 设备控制块是 `int32_t[XD_CTL_INTS]` =

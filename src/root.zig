@@ -31,7 +31,6 @@ pub const spec_rollback = @import("spec_rollback.zig");
 pub const serial = @import("serial.zig");
 /// 显式计算图（XG）：宿主侧的图状态机与 `xd.cu` op 表的 Zig 声明。
 /// 见 docs/cuda-backend-brief.md 的「显式计算图」一节与 plan §1。
-pub const graph_registry = @import("graph_registry.zig");
 pub const xd = @import("xd.zig");
 
 // The IQ lookup tables are defined here once and consumed by the C kernels via

@@ -796,6 +796,85 @@ memory，`unroll 2` 收益被归约冲掉 —— 要正做需要重排归约结�
 - `ncu` 需要 `RmProfilingAdminOnly=0` 或 `sudo`。本机已配置 sudo 免密，
   直接 `sudo -n ncu ...`。
 
+### 5.bb XG（显式计算图）：显式录制/重放，不靠每个 op 自己判断
+
+**形态。** 后端只提供四个可命名的原语，**不做**"这一步该录还是该放"的判断
+（那需要知道模型结构，只有引擎知道）：
+
+| 原语 | 做什么 |
+|---|---|
+| `hasGraph(slot)` | 槽里有没有可重放的 exec |
+| `beginRecord(slot)` | 开 capture（旧 exec 先销毁） |
+| `endRecord(slot)` | 关 capture + instantiate，**仅此而已** |
+| `publishCtl(slot, ctl)` | 位置 + 采样参数，一次 H2D |
+| `launch(slot)` | 纯 `GraphLaunch` |
+
+引擎侧（`Engine.decode` / `.draft` / `.verify`）：
+
+```
+if (!hasGraph(slot)) { beginRecord(slot); 构建; endRecord(slot); }
+publishCtl(slot, ctl);
+launch(slot);
+sampledToken();          // 图后的一次 4 B D2H
+```
+
+录制轮与重放轮走**完全同一段收尾**，区别只是前面多了 capture。
+
+**为什么必须这么分。** 旧做法是"每步走完整流程、每个 op 查 `replayed` 再决定
+要不要发射"。那让重放仍要遍历 65 层、约 1977 次 vtable 分派，全部空转；省掉的
+只有 `cuLaunchKernel`。四个参照实现都不是这个形态：
+
+| 项目 | 重放命中时 |
+|---|---|
+| llama.cpp `ggml-cuda.cu:5529` | 不进 `for (node) compute_forward`，只 `GraphLaunch` |
+| squid5090 `engine.zig:1091` | `if (use_graphs) launch(); else record_forward();` 互斥两条路 |
+| ds4 `ds4.c:43133` | `if (state == 1) return true;` —— 直接返回，不执行 encode |
+| Strata `verify.cpp:3938` | 只有 `cudaGraphLaunch(exec_[T], cs_)` |
+
+**槽按形状划分。** 18 个：`graph_slot_decode`(0)、`graph_slot_verify_base`+k-2
+(1..16)、`graph_slot_nextn`(17)。verify 一种 k 一张图、懒加载（只有出现过的 k
+才录），因为 `matvecBatchK` 的批宽、`rmsnormRows` 的行数、`attn_chunk` 的窗口
+都烘死在录制那一刻。
+
+**控制块只有一块。** 位置字段（`pos`/`base`/`kv_slot`/`attn_slot`/`rows`/
+`tok[16]`）与采样字段（16 个）合并在同一个 `GraphCtl`（37 个 int = 148 B），
+每步**一次** H2D。采样 kernel 是图的最后一个节点，读的状态和前面 65 层是同一
+时刻的，分两块缓冲只会让"每步要发的东西"散在两处。
+
+**踩过的坑（都会重犯）：**
+
+1. **`endRecord` 只能做 instantiate。** `xdFinishCapture` 早先在 instantiate 之后
+   自己发一次 `GraphLaunch`，而调用方又发一次 —— 每步执行两遍。症状：`XD=1`
+   从第 2 个 token 起重复同一 id、MTP 只出 1 个 token。
+2. **`publishCtl` 必须在构建之前。** 直通路径上 `buildDecode` 里的 `sample`
+   当场读控制块；发布晚了就采到旧参数（症状：输出全是 0）。
+3. **`verify` 录制轮不能多算一遍。** `launch` 之后必须直接 `return`，否则又跑
+   一次 `buildVerify`，主机与图的结果打架（症状：MTP 只出 3 个 token）。
+4. **`SCTL_BASE` 是 `5 + 16 = 21`，不是 `XD_CTL_INTS`(37)。** 写成 37 会让采样
+   字段越界写到 37..53，症状是 `vocab` 读回正确、但 `flags`/`token_out` 全 0
+   （输出全是 0）。现在由 `graph_tests.zig` 的 `@offsetOf` 断言钉住。
+5. **后端共享的 `ctl_host` 不能跨槽比较。** `.nextn` 与 `.verify` 在一轮里相邻
+   执行，谁后 `beginRecord` 谁占着它。曾用共享镜像做断言，草稿槽覆盖 `pos` 后
+   verify 的 rope 断言失败，MTP 接受率掉到 0%。rope 里的
+   `publishCtl(..., force=false)` 正是把它纠正回本槽值的手段，**不要删**。
+
+**当前状态（2026-11-27）：**
+
+| 路径 | 状态 |
+|---|---|
+| CUDA `QWEN35_XD=0`（无图） | 正确；plain IDS `857b78f3…`，MTP 59.6% |
+| CUDA `QWEN35_XD=1` decode 图 | **仍不正确**（`101850 0 271 101850…`） |
+| `.verify` 图 | 默认关闭（`QWEN35_XD_VERIFY=1` 才开，开了接受率掉到个位数） |
+| CPU 后端 | 正确（`hasGraph` 恒 false，四原语空操作） |
+
+`XD=1` 的错误是**既存缺陷**，不是本轮重构引入：在重构前的提交 `1b42447` 上
+跑出完全同一串。验收因此走 `XD=0` —— 那是与改动前语义等价的路径。
+
+**参照实现（读代码而不是凭印象）：** 见 `/mnt/ds4/ds4_cuda.cu:1140-1216` 的
+`ds4_gpu_decode_graph_begin/end` 与 `/mnt/strata/Strata/engine/src/core/graph.cpp`
+的 `CapturedGraph::launch`。ds4 的三态返回值（`-1` 直发 / `0` 录制 / `1` 重放
+命中）是本实现的来源。
+
 ## 6. 手动运行与性能对比（模型与 target）
 > 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
 > 提交前必跑的步骤。以下 target 只用于手动调试与性能对比。
@@ -834,7 +913,9 @@ memory，`unroll 2` 收益被归约冲掉 —— 要正做需要重排归约结�
 - 一次提交只做一件事：kernel 改动与调用方改动分开，便于二分定位回归。
 
 ## 8. 文档一致性提醒
-
-- `docs/port-brief.md` 是**过期文档**：它要求"把内核移植成纯 Zig `@Vector`、禁 C/C++、禁 inline asm"，
-  与 §1 直接冲突（git 历史 `f0e36ea Remove Zig SIMD kernels, use C kernels only` 已推翻该方案，
-  `src/simd/` 目录也已删除）。以本文件为准；需要时可归档或删除该简报，不要据它开工。
+- `docs/port-brief.md` 已删除（2026-11）：它要求"把内核移植成纯 Zig `@Vector`、禁 C/C++、
+  禁 inline asm"，与 §1 直接冲突，而且 `src/simd/` 目录早已随
+  `f0e36ea Remove Zig SIMD kernels, use C kernels only` 删除。以本文件为准。
+- `src/graph_registry.zig` 已删除（2026-11）：录制/重放改为引擎侧的显式动作
+  （`beginRecord` / `endRecord` / `publishCtl` / `launch`），后端不再维护
+  absent/warm/rec/live 这套自动推演。详见 §5.bb。

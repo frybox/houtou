@@ -40,7 +40,6 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
-const graph_registry = @import("graph_registry.zig");
 const xd = @import("xd.zig");
 const cpu_mod = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
@@ -1233,8 +1232,8 @@ const GraphSlot = struct {
 };
 
 /// XG 一张图的状态。`warm` 是"下一步录制"（`absent → warm → live`），
-/// 与 `graph_registry.zig` 的状态机同义，但因为 `graph_registry` 的 key
-/// 是 `(signature, kind, rows)` 而 decode 只有一种，这里先用单槽状态。
+/// 一张图从"没有"到"可重放"只有两步（引擎显式驱动，见 `dBeginRecord` /
+/// `dEndRecord`），所以这里不需要更细的状态。
 const XdPhase = enum { off, rec, live };
 
 pub const CudaBackend = struct {
@@ -2498,7 +2497,7 @@ pub const CudaBackend = struct {
 
     // ==== 显式计算图（XG）的状态机 ==========================================
     //
-    // `off → warm → rec → live`，与 `graph_registry.zig` 的语义一致：
+    // `off → rec → live`，由引擎显式驱动（`beginRecord` / `endRecord`）：
     //
     //   off   直接发射，不录制。
     //   warm  直接发射；`dGraphEnd` 把这步当作"惰性分配已稳态"的证据，转 rec。
