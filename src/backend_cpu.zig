@@ -1022,14 +1022,33 @@ pub const CpuBackend = struct {
     /// The explicit-compute-graph hooks.  The CPU runs straight-line code: there
     /// is nothing to capture and nothing to replay, so `graphBegin` hands back
     /// the pass-through graph (`ptr == null`) and every op ignores its `g`.
-    fn vGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl, slot: u8) backend.Graph {
+    /// CPU 后端没有图：`hasGraph` 恒 false，录制/发布/launch 全是空操作。
+    /// 引擎因此走"永远直通"那条路，与改动前逐 bit 相同。
+    fn vHasGraph(ctx: *anyopaque, slot: u8) bool {
         _ = ctx;
-        return .{ .kind = kind, .ctl = ctl, .slot = slot };
+        _ = slot;
+        return false;
     }
 
-    fn vGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
+    fn vBeginRecord(ctx: *anyopaque, slot: u8) void {
         _ = ctx;
-        _ = g;
+        _ = slot;
+    }
+
+    fn vEndRecord(ctx: *anyopaque, slot: u8) void {
+        _ = ctx;
+        _ = slot;
+    }
+
+    fn vPublishCtl(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) void {
+        _ = ctx;
+        _ = slot;
+        _ = ctl;
+    }
+
+    fn vLaunch(ctx: *anyopaque, slot: u8) void {
+        _ = ctx;
+        _ = slot;
     }
 
     fn vName(ctx: *anyopaque) []const u8 {
@@ -1629,8 +1648,11 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         .argmaxRows = vArgmaxRows,
         .sample = vSample,
         .sampledToken = vSampledToken,
-        .graphBegin = vGraphBegin,
-        .graphEnd = vGraphEnd,
+        .hasGraph = vHasGraph,
+        .beginRecord = vBeginRecord,
+        .endRecord = vEndRecord,
+        .publishCtl = vPublishCtl,
+        .launch = vLaunch,
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,

@@ -295,9 +295,8 @@ fn stubNoCudaKernels() c_int {
 /// `dAddResid` …）在调用 body 之前压入、之后弹回，而不是由"当前 span"全局
 /// 决定 —— 后者在嵌套 span（草稿块在 verify 里面）下会拿错槽。
 ///
-/// 为什么需要它：`graphGate` 只看 `Graph.phase`，而 verify 那段是逐
-/// kernel 直发（`replayed == false`）。草稿图重放时它的 op 同样是 `false`，
-/// 必须靠"槽 2 是 `.live`"来抑制，否则草稿的每一步会在主机上再算一遍。
+/// 现在它只服务于 `$QWEN35_PROF` 的槽级计时，`graphGate` 不再读它：
+/// 录制/重放由引擎显式决定（`Graph.phase`），后端不猜。
 var xg_cur_slot: u8 = 0;
 /// 压入 `slot`，返回先前那个（供 `defer` 恢复）。
 inline fn xg_push_slot(slot: u8) u8 {
@@ -305,7 +304,6 @@ inline fn xg_push_slot(slot: u8) u8 {
     xg_cur_slot = slot;
     return prev;
 }
-var xg_backend: ?*CudaBackend = null;
 
 /// `$QWEN35_GATEDBG` 的累计计数：`graphGate` 被调用多少次、其中多少次是
 /// "图已重放"（即跳过发射）。
@@ -325,14 +323,9 @@ fn graphGate(g: backend.Graph) bool {
             std.debug.print("[gate] REPLAYED kind={s} slot={d}\n", .{ @tagName(g.kind), g.slot });
         }
     }
-    // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
-    if (g.kind == .nextn) {
-        const self = xg_backend orelse return g.phase == .replay;
-        if (xg_cur_slot >= self.g_slots.len) return g.phase == .replay;
-        const s = self.g_slots[xg_cur_slot];
-        if (s.xd_capturing) return false;
-        if (s.xd_phase == .live) return true;
-    }
+    // `.record` 期 op 必须照常发射（CUDA 才录得到），`.replay` 期一律抑制。
+    // 引擎已经在 `.replay` 时整段跳过构建，所以这个 gate 只是第二道防线
+    // （例如某个 op 在跳过的分支之外被发出）。
     return g.phase == .replay;
 }
 
@@ -1190,9 +1183,23 @@ comptime {
     }
 }
 
-/// 槽数：decode / verify / nextn 各一张。槽号必须和 `engines/qwen35.zig` 的
-/// `graph_slot_*` 常量一致（引擎传进来，后端只做边界检查）。
-const graph_slot_count: usize = 3;
+/// 槽数：decode 一张、nextn 一张，verify **按行数**每 k 一张（k = 2..16）。
+///
+/// verify 的节点集合随 k 变（matvecBatchK 的行数、rnnormRows 的行数、
+/// attn_chunk 的窗口都烘死在录制那一刻），所以一种 k 一张图、懒加载：
+/// 只有真正出现过的 k 会录。上限取 `spec_verify_rows`（引擎侧同名常量），
+/// 这与 `ctl_tokens` 是同一个上界。
+///
+/// 槽号必须和 `engines/qwen35.zig` 的 `graph_slot_*` 一致（引擎算出来传进来，
+/// 后端只做边界检查）。
+const graph_slot_count: usize = 2 + graph_slot_verify_max;
+
+/// verify 的最大 k（含）。与 `backend.ctl_tokens` / `spec_verify_rows` 相同。
+const graph_slot_verify_max: usize = 16;
+
+comptime {
+    std.debug.assert(graph_slot_verify_max == backend.ctl_tokens);
+}
 
 /// One graph's captured state.
 ///
@@ -1984,6 +1991,23 @@ pub const CudaBackend = struct {
         ctl.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
     }
 
+    /// 原样发布（采样字段由调用方写好）。`dPublishCtl` 用这条。
+    fn publishCtlRaw(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
+        _ = stream;
+        _ = force;
+        const p = self.ensureCtl() orelse return false;
+        const cu = &(self.cu orelse return false);
+        const rc = cu.lib.Memcpy(p, @ptrCast(&ctl), @sizeOf(backend.GraphCtl), cudart.MemcpyHostToDevice);
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("ctl publish", rc);
+            return false;
+        }
+        self.stat_h2d_bytes += @sizeOf(backend.GraphCtl);
+        self.ctl_host = ctl;
+        self.ctl_valid = true;
+        return true;
+    }
+
     fn publishCtl(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
         _ = stream;
         // 短路只对"完全没有采样器"的调用成立。有采样器时每一步的 PRNG 位置
@@ -2496,84 +2520,6 @@ pub const CudaBackend = struct {
     /// `graphEnd` 会嵌套（草稿块在 verify 里面），全局当前槽会让外层的收尾
     /// 落到内层的槽上 —— 实测：草稿槽永远停在 `.off`，草稿的 op 全落到主机侧
     /// 又算一遍，接受率 0%。
-    fn xdPhaseBegin(self: *CudaBackend, g: backend.Graph) backend.Graph {
-        const s = self.gs(g.slot);
-        const out_node = struct {
-            fn make(gg: backend.Graph, ss: *GraphSlot, phase: backend.Phase) backend.Graph {
-                return .{
-                    .kind = gg.kind,
-                    .ctl = gg.ctl,
-                    .slot = gg.slot,
-                    .ptr = @ptrCast(ss),
-                    .phase = phase,
-                };
-            }
-        }.make;
-        s.xd_launched = false;
-        // prefill 的块长度是数据相关的（`min(nbatch, 剩余 token)`），而一张图
-        // 只对一种行数成立；按形状建图最多要 nbatch-1 张。prefill 的发射开销
-        // 在 238 ms 的块里上界只有 6.3%（AGENTS.md §5.7 的账本），所以
-        // prefill 一律直通 —— 它现在压根不经过这里（`forwardChunk` 自己不开
-        // span，只有 `forwardChunkVerify` 开 `.verify`）。
-        //
-        // `.verify` 走到这里只可能来自 `$QWEN35_XD_VERIFY=1`（默认不建图，
-        // 见 `dGraphBegin`）。它的行数逐轮会变，所以这里按 `rows` 校验：一张
-        // 图只对一种行数成立，行数变了必须重录，否则会重放一张节点数与 buffer
-        // 行数都不匹配的图 —— 那是静默算错，不是报错。
-        if (s.xd_phase == .live and s.xd_rows != g.ctl.rows) {
-            if (s.xd_gexec) |e| {
-                if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
-                s.xd_gexec = null;
-            }
-            s.xd_phase = .rec;
-        }
-        s.xd_rows = g.ctl.rows;
-        switch (s.xd_phase) {
-            .off => return g,
-            .rec => {
-                // 录制期：op 必须照常发射，CUDA 才录得到。`phase = .record`
-                // 因此**不**抑制任何发射，它只是告诉引擎"这一轮是在建图"。
-                if (s.xd_capturing) return out_node(g, s, .record);
-                if (!self.xdStartCapture(s)) return g;
-                return out_node(g, s, .record);
-            },
-            .live => {
-                // `$QWEN35_XD_NOREPLAY=1`：每一步都重新录制而不是重放。调试用，
-                // 用来把"图的内容错"与"重放这个动作错"分开。
-                if (cudart.getenv("QWEN35_XD_NOREPLAY") != null) {
-                    if (s.xd_gexec) |e| {
-                        if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
-                        s.xd_gexec = null;
-                    }
-                    s.xd_phase = .rec;
-                    if (!self.xdStartCapture(s)) return g;
-                    return out_node(g, s, .record);
-                }
-                if (!self.xdReplay(s)) {
-                    // 重放失败后**不能**退回主机侧直接发射：图可能已经执行
-                    // （状态被推进一次），重跑整步会把状态推进两次。所以只有
-                    // "图没启动"这一种失败允许降级；见 `xd_launched`。
-                    s.xd_phase = .off;
-                    // 图已经跑过：本步的活它做完了，引擎必须按重放处理
-                    // （跳过整段构建），否则会在默认流上把整步再算一遍。
-                    if (s.xd_launched) return out_node(g, s, .replay);
-                    return g;
-                }
-                // `.replay`：图已经 launch，主机侧**不要再构建任何东西**。
-                return out_node(g, s, .replay);
-            },
-        }
-    }
-
-    fn xdPhaseEnd(self: *CudaBackend, g: backend.Graph) void {
-        const s = self.gs(g.slot);
-        switch (s.xd_phase) {
-            .rec => self.xdFinishCapture(s),
-            // `live` 的 `GraphLaunch` 已经在 `xdPhaseBegin` 里发过，没有收尾。
-            else => {},
-        }
-    }
-
     /// 开 capture。失败返回 false，`xd_phase` 归 `.off`。
     fn xdStartCapture(self: *CudaBackend, slot: *GraphSlot) bool {
         const cu = &(self.cu orelse return false);
@@ -2686,36 +2632,11 @@ pub const CudaBackend = struct {
         _ = cu.lib.GraphDestroy(graph.?);
         s.xd_gexec = gexec_new;
         s.xd_phase = .live;
-        // capture 只记录不执行：这一 token 至今没有任何 kernel 跑过，必须
-        // launch 一次，否则 KV/GDN 状态都停在上一个 token。
-        //
-        // 而且**必须把结果排序回默认流**：`GraphLaunch` 落在 `g_stream` 上、
-        // 是异步的，而 `launchStream()` 在图活着时返回默认流，于是图之后的所有
-        // 工作（调用方的 argmax、下一层）会和它并发。`xdReplay` 早就做了这道
-        // 排序（见那里注释里的"旧机制参数全冻结、每次跑出不同 token"），这里
-        // 一直漏着：漏掉它时**录制那一轮就已经算错**，而不是只有重放轮错。
-        const lrc = cu.lib.GraphLaunch(gexec_new, self.g_stream.?);
-        if (lrc != cudart.cudaSuccess) {
-            self.ewLaunchFail("xg: first launch", lrc);
-            s.xd_phase = .off;
-            _ = cu.lib.GraphExecDestroy(gexec_new.?);
-            s.xd_gexec = null;
-            return;
-        }
-        if (self.g_ev_out) |ev| {
-            if (cu.lib.EventRecord(ev, self.g_stream.?) == cudart.cudaSuccess) {
-                _ = cu.lib.StreamWaitEvent(null, ev, 0);
-                _ = cu.lib.EventSynchronize(ev);
-            }
-        } else {
-            // 没有事件句柄（`ensureEvents` 只在 profiling 时建）时退化成一次
-            // 流同步：录制一轮本来就只发生一次，这点代价可以接受，而漏掉排序
-            // 会直接产出错值。
-            _ = cu.lib.StreamSynchronize(self.g_stream.?);
-        }
-        // `$QWEN35_XD_FULLSYNC=1`（调试）：首次 launch 之后做一次全设备同步。
-        // 若它能消除"打开过 capture 之后结果随机"的问题，就说明还有一处流间
-        // 依赖没被排序。
+        // **不 launch。** capture 只记录不执行，所以这一轮的显式计算由调用方
+        // 在 `endRecord` 之后显式 `launch` 一次完成（`Engine.decode` 等）。
+        // 早先这里自己 launch 过一次，而调用方又 launch 一次 —— 每步执行两遍。
+        // 实测症状：XD=1 的 token 流从第 2 个起重复同一个 id，MTP 只出 1 token。
+        // 这是"`endRecord` 只做 instantiate"这条约定必须守住的原因。
         if (cudart.getenv("QWEN35_XD_FULLSYNC") != null) _ = cu.lib.DeviceSynchronize();
     }
 
@@ -5155,15 +5076,15 @@ pub const CudaBackend = struct {
         // 一个 **memcpy 节点**，重放时把录制那一步的参数写回设备块（实测：
         // `QWEN35_XD_NODES` 报出 1 个 non-kernel 节点，正是它）。参数已由
         // `dGraphBegin` 在图外、图 launch 之前发布好，这里只负责把 kernel 录进去。
-        // 参数已经由本步的 `publishCtl` 整块写进控制块（采样字段与位置字段
-        // 同一次 H2D）。这里**不能**再写：capture 期间发出的拷贝会被录成
-        // 节点，重放时把录制那一步的参数写回。
+        // 参数由**引擎**在 `decode` / `verify` / `draft` 里经 `publishCtl`
+        // 显式发布（位置字段与采样字段同一次 H2D）。这里默认不再写：
+        //   * capture 期间写会被录成节点，重放时用录制值；
+        //   * 直通路径上引擎也已经发过，再发一次只会把当步的值覆盖成旧值。
         //
-        // 但**直通路径**没有人发布过：prefill / 自检 / 图关闭时走的正是这里，
-        // 而采样 kernel 直接从控制块读 temperature/PRNG。所以只在
-        // "没有图活跃"时补这一次（此时没有 capture，写进去就生效）。
-        if (!self.graphActive(g)) {
-            var ctl = self.ctl_host;
+        // 唯一例外是从未发布过的调用方（自检路径直接调 `sample`）。那时
+        // `ctl_valid == false`，补一次让采样 kernel 至少有合法的 vocab/参数。
+        if (!self.ctl_valid) {
+            var ctl = backend.GraphCtl{};
             CudaBackend.fillSampleCtl(&ctl, logits.len, sp);
             if (!self.publishCtl(ctl, self.launchStream(), true)) {
                 return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
@@ -6747,75 +6668,67 @@ pub const CudaBackend = struct {
     /// 显式计算图（XG）的钩子。S2 返回直通图；捕获/重放在 S3 接线。CUDA 后端
     /// 仍保留 S1 的 registry，好让 A/B 开关（`QWEN35_CUDA_GRAPH`）与诊断输出
     /// 依然能描述"接下来会发生什么"。
-    fn dGraphBegin(ctx: *anyopaque, kind: backend.GraphKind, ctl: backend.GraphCtl, slot: u8) backend.Graph {
+    // ==== XG 原语：录制与重放是两个显式动作 ==============================
+    //
+    // 引擎侧（`Engine.decode` / `.draft` / `.verify`）这样用：
+    //
+    //     if (!hasGraph(slot)) { beginRecord(slot); ...构建...; endRecord(slot); }
+    //     publishCtl(slot, ctl);
+    //     launch(slot);
+    //
+    // 后端**不做**"这一步该录还是该放"的判断 —— 那需要知道模型结构，只有
+    // 引擎知道。这里每个原语只做一件可命名的事。
+
+    /// `VTable.hasGraph`：这个槽里有没有一张可重放的 exec。
+    fn dHasGraph(ctx: *anyopaque, slot: u8) bool {
         const self = self_(ctx);
-        if (!self.gpuReady()) return .{ .kind = kind, .ctl = ctl, .slot = slot };
-        // 槽号来自调用方（见 `backend.Graph.slot`）。越界只会是引擎的笔误，
-        // 直接落回直通图并报一次，而不是悄悄写到别的槽上。
-        if (slot >= self.g_slots.len) {
-            std.debug.print("cuda backend: graphBegin slot {d} out of range\n", .{slot});
-            return .{ .kind = kind, .ctl = ctl, .slot = slot };
-        }
-        // 在其它任何东西跑起来之前，先把这一步的标量发布出去。这是每步唯一能
-        // 安全分配控制块的地方（capture 区间内 `cudaMalloc` 非法），也是唯一
-        // 知道"这一步开始了"的地方。
-        //
-        // 这次写发生在图 launch 之前，图里的 kernel 只读那块设备内存；不带图的
-        // 步骤则按自己的流顺序读同一个块（同一条流）。
-        //
-        // 发布失败不是致命的：每个消费方都有逐标量回退，所以这一步照样跑（只是
-        // capture 不安全，也就是它不会被录进图）。
-        _ = self.publishCtl(ctl, null, true);
-        const g = backend.Graph{ .kind = kind, .ctl = ctl, .slot = slot };
-
-        // XG 服务"节点集合可重放"的三种前向：`.decode`（1 行）、`.verify`
-        // （k 行，k 由调用方声明、写进控制块）、`.nextn`（草稿块，1 行）。
-        // prefill 的块长度是数据相关的，按形状建图最多要 nbatch-1 张；而
-        // prefill 现在压根不经过这里（`forwardChunk` 自己不开 span），它的
-        // 发射开销在 238 ms 的块里上界只有 6.3%。
-        if (cudart.getenv("QWEN35_XD_REPLAYDBG") != null) {
-            std.debug.print("[xg] graphBegin kind={s} slot={d} phase={s}\n", .{ @tagName(kind), slot, @tagName(self.gs(slot).xd_phase) });
-        }
-        if (kind != .decode and kind != .verify and kind != .nextn) return g;
-        if (!graphWanted() or !xdWanted()) return g;
-        // `.verify` 默认**不进图**：把 k 行前向录成一张可重放的图，要求它的
-        // 每一个逐轮标量都走设备控制块。目前只覆盖到 KV 写入行与 attn 起始行，
-        // `matvecBatchK` 的激活/输出 scratch 仍按录制时那一次固化 —— 实测
-        // （27B IQ3_XXS，MTP draft=2）：图里只剩"尾部 rmsnormRows + lm_head"
-        // 两步时接受率也是 0%（直发 60%），说明缺口不止一处。
-        //
-        // prefill 不走这里，它的发射开销在 238 ms 的块里上界只有 6.3%，所以
-        // "verify 不建图"并不亏；把剩下的标量逐个搬到 ctl 之后再打开。
-        // `$QWEN35_XD_VERIFY=1` 可以强行打开，用来继续那条工作。
-        if (kind == .verify and cudart.getenv("QWEN35_XD_VERIFY") == null) return g;
-        if (kind != .decode) return self.xdPhaseBegin(g);
-        // 采样参数在**图 launch 之前**拷进设备常驻控制块。这是整个重放循环里
-        // 唯一正确的位置：
-        //   * 图里的 `k_plan` / `k_draw` / `k_coin` 在重放时从该块读
-        //     temperature / top_k / top_p / PRNG，读的必须是**这一步**的值；
-        //   * 而 `sample` 这个 op 的调用点在图 launch 之后（`dSample_body`
-        //     那时再写就晚了 —— 会把图刚写下的 `CTL_FLAGS`/`CTL_TOKEN_OUT`
-        //     整体重置，实测读回永远是 0）；
-        //   * 写进 capture 区间更不行，那会被录成节点，重放永远用录制值。
-        // 所以就是用户定的形态：两次重放之间 host H2D 一次，重放期间图只读。
-        //
-        // 拷贝发到 `g_stream`（图所在流）而不是默认流：图 launch 也在这条流
-        // 上，先入先出保证它读到的是这次写进去的值。
-        //
-        // 引擎每步传的是同一个 `*Sampler`（`dSample_body` 里记下的
-        // `sample_sp`），所以这里拿到的 temperature/top-k/top-p/PRNG 就是当步的。
-
-        const out = self.xdPhaseBegin(g);
-        return out;
+        if (!self.gpuReady() or slot >= self.g_slots.len) return false;
+        if (!graphWanted() or !xdWanted()) return false;
+        return self.gs(slot).xd_gexec != null;
     }
 
-    fn dGraphEnd(ctx: *anyopaque, g: *backend.Graph) void {
+    /// `VTable.beginRecord`：打开 capture。这一轮随后发出的 op 全部被录进图，
+    /// **不执行**。槽里已有旧图时先销毁（形状变了必须重录）。
+    fn dBeginRecord(ctx: *anyopaque, slot: u8) void {
         const self = self_(ctx);
-        if (g.ptr == null) return;
-        // 收尾用的是**这张图自己的槽**，所以嵌套 span（草稿块在 verify 里面）
-        // 各自关各自的 capture，外层不会被内层提前关掉。
-        self.xdPhaseEnd(g.*);
-        g.ptr = null;
+        if (!self.gpuReady() or slot >= self.g_slots.len) return;
+        if (!graphWanted() or !xdWanted()) return;
+        const s = self.gs(slot);
+        if (s.xd_gexec) |e| {
+            if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
+            s.xd_gexec = null;
+        }
+        s.xd_launched = false;
+        s.xd_phase = .rec;
+        _ = self.xdStartCapture(s);
+    }
+
+    /// `VTable.endRecord`：关 capture + instantiate。**只做这两件事**。
+    fn dEndRecord(ctx: *anyopaque, slot: u8) void {
+        const self = self_(ctx);
+        if (!self.gpuReady() or slot >= self.g_slots.len) return;
+        const s = self.gs(slot);
+        if (!s.xd_capturing) return;
+        self.xdFinishCapture(s);
+    }
+
+    /// `VTable.publishCtl`：本步标量一次 H2D。必须在 capture 之外、launch 之前。
+    fn dPublishCtl(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) void {
+        const self = self_(ctx);
+        _ = slot;
+        if (!self.gpuReady()) return;
+        // 引擎已经把采样字段填进 `ctl`（`GraphCtlBuilder`），所以这里不能再让
+        // `publishCtl` 用 `sample_sp` 覆盖它 —— 那个指针可能是上一步的。
+        _ = self.publishCtlRaw(ctl, null, true);
+    }
+
+    /// `VTable.launch`：纯 `GraphLaunch`，外加与默认流的排序。
+    fn dLaunch(ctx: *anyopaque, slot: u8) void {
+        const self = self_(ctx);
+        if (!self.gpuReady() or slot >= self.g_slots.len) return;
+        const s = self.gs(slot);
+        if (s.xd_gexec == null) return;
+        _ = self.xdReplay(s);
     }
 
     /// 图关闭之后取回本步 `sample` 写进设备控制块的那个 id。
@@ -7966,8 +7879,11 @@ pub const vtable = backend.Exec.VTable{
     .profPhase = CudaBackend.dProfPhase,
     .profReset = CudaBackend.dProfReset,
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
-    .graphBegin = CudaBackend.dGraphBegin,
-    .graphEnd = CudaBackend.dGraphEnd,
+    .hasGraph = CudaBackend.dHasGraph,
+    .beginRecord = CudaBackend.dBeginRecord,
+    .endRecord = CudaBackend.dEndRecord,
+    .publishCtl = CudaBackend.dPublishCtl,
+    .launch = CudaBackend.dLaunch,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .profReport = CudaBackend.dProfReport,

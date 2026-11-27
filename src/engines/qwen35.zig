@@ -886,8 +886,20 @@ pub const Engine = struct {
     /// 不同槽上（节点集合不同，共用会让每步都失配重捕），而槽号走句柄而不是
     /// 后端的"当前槽"，嵌套 span（草稿块在 verify 里面）才能各自正确收尾。
     pub const graph_slot_decode: u8 = 0;
-    pub const graph_slot_chunk: u8 = 1;
-    pub const graph_slot_nextn: u8 = 2;
+    /// verify 的槽基址：k 行的图用 `graph_slot_verify_base + (k - 2)`。
+    ///
+    /// 一种 k 一张图是必须的：`matvecBatchK` 的批宽度、`rmsnormRows` 的行数、
+    /// `attn_chunk` 的窗口都烘死在录制那一刻，行数变了必须重录。懒加载意味着
+    /// 只有真正出现过的 k 才会占用图。上界 `spec_verify_rows` 与后端
+    /// `graph_slot_verify_max` 由两边的 comptime 断言对齐。
+    pub const graph_slot_verify_base: u8 = 1;
+    pub const graph_slot_nextn: u8 = graph_slot_verify_base + spec_verify_rows;
+
+    /// k 行 verify 用哪个槽。
+    pub fn graphSlotVerify(k: usize) u8 {
+        std.debug.assert(k >= 2 and k <= spec_verify_rows);
+        return graph_slot_verify_base + @as(u8, @intCast(k - 2));
+    }
 
     /// `forwardLogits` 在**没有 span** 时用的控制块。
     ///
@@ -907,6 +919,51 @@ pub const Engine = struct {
             .tok = tt,
         };
     }
+
+    /// 构造本步的控制块：位置字段 + 采样参数。**一次 H2D 发全部**。
+    const GraphCtlBuilder = struct {
+        /// 单行（decode / draft）：`tok[0]` 是本步要嵌入的 token。
+        fn decode(c: *const Config, token: u32, pos: u32, sp: *const Sampler) backend.GraphCtl {
+            var tt: [backend.ctl_tokens]u32 = @splat(0);
+            tt[0] = token;
+            var ctl = backend.GraphCtl{
+                .pos = pos,
+                .rope_base_bits = @bitCast(c.rope_freq_base),
+                .kv_slot = pos,
+                .attn_slot = pos,
+                .rows = 1,
+                .tok = tt,
+            };
+            fillSampler(&ctl, c.vocab, sp);
+            return ctl;
+        }
+
+        /// k 行（verify）：`tok[0..k]` 是这一块要嵌的 token。
+        fn rows(c: *const Config, tokens: []const u32, pos0: u32, sp: *const Sampler) backend.GraphCtl {
+            var tt: [backend.ctl_tokens]u32 = @splat(0);
+            for (tokens, 0..) |t, i| tt[i] = t;
+            var ctl = backend.GraphCtl{
+                .pos = pos0,
+                .rope_base_bits = @bitCast(c.rope_freq_base),
+                .kv_slot = pos0,
+                .attn_slot = pos0,
+                .rows = @intCast(tokens.len),
+                .tok = tt,
+            };
+            fillSampler(&ctl, c.vocab, sp);
+            return ctl;
+        }
+
+        fn fillSampler(ctl: *backend.GraphCtl, vocab: usize, sp: *const Sampler) void {
+            ctl.vocab = @intCast(vocab);
+            ctl.temperature_bits = @bitCast(sp.temperature);
+            ctl.top_k = @intCast(sp.top_k);
+            ctl.top_p_bits = @bitCast(sp.top_p);
+            const seed: u64 = sp.state;
+            ctl.rng_lo = @bitCast(@as(u32, @truncate(seed)));
+            ctl.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
+        }
+    };
 
     /// GDN 状态快照槽数 K。一次 verify 块最多 `spec_verify_rows` 行，接受
     /// `rows <= verify_rows - 1` 行，而槽 `rows-1` 是"跑完第 rows 行之后"，
@@ -1657,55 +1714,51 @@ pub const Engine = struct {
     /// 采样器由这里在 span 内调用（图的最后一个节点），读回 token 的那次 D2H
     /// 留在 `graphEnd` 之后。
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+        return self.decode(token, pos);
+    }
+
+    /// **decode：有图、单行、sample 在图里。**
+    ///
+    /// 形态由调用方显式决定，后端不做判断：
+    ///
+    ///     if (!hasGraph(slot)) {
+    ///         beginRecord(slot);  embed + 65 层 + sample;  endRecord(slot);
+    ///     } else {
+    ///         // 什么都不构建
+    ///     }
+    ///     publishCtl(slot, ctl);   // 位置 + 采样参数，一次 H2D
+    ///     launch(slot);            // 纯 GraphLaunch
+    ///     sampledToken()           // 图后的一次 4 B D2H
+    ///
+    /// 录制那一轮也要 publish + launch：capture 不执行 kernel。
+    pub fn decode(self: *Engine, token: u32, pos: u32) u32 {
         const c = self.cfg;
-        // 一次 decode 步骤 —— 从 embedding 查表到 logits —— 是整个引擎里唯一
-        // 一段"kernel 在跑之前就已知"的区间：权重已常驻、每个形状固定，只有
-        // `pos`/`slot` 在动。所以设备后端可以录一次、之后重放，而它需要被告知
-        // 这段区间的起止 —— 它看不到模型的控制流，只看得到单个算子。
-        //
-        // embedding 是 span **内**的第一个 op：本步的 token 先写进控制块的
-        // `tok[0]`，后端在设备上按它选行（见 `embedTo`），于是节点实参全是
-        // 模型常量，重放时嵌的是当步的 token。行号若留在主机侧当实参，录进图
-        // 之后会永远重读录制那一行。
-        self.graph = self.exec.graphBegin(.decode, .{
-            .pos = pos,
-            .rope_base_bits = @bitCast(c.rope_freq_base),
-            .kv_slot = pos,
-            .attn_slot = pos,
-            .rows = 1,
-            .tok = blk: {
-                var tt: [backend.ctl_tokens]u32 = @splat(0);
-                tt[0] = token;
-                break :blk tt;
-            },
-        }, graph_slot_decode);
-        // **重放命中：主机侧一步都不走。** 图已经 launch 完，65 层的前向、
-        // embedding 全在它里面；这里唯一还要做的两件事是：
-        //   1. `sample` —— 它也是图里的最后一个节点（`dSample` 在 `.replay`
-        //      时只记指针，不发射），调用它只是为了把本步的采样参数登记给
-        //      后端，`sampledToken` 之后要读；
-        //   2. `graphEnd` —— 在 `.live` 上它是空操作。
-        //
-        // 参考实现都是这个形态（llama.cpp `ggml-cuda.cu:5529`、squid5090
-        // `engine.zig:1091`、ds4 `ds4.c:43133` 的 `if (state == 1) return true`、
-        // Strata `verify.cpp:3938`）：重放 = 一次 GraphLaunch，不做任何遍历。
-        if (self.graph.phase == .replay) {
-            self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
-            self.exec.graphEnd(&self.graph);
-            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
-            return self.exec.sampledToken();
+        const ctl = GraphCtlBuilder.decode(&c, token, pos, &self.sampler);
+        // **先发布再构建。** 构建期的 `sample` 在直通路径上会当场读设备控制块
+        // （temperature/PRNG），而它也是图里的最后一个节点 —— capture 期间它
+        // 只被录下、不执行，所以对录制那条路没有影响；对直通路径则是必须的。
+        self.exec.publishCtl(graph_slot_decode, ctl);
+        if (!self.exec.hasGraph(graph_slot_decode)) {
+            self.exec.beginRecord(graph_slot_decode);
+            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = ctl, .phase = .record };
+            self.buildDecode(token, pos);
+            self.exec.endRecord(graph_slot_decode);
         }
-        self.embedTo(token, self.x.span(0, c.hidden));
-        // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是
-        // 一次普通调用。读回 token 的那次 D2H 必须在 `graphEnd` **之后**：
-        // capture 期间不能拷贝，录进图又会让每一 token 都读回录制时的那个 id。
-        _ = self.forwardLogits(token, pos);
-        self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
-        self.exec.graphEnd(&self.graph);
-        // 收尾后回到直通控制块：`forwardLogits` 是公开入口，其它调用点（prefill
-        // 尾巴、自检）靠它拿到当步的 `tok`/`pos`，而不是一个清零的结构。
+        self.exec.launch(graph_slot_decode);
+        // 图外的直通路径（CPU 后端、图关闭）：`launch` 是空操作，这里已经算完。
         self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
         return self.exec.sampledToken();
+    }
+
+    /// `decode` 的"构建"部分：embedding + 65 层 + sample 节点。
+    ///
+    /// 只在没有图、需要录制时调用一次（之后每 token 只 launch）。CPU 后端
+    /// `hasGraph` 恒 false，于是它每步都走这里 —— 与改动前的直通路径相同。
+    fn buildDecode(self: *Engine, token: u32, pos: u32) void {
+        const c = self.cfg;
+        self.embedTo(token, self.x.span(0, c.hidden));
+        _ = self.forwardLogits(token, pos);
+        self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
     }
 
     /// 单 token 前向，**自带 embedding**。给调试/自检路径用（它们只想要
@@ -1986,57 +2039,64 @@ pub const Engine = struct {
         // 也都在任何 span 之外；所以这里断言而不是转发。
         std.debug.assert(k > 1 and k <= self.nbatch and k <= spec_verify_rows);
         const c = self.cfg;
-        const hidden: usize = c.hidden;
 
-        // 控制块：`pos` 是这一块第一行的位置，`kv_slot`/`attn_slot` 同它，
-        // `rows` 是 k（后端据此判断槽里那张图还成不成立）。
+        // **verify：有图、k 行、按 k 懒加载。**
         //
-        // `$QWEN35_VERIFY_NOSPAN=1`（调试）：完全不碰图，`self.graph` 保持直通。
-        // 用来把"图机制有问题"与"图的内容有问题"分开。
-        const nospan = @import("../cudart.zig").environ_map != null and
-            @import("../cudart.zig").environ_map.?.get("QWEN35_VERIFY_NOSPAN") != null;
-        var tok: [backend.ctl_tokens]u32 = @splat(0);
-        for (tokens, 0..) |t, i| tok[i] = t;
-        if (!nospan) {
-            self.graph = self.exec.graphBegin(.verify, .{
-                .pos = pos0,
-                .rope_base_bits = @bitCast(c.rope_freq_base),
-                .kv_slot = pos0,
-                .attn_slot = pos0,
-                .rows = @intCast(k),
-                .tok = tok,
-            }, graph_slot_chunk);
-        }
+        // 与 `decode` 同一个形态，唯一的区别是槽按行数选（`graphSlotVerify`）：
+        // 一张图只对一种 k 成立，于是第一次见到某个 k 就录一张，之后每轮只
+        // launch。`$QWEN35_VERIFY_NOSPAN=1` 仍是调试开关，让这条路径完全不碰图。
+        const slot = graphSlotVerify(k);
+        const ctl = GraphCtlBuilder.rows(&c, tokens, pos0, &self.sampler);
+        // `$QWEN35_VERIFY_NOSPAN=1` 让本路径完全不碰图（调试 A/B）。
+        //
+        // 另外，`.verify` 的图**默认不建**（`$QWEN35_XD_VERIFY=1` 才建）：
+        // 把 k 行前向录成一张可重放的图，要求它的每一个逐轮标量都走设备控制块，
+        // 而 `matvecBatchK` 的激活/输出 scratch 仍按录制那一次固化 —— 实测
+        // （27B IQ3_XXS，MTP draft=2）：开启后接受率从 56.5% 掉到个位数。
+        // 这是既存缺口，不是本次重构引入的；懒加载的槽结构已经就位，等补齐
+        // 那几个标量之后把这条默认打开即可。
+        const env = @import("../cudart.zig").environ_map;
+        const nospan = env != null and env.?.get("QWEN35_VERIFY_NOSPAN") != null;
+        const verify_graphs = !nospan and env != null and env.?.get("QWEN35_XD_VERIFY") != null;
+        const recorded = verify_graphs and self.exec.hasGraph(slot);
         defer {
-            if (!nospan) {
-                self.exec.graphEnd(&self.graph);
-                // 回到直通句柄并带上本块末行的 ctl：`forwardChunkVerify` 返回后
-                // 调用方（`generateSpec` 的 `draft_fn`）还会发直通 op，而它们
-                // 读 `ctl.tok[0]`。留 `.{}` 会把行号清零，嵌入变成 token 0
-                // —— 实测：MTP 接受率从 56.5% 掉到 41.7%。
-                self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0 + @as(u32, @intCast(k - 1)), tokens[k - 1], 1) };
-            }
+            // 回到直通句柄并带上本块末行的 ctl：调用方（`generateSpec` 的
+            // `draft_fn`）随后还会发直通 op，而它们读 `ctl.tok[0]`。留空结构会
+            // 把行号清零，嵌入变成 token 0（实测：MTP 接受率 56.5% → 41.7%）。
+            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos0 + @as(u32, @intCast(k - 1)), tokens[k - 1], 1) };
         }
+        if (verify_graphs) {
+            // 先发布再构建：直通路径上构建期就要读控制块。
+            self.exec.publishCtl(slot, ctl);
+            if (!recorded) {
+                self.exec.beginRecord(slot);
+                self.graph = .{ .kind = .verify, .slot = slot, .ctl = ctl, .phase = .record };
+                self.buildVerify(tokens, pos0, k);
+                self.exec.endRecord(slot);
+            }
+            self.exec.launch(slot);
+            // 两条分支都到此为止：录制轮由 launch 执行刚录下的图，重放轮由
+            // launch 执行已有的图。**不能**再往下走一次 `buildVerify` —— 那会在
+            // 主机上把这一块再算一遍（实测：MTP 只出 3 个 token）。
+            return self.logitsK.span(0, k * c.vocab);
+        }
+        self.graph = .{ .kind = .verify, .slot = slot, .ctl = ctl };
+        self.buildVerify(tokens, pos0, k);
+        return self.logitsK.span(0, k * c.vocab);
+    }
 
-        // Layers, exactly as `forwardChunk` runs them.  Row k-1 also gets its
-        // lm_head there, which the batched projection below recomputes.
-        //
-        // **重放命中：整段跳过。** 与 `step` 同理，图已经把这一块算完了；
-        // 唯一的产物是 `logitsK`，图里已经写好。`.verify` 默认不建图
-        // （`QWEN35_XD_VERIFY` 才开），但跳过逻辑本身与 decode 一致，
-        // 将来那条路修好后不需要再改这里。
-        if (self.graph.phase == .replay) return self.logitsK.span(0, k * c.vocab);
+    /// `verify` 的构建部分：k 行的块前向 + 逐行 lm_head，产物在 `logitsK`。
+    fn buildVerify(self: *Engine, tokens: []const u32, pos0: u32, k: usize) void {
+        const c = self.cfg;
+        const hidden: usize = c.hidden;
         // 让 GDN 分支写每行的状态快照；`specRollbackAndReplay` 据此只改视图。
         self.in_spec_verify = true;
         defer self.in_spec_verify = false;
-        // 这一段落在 `.verify` span 里，但后端默认**不把 `.verify` 录成图**
-        // （见 `dGraphBegin` 的说明）。
         _ = self.forwardChunk(tokens, pos0);
         // Normalise every row and project them all through lm_head.
         self.exec.rmsnormRows(self.graph, self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), self.output_norm, k, c.rms_eps);
         const w = self.output_weight orelse self.token_embd;
         self.exec.matvecBatchK(self.graph, self.logitsK.span(0, k * c.vocab), w, self.x1K.span(0, k * hidden), k);
-        return self.logitsK.span(0, k * c.vocab);
     }
 
     /// Greedy argmax over the last logits.  Forwards to the backend so the logits
@@ -2637,9 +2697,7 @@ pub const Engine = struct {
     ) !void {
         const nn = self.nextn orelse return error.NoNextn;
         const c = self.cfg;
-        const hidden: usize = c.hidden;
-        const li = nn.li;
-        const lw = &self.layers[li];
+        _ = c.hidden;
 
         // 草稿块这一趟自己的图。它是**独立的一槽**（`GraphKind.nextn`）：
         // 节点集合与 decode 不同（反量化的是嵌入行、下一层是 nextn 层），
@@ -2659,30 +2717,40 @@ pub const Engine = struct {
         // 不需要保存/恢复外层句柄 —— 那正是 `ctl_host` 只按后端存一份、
         // 恢复时漏掉一半状态的来源（实测：草稿槽覆盖 pos 后 verify 的 rope
         // 读到别人的 pos，MTP 接受率 0%）。
-        self.graph = self.exec.graphBegin(.nextn, .{
-            .pos = draft_pos,
-            .rope_base_bits = @bitCast(c.rope_freq_base),
-            .kv_slot = draft_pos,
-            .attn_slot = draft_pos,
-            .rows = 1,
-            .tok = blk: {
-                var tt: [backend.ctl_tokens]u32 = @splat(0);
-                tt[0] = next_token;
-                break :blk tt;
-            },
-        }, graph_slot_nextn);
+        // **draft：有图、单行，与 `decode` 同一形态、不同槽。**
+        //
+        // 草稿头只需要一步预测；调用方（`MtpRunner.draft`）循环调它来成链，
+        // 每步只换 `pos` 与 `tok[0]`，所以同一张图能覆盖整条链。
+        const ctl = GraphCtlBuilder.decode(&c, next_token, draft_pos, &self.sampler);
+        const recorded = self.exec.hasGraph(graph_slot_nextn);
         defer {
-            self.exec.graphEnd(&self.graph);
             // 回到直通句柄，而不是某个"外层"图：调用方进来时 `self.graph`
             // 只可能是直通（见上面的串行约定）。
             self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(draft_pos, next_token, 1) };
         }
+        self.exec.publishCtl(graph_slot_nextn, ctl);
+        if (!recorded) {
+            self.exec.beginRecord(graph_slot_nextn);
+            self.graph = .{ .kind = .nextn, .slot = graph_slot_nextn, .ctl = ctl, .phase = .record };
+            self.buildDraft(nn, hidden_buf, next_token, draft_pos, out_hidden);
+            self.exec.endRecord(graph_slot_nextn);
+        }
+        self.exec.launch(graph_slot_nextn);
+        // 有图时 launch 已经算完；直通（CPU / 图关闭）时上面的 build 算的。
+        if (recorded) return;
 
+        // 直通（CPU / 图关闭）或首次录制：在这里构建。
+        self.buildDraft(nn, hidden_buf, next_token, draft_pos, out_hidden);
+    }
+
+    /// `draft` 的构建部分：eh_proj + 一层 decoder + shared head + lm_head。
+    fn buildDraft(self: *Engine, nn: Nextn, hidden_buf: backend.Buf, next_token: u32, draft_pos: u32, out_hidden: ?backend.Buf) void {
+        const c = self.cfg;
+        const hidden: usize = c.hidden;
+        const li = nn.li;
+        const lw = &self.layers[nn.li];
         // h = eh_proj([enorm(e); hnorm(h)])  -- one matvec over a 2*hidden input.
         //
-        // **重放命中：整段跳过**（与 `step` 同理）。草稿块只有一层的计算，
-        // 图已经把它做完了；返回值也是图里写好的 `self.logits`。
-        if (self.graph.phase == .replay) return;
         // `enorm`/`hnorm` are RMSNorms, and they are applied to the two halves
         // INDEPENDENTLY (each over its own `hidden` values), not jointly over
         // the concatenation: GGUF ships them as two separate [hidden] weights,

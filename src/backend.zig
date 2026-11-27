@@ -715,19 +715,38 @@ pub const Exec = struct {
 
         // ---- explicit compute graph (XG) ------------------------------------
         //
-        // A forward pass is handed to the backend as a `Graph`.  The FIRST time
-        // a given (kind, rows) is seen the backend runs it straight through and
-        // warms its lazy allocations; the second time it RECORDS the calls and
-        // instantiates the graph, then launches it once (so the recorded step
-        // really executes); every later time it replays.  See
-        // `src/graph_registry.zig` for the state machine and plan §1.2.
+        // 录制与重放是**两个显式动作**，不是"每步进来问一次该录还是该放"。
+        // 调用方（`Engine` 的 `decode` / `draft` / `verify`）这样用：
         //
-        // `graphBegin` returns the handle the engine threads through every op of
-        // the pass; `graphEnd` closes it.  A CPU backend returns the
-        // pass-through graph and does nothing on `graphEnd`, so the engine's
-        // code is identical on both.
-        graphBegin: *const fn (ctx: *anyopaque, kind: GraphKind, ctl: GraphCtl, slot: u8) Graph,
-        graphEnd: *const fn (ctx: *anyopaque, g: *Graph) void,
+        //     if (!hasGraph(slot)) {
+        //         beginRecord(slot);      // 开 capture
+        //             ...构建整段前向...   // op 照常发射，CUDA 记录它们
+        //         endRecord(slot);        // 关 capture + instantiate（仅此而已）
+        //     }
+        //     publishCtl(slot, ctl);      // 一次 H2D，位置 + 采样参数
+        //     launch(slot);               // 纯 GraphLaunch
+        //
+        // 录制那一轮同样要 `publishCtl` + `launch`（capture 不执行 kernel，
+        // 不 launch 这一轮就没有任何计算发生），所以两轮走同一段收尾。
+        //
+        // 参照实现都是这个形态：llama.cpp 重放时不进逐节点循环
+        // （`ggml-cuda.cu:5529`），squid5090 两条互斥路径（`engine.zig:1091`），
+        // ds4 的 `if (state == 1) return true`（`ds4.c:43133`），Strata 的
+        // `CapturedGraph::launch`（`graph.cpp:77`）。
+
+        /// 这个槽里是否已有一张可重放的图。
+        hasGraph: *const fn (ctx: *anyopaque, slot: u8) bool,
+        /// 打开 capture。这一轮随后发出的每个 op 都会被录进图；**不执行**。
+        /// 槽里已有一张图时先销毁它（形状变了就必须重录）。
+        beginRecord: *const fn (ctx: *anyopaque, slot: u8) void,
+        /// 关 capture 并 instantiate。**只做这两件事** —— 不发布、不 launch。
+        /// 失败时槽保持"没有图"，随后的 `launch` 是空操作。
+        endRecord: *const fn (ctx: *anyopaque, slot: u8) void,
+        /// 把本步的标量（位置 + 采样参数）一次 H2D 写进设备控制块。
+        /// 必须在 capture **之外**、`launch` **之前**。
+        publishCtl: *const fn (ctx: *anyopaque, slot: u8, ctl: GraphCtl) void,
+        /// 纯 `GraphLaunch`：不判断、不重录、不改节点。
+        launch: *const fn (ctx: *anyopaque, slot: u8) void,
 
         /// The token this step's `sample` produced, valid AFTER `graphEnd`.
         ///
@@ -1017,11 +1036,21 @@ pub const Exec = struct {
     /// `slot` 由调用方指定（同一时刻不同 kind 的图必须落在不同槽），后端只
     /// 原样记进句柄。见 `Graph.slot` 的说明：槽号走句柄而不是后端全局，才能
     /// 让嵌套 span 正确收尾。
-    pub fn graphBegin(self: Exec, kind: GraphKind, ctl: GraphCtl, slot: u8) Graph {
-        return self.vtable.graphBegin(self.ptr, kind, ctl, slot);
+    /// 这个槽里是否已有一张可重放的图（见 `VTable.hasGraph`）。
+    pub fn hasGraph(self: Exec, slot: u8) bool {
+        return self.vtable.hasGraph(self.ptr, slot);
     }
-    pub fn graphEnd(self: Exec, g: *Graph) void {
-        self.vtable.graphEnd(self.ptr, g);
+    pub fn beginRecord(self: Exec, slot: u8) void {
+        self.vtable.beginRecord(self.ptr, slot);
+    }
+    pub fn endRecord(self: Exec, slot: u8) void {
+        self.vtable.endRecord(self.ptr, slot);
+    }
+    pub fn publishCtl(self: Exec, slot: u8, ctl: GraphCtl) void {
+        self.vtable.publishCtl(self.ptr, slot, ctl);
+    }
+    pub fn launch(self: Exec, slot: u8) void {
+        self.vtable.launch(self.ptr, slot);
     }
     /// See `VTable.sampledToken`: valid only after `graphEnd`.
     pub fn sampledToken(self: Exec) u32 {
