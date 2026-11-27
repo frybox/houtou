@@ -295,7 +295,7 @@ fn stubNoCudaKernels() c_int {
 /// `dAddResid` …）在调用 body 之前压入、之后弹回，而不是由"当前 span"全局
 /// 决定 —— 后者在嵌套 span（草稿块在 verify 里面）下会拿错槽。
 ///
-/// 为什么需要它：`graphGate` 只能看到 `Graph.replayed`，而 verify 那段是逐
+/// 为什么需要它：`graphGate` 只看 `Graph.phase`，而 verify 那段是逐
 /// kernel 直发（`replayed == false`）。草稿图重放时它的 op 同样是 `false`，
 /// 必须靠"槽 2 是 `.live`"来抑制，否则草稿的每一步会在主机上再算一遍。
 var xg_cur_slot: u8 = 0;
@@ -319,21 +319,21 @@ fn graphGate(g: backend.Graph) bool {
     if (cudart.getenv("QWEN35_GATEDBG") != null) {
         const st = &g_gate_stat;
         st.calls += 1;
-        if (g.replayed) st.replayed += 1;
+        if (g.phase == .replay) st.replayed += 1;
         st.last_kind = @tagName(g.kind);
-        if (cudart.getenv("QWEN35_GATEDBG").?[0] == '2' and g.replayed) {
+        if (cudart.getenv("QWEN35_GATEDBG").?[0] == '2' and g.phase == .replay) {
             std.debug.print("[gate] REPLAYED kind={s} slot={d}\n", .{ @tagName(g.kind), g.slot });
         }
     }
     // 草稿图：录制期一律照常发射（CUDA 才录得到），重放期按槽位状态抑制。
     if (g.kind == .nextn) {
-        const self = xg_backend orelse return g.replayed;
-        if (xg_cur_slot >= self.g_slots.len) return g.replayed;
+        const self = xg_backend orelse return g.phase == .replay;
+        if (xg_cur_slot >= self.g_slots.len) return g.phase == .replay;
         const s = self.g_slots[xg_cur_slot];
         if (s.xd_capturing) return false;
         if (s.xd_phase == .live) return true;
     }
-    return g.replayed;
+    return g.phase == .replay;
 }
 
 /// 编译期解析的 launcher 表。`cuda_linked` 是 comptime 已知的，所以每个字段都
@@ -2481,13 +2481,13 @@ pub const CudaBackend = struct {
     fn xdPhaseBegin(self: *CudaBackend, g: backend.Graph) backend.Graph {
         const s = self.gs(g.slot);
         const out_node = struct {
-            fn make(gg: backend.Graph, ss: *GraphSlot, replayed: bool) backend.Graph {
+            fn make(gg: backend.Graph, ss: *GraphSlot, phase: backend.Phase) backend.Graph {
                 return .{
                     .kind = gg.kind,
                     .ctl = gg.ctl,
                     .slot = gg.slot,
                     .ptr = @ptrCast(ss),
-                    .replayed = replayed,
+                    .phase = phase,
                 };
             }
         }.make;
@@ -2513,11 +2513,11 @@ pub const CudaBackend = struct {
         switch (s.xd_phase) {
             .off => return g,
             .rec => {
-                // 直通图：capture 期 op 必须照常发射，CUDA 才会记录它们；
-                // 若返回带 ptr 的图，`graphGate` 会把每次发射都跳过，图就是空的。
-                if (s.xd_capturing) return out_node(g, s, false);
+                // 录制期：op 必须照常发射，CUDA 才录得到。`phase = .record`
+                // 因此**不**抑制任何发射，它只是告诉引擎"这一轮是在建图"。
+                if (s.xd_capturing) return out_node(g, s, .record);
                 if (!self.xdStartCapture(s)) return g;
-                return out_node(g, s, false);
+                return out_node(g, s, .record);
             },
             .live => {
                 // `$QWEN35_XD_NOREPLAY=1`：每一步都重新录制而不是重放。调试用，
@@ -2529,19 +2529,20 @@ pub const CudaBackend = struct {
                     }
                     s.xd_phase = .rec;
                     if (!self.xdStartCapture(s)) return g;
-                    return out_node(g, s, false);
+                    return out_node(g, s, .record);
                 }
                 if (!self.xdReplay(s)) {
                     // 重放失败后**不能**退回主机侧直接发射：图可能已经执行
                     // （状态被推进一次），重跑整步会把状态推进两次。所以只有
                     // "图没启动"这一种失败允许降级；见 `xd_launched`。
                     s.xd_phase = .off;
-                    if (s.xd_launched) return out_node(g, s, true);
+                    // 图已经跑过：本步的活它做完了，引擎必须按重放处理
+                    // （跳过整段构建），否则会在默认流上把整步再算一遍。
+                    if (s.xd_launched) return out_node(g, s, .replay);
                     return g;
                 }
-                // `.replayed = true` 是抑制主机侧发射的唯一依据：图的每一个节点
-                // 都会在本步执行，主机再发一遍就是在默认流上把整步算第二次。
-                return out_node(g, s, true);
+                // `.replay`：图已经 launch，主机侧**不要再构建任何东西**。
+                return out_node(g, s, .replay);
             },
         }
     }
@@ -5158,7 +5159,7 @@ pub const CudaBackend = struct {
         // 进设备控制块（见 `dGraphBegin`）。这里**什么都不能再写** —— 尤其不能
         // 再 `publishSampleCtl`，那条路径会把控制块整体重置，正好覆盖图刚写下的
         // `CTL_FLAGS` 与 `CTL_TOKEN_OUT`（实测：重放后 token 永远读回 0）。
-        if (g.replayed) {
+        if (g.phase == .replay) {
             self.sample_sp = sp;
             self.sample_vocab = logits.len;
             return 0;

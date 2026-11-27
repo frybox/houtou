@@ -1679,6 +1679,22 @@ pub const Engine = struct {
                 break :blk tt;
             },
         }, graph_slot_decode);
+        // **重放命中：主机侧一步都不走。** 图已经 launch 完，65 层的前向、
+        // embedding 全在它里面；这里唯一还要做的两件事是：
+        //   1. `sample` —— 它也是图里的最后一个节点（`dSample` 在 `.replay`
+        //      时只记指针，不发射），调用它只是为了把本步的采样参数登记给
+        //      后端，`sampledToken` 之后要读；
+        //   2. `graphEnd` —— 在 `.live` 上它是空操作。
+        //
+        // 参考实现都是这个形态（llama.cpp `ggml-cuda.cu:5529`、squid5090
+        // `engine.zig:1091`、ds4 `ds4.c:43133` 的 `if (state == 1) return true`、
+        // Strata `verify.cpp:3938`）：重放 = 一次 GraphLaunch，不做任何遍历。
+        if (self.graph.phase == .replay) {
+            self.sampled = self.exec.sample(self.graph, self.logits, self.sample_scratch, &self.sampler);
+            self.exec.graphEnd(&self.graph);
+            self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = self.directCtl(pos, token, 1) };
+            return self.exec.sampledToken();
+        }
         self.embedTo(token, self.x.span(0, c.hidden));
         // 采样器在区间**之内**运行（图的最后一个节点）；对 CPU 后端来说它只是
         // 一次普通调用。读回 token 的那次 D2H 必须在 `graphEnd` **之后**：
@@ -2004,6 +2020,12 @@ pub const Engine = struct {
 
         // Layers, exactly as `forwardChunk` runs them.  Row k-1 also gets its
         // lm_head there, which the batched projection below recomputes.
+        //
+        // **重放命中：整段跳过。** 与 `step` 同理，图已经把这一块算完了；
+        // 唯一的产物是 `logitsK`，图里已经写好。`.verify` 默认不建图
+        // （`QWEN35_XD_VERIFY` 才开），但跳过逻辑本身与 decode 一致，
+        // 将来那条路修好后不需要再改这里。
+        if (self.graph.phase == .replay) return self.logitsK.span(0, k * c.vocab);
         // 让 GDN 分支写每行的状态快照；`specRollbackAndReplay` 据此只改视图。
         self.in_spec_verify = true;
         defer self.in_spec_verify = false;
@@ -2658,6 +2680,9 @@ pub const Engine = struct {
 
         // h = eh_proj([enorm(e); hnorm(h)])  -- one matvec over a 2*hidden input.
         //
+        // **重放命中：整段跳过**（与 `step` 同理）。草稿块只有一层的计算，
+        // 图已经把它做完了；返回值也是图里写好的 `self.logits`。
+        if (self.graph.phase == .replay) return;
         // `enorm`/`hnorm` are RMSNorms, and they are applied to the two halves
         // INDEPENDENTLY (each over its own `hidden` values), not jointly over
         // the concatenation: GGUF ships them as two separate [hidden] weights,

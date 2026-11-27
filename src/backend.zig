@@ -210,6 +210,21 @@ comptime {
     std.debug.assert(@alignOf(GraphCtl) == 4);
 }
 
+/// 一次前向在设备后端眼里的三种形态。这是**显式**的阶段，引擎直接据它分支，
+/// 不再靠"每个 op 自己查 `replayed` 再决定要不要发射"。
+///
+/// 参照 ds4 的 `ds4_gpu_decode_graph_begin()` 返回值：`-1` 直发、`0` 录制、
+/// `1` 重放命中。关键在 `replay` 这一态的用法 —— 调用方看到它应当**直接跳过
+/// 整段构建**，而不是把构建照跑一遍再让每个 op 空转返回。
+pub const Phase = enum {
+    /// 没有图：每个 op 照常发射。CPU 后端、prefill、图关闭时都是它。
+    direct,
+    /// 本步正在被录入一张图：op 必须照常发射，CUDA 才录得到。
+    record,
+    /// 本步已由图重放完成：**主机侧不要再构建任何东西**。
+    replay,
+};
+
 /// A forward pass being recorded, replayed, or run straight through.
 ///
 /// `ptr == null` is the **pass-through** graph: every op behaves exactly as it
@@ -221,11 +236,13 @@ pub const Graph = struct {
     ptr: ?*anyopaque = null,
     kind: GraphKind = .decode,
     ctl: GraphCtl = .{},
-    /// True when THIS step's work is being carried out by a graph replay, so the
-    /// host must not issue the same launches again.  False while recording: the
-    /// launches are what the capture records.  A backend that has no graph
-    /// (the CPU one) always leaves it false, so every op runs normally.
-    replayed: bool = false,
+    /// 本步是直发 / 正在录制 / 已重放。引擎据它**跳过整段构建**（见 `Phase`）。
+    ///
+    /// 历史：这里原来是一个 `replayed: bool`，每个 op 调 `graphGate(g)` 判断
+    /// "要不要发射"。那让重放仍然要跑完整段前向 —— 65 层、约 2000 次 vtable
+    /// 分派，全部空转。四个参考实现（llama.cpp / squid5090 / ds4 / Strata）都是
+    /// 重放时主机侧只 `GraphLaunch` 一次，不做任何遍历。
+    phase: Phase = .direct,
     /// Backend-defined slot index for this graph, carried **by the handle**
     /// rather than looked up from a "current graph" global.
     ///
