@@ -738,7 +738,14 @@ pub const Exec = struct {
         hasGraph: *const fn (ctx: *anyopaque, slot: u8) bool,
         /// 打开 capture。这一轮随后发出的每个 op 都会被录进图；**不执行**。
         /// 槽里已有一张图时先销毁它（形状变了就必须重录）。
-        beginRecord: *const fn (ctx: *anyopaque, slot: u8) void,
+        ///
+        /// 返回本步的 `Graph` 句柄：`phase = .record`，且 `ptr` 指向后端为该槽
+        /// 保存的状态。**调用方必须把它赋给 `Engine.gctx`** —— 各 op 用
+        /// `g.ptr != null` 判断"我是不是在图里"（例如 `dequantRow` 走设备行号
+        /// 还是主机行号）。早先这里返回 void、引擎自己拼了一个 `ptr == null`
+        /// 的句柄，于是所有 op 都以为自己在直通路径上，嵌入行号被固化成了
+        /// 录制那一轮的值。
+        beginRecord: *const fn (ctx: *anyopaque, slot: u8, ctl: GraphCtl) Graph,
         /// 关 capture 并 instantiate。**只做这两件事** —— 不发布、不 launch。
         /// 失败时槽保持"没有图"，随后的 `launch` 是空操作。
         endRecord: *const fn (ctx: *anyopaque, slot: u8) void,
@@ -1043,8 +1050,8 @@ pub const Exec = struct {
     pub fn hasGraph(self: Exec, slot: u8) bool {
         return self.vtable.hasGraph(self.ptr, slot);
     }
-    pub fn beginRecord(self: Exec, slot: u8) void {
-        self.vtable.beginRecord(self.ptr, slot);
+    pub fn beginRecord(self: Exec, slot: u8, ctl: GraphCtl) Graph {
+        return self.vtable.beginRecord(self.ptr, slot, ctl);
     }
     pub fn endRecord(self: Exec, slot: u8) void {
         self.vtable.endRecord(self.ptr, slot);

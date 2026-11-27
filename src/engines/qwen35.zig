@@ -1747,8 +1747,7 @@ pub const Engine = struct {
         self.exec.publishCtl(graph_slot_decode, ctl);
         const recorded = self.exec.hasGraph(graph_slot_decode);
         if (!recorded) {
-            self.exec.beginRecord(graph_slot_decode);
-            self.gctx = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = ctl, .phase = .record };
+            self.gctx = self.exec.beginRecord(graph_slot_decode, ctl);
             self.buildDecode(token, pos);
             self.exec.endRecord(graph_slot_decode);
         }
@@ -2083,8 +2082,7 @@ pub const Engine = struct {
             // 先发布再构建：直通路径上构建期就要读控制块。
             self.exec.publishCtl(slot, ctl);
             if (!recorded) {
-                self.exec.beginRecord(slot);
-                self.gctx = .{ .kind = .verify, .slot = slot, .ctl = ctl, .phase = .record };
+                self.gctx = self.exec.beginRecord(slot, ctl);
                 self.buildVerify(tokens, pos0, k);
                 self.exec.endRecord(slot);
             }
@@ -2744,8 +2742,7 @@ pub const Engine = struct {
         }
         self.exec.publishCtl(graph_slot_nextn, ctl);
         if (!recorded) {
-            self.exec.beginRecord(graph_slot_nextn);
-            self.gctx = .{ .kind = .nextn, .slot = graph_slot_nextn, .ctl = ctl, .phase = .record };
+            self.gctx = self.exec.beginRecord(graph_slot_nextn, ctl);
             self.buildDraft(nn, hidden_buf, next_token, draft_pos, out_hidden);
             self.exec.endRecord(graph_slot_nextn);
         }

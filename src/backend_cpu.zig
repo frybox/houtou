@@ -1030,9 +1030,9 @@ pub const CpuBackend = struct {
         return false;
     }
 
-    fn vBeginRecord(ctx: *anyopaque, slot: u8) void {
+    fn vBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.Graph {
         _ = ctx;
-        _ = slot;
+        return .{ .kind = .decode, .slot = slot, .ctl = ctl };
     }
 
     fn vEndRecord(ctx: *anyopaque, slot: u8) void {

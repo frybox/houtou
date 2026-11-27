@@ -6697,10 +6697,11 @@ pub const CudaBackend = struct {
 
     /// `VTable.beginRecord`：打开 capture。这一轮随后发出的 op 全部被录进图，
     /// **不执行**。槽里已有旧图时先销毁（形状变了必须重录）。
-    fn dBeginRecord(ctx: *anyopaque, slot: u8) void {
+    fn dBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.Graph {
         const self = self_(ctx);
-        if (!self.gpuReady() or slot >= self.g_slots.len) return;
-        if (!graphWanted() or !xdWanted()) return;
+        const direct = backend.Graph{ .kind = .decode, .slot = slot, .ctl = ctl };
+        if (!self.gpuReady() or slot >= self.g_slots.len) return direct;
+        if (!graphWanted() or !xdWanted()) return direct;
         const s = self.gs(slot);
         if (s.xd_gexec) |e| {
             if (self.cu) |*cu| _ = cu.lib.GraphExecDestroy(e);
@@ -6708,7 +6709,9 @@ pub const CudaBackend = struct {
         }
         s.xd_launched = false;
         s.xd_phase = .rec;
-        _ = self.xdStartCapture(s);
+        if (!self.xdStartCapture(s)) return direct;
+        // `ptr` 必须非空：各 op 用 `g.ptr != null` 判断"我是不是在图里"。
+        return .{ .kind = .decode, .slot = slot, .ctl = ctl, .ptr = @ptrCast(s), .phase = .record };
     }
 
     /// `VTable.endRecord`：关 capture + instantiate。**只做这两件事**。
