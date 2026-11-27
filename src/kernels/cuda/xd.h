@@ -163,7 +163,12 @@ static_assert(offsetof(struct xd_node, derived) == 1200, "xd_node.derived moved"
 #define XD_CTL_ATTN_SLOT 3   // last KV row full attention must cover
 #define XD_CTL_ROWS      4   // rows this step produces
 #define XD_CTL_TOK       5   // 本步各行的嵌入 token id（`XD_CTL_TOKENS` 个）
-#define XD_CTL_INTS      (XD_CTL_TOK + XD_CTL_TOKENS)
+// 采样器的 16 个字段接在嵌入行号之后（见 `sample.cu` 的 `SCTL_BASE`）。
+// 两者是**同一块**常驻缓冲：采样 kernel 是图的最后一个节点，它读的状态和
+// 前 65 层是同一时刻的，由同一次 `publishCtl` 整块写入。
+#define XD_SCTL_BASE     (XD_CTL_TOK + XD_CTL_TOKENS)   // 采样字段的起始下标 = 21
+#define XD_SCTL_INTS     16
+#define XD_CTL_INTS      (XD_SCTL_BASE + XD_SCTL_INTS)  // 整块 = 37
 
 static_assert(sizeof(int) == 4, "the control block is an int32 array");
 

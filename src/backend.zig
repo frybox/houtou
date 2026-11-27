@@ -193,6 +193,38 @@ pub const GraphCtl = extern struct {
     /// 实参，录进图之后重放永远嵌入录制那一轮的行。让行号走控制块、由 kernel
     /// 在设备上读，节点实参才能全是模型常量。`rows` 给出有效前缀，其余填 0。
     tok: [ctl_tokens]u32 = @splat(0),
+
+    // ---- 采样器字段 ----------------------------------------------------
+    //
+    // 原本是另一块常驻缓冲（`SampleCtl`），每步单独一次 H2D。合并进来的理由：
+    // 采样 kernel 是图的**最后一个节点**，它和前面 65 层读的是同一时刻的状态、
+    // 由同一次 `publishCtl` 在 launch 之前整块写好 —— 拆成两次 H2D 只是把
+    // "每步要发的东西"分散到两处，没有任何好处。
+    //
+    // 前一半是输入（每步由主机写），后一半 `token_out`/`rng_out_*`/`flags`
+    // 是 kernel 写回的结果（`dSampledToken` 在 graphEnd 之后读）。
+
+    /// 词表大小（logits 长度）。
+    vocab: i32 = 0,
+    temperature_bits: i32 = 0,
+    top_k: i32 = 0,
+    top_p_bits: i32 = 0,
+    /// 本步 PRNG 状态的起值（由内核推进后写回 `rng_out_*`）。
+    rng_lo: i32 = 0,
+    rng_hi: i32 = 0,
+    /// kernel 写：采样出的 token id。
+    token_out: i32 = 0,
+    rng_out_lo: i32 = 0,
+    rng_out_hi: i32 = 0,
+    /// CDF 二分用的阈值。
+    thresh_bits: i32 = 0,
+    /// kernel 写：`k_plan` 决定的采样路径标志位。
+    flags: i32 = 0,
+    sel_prefix: i32 = 0,
+    sel_mask: i32 = 0,
+    sel_rank: i32 = 0,
+    reserved0: i32 = 0,
+    reserved1: i32 = 0,
 };
 
 /// 每步控制块里嵌入行号数组的长度。与 `src/kernels/cuda/xd.h` 的
@@ -204,11 +236,16 @@ pub const GraphCtl = extern struct {
 pub const ctl_tokens: usize = 16;
 
 comptime {
-    // The device block is a `int32_t[XD_CTL_INTS]` = 5 + XD_CTL_TOKENS = 21.
-    // This must stay in step with `src/kernels/cuda/xd.h`.
-    std.debug.assert(@sizeOf(GraphCtl) == (5 + ctl_tokens) * @sizeOf(i32));
+    // 设备块是 `int32_t[XD_CTL_INTS]` = 5 + XD_CTL_TOKENS + 16 = 37。
+    // 必须与 `src/kernels/cuda/xd.h` 的 `XD_CTL_INTS` 一致。
+    std.debug.assert(@sizeOf(GraphCtl) == (5 + ctl_tokens + 16) * @sizeOf(i32));
     std.debug.assert(@alignOf(GraphCtl) == 4);
 }
+
+/// 采样器字段在控制块里的起始下标（以 int 为单位）。kernel 侧是
+/// `src/kernels/cuda/sample.cu` 的 `SCTL_*`，两边的 comptime / static_assert
+/// 互相钉住。用来给设备指针做 `+ SCTL_BASE` 的偏移算术。
+pub const sctl_base: usize = 5 + ctl_tokens;
 
 /// 一次前向在设备后端眼里的三种形态。这是**显式**的阶段，引擎直接据它分支，
 /// 不再靠"每个 op 自己查 `replayed` 再决定要不要发射"。

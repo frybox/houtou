@@ -92,25 +92,38 @@
 #include "common.cuh"
 #include <math_constants.h>
 
+#include "xd.h"
+
 namespace {
 
-// Control block field indices.  MUST match `SampleCtl` in backend_cuda.zig.
+// Control block field indices.  MUST match `backend.GraphCtl`.
+//
+// 与 `xd.h` 的 `XD_CTL_*` 共用**同一块** `int32_t[]`：前 `XD_CTL_INTS` 个
+// 下标是每步位置/嵌入行号，采样字段从 `SCTL_BASE` 开始往后排。合并的理由是
+// 采样 kernel 就是图的最后一个节点，和前面 65 层读同一时刻的状态、由同一次
+// `publishCtl` 在 launch 之前写 —— 拆成两块缓冲只是让"每步要发的东西"散在
+// 两处。`SCTL_BASE` 与 `backend.zig` 的 `sctl_base` 由 comptime / static_assert
+// 互相钉住。
+
 enum : int {
-    CTL_VOCAB = 0,
-    CTL_TEMPERATURE = 1,
-    CTL_TOP_K = 2,
-    CTL_TOP_P = 3,
-    CTL_RNG_LO = 4,
-    CTL_RNG_HI = 5,
-    CTL_TOKEN_OUT = 6,
-    CTL_RNG_OUT_LO = 7,
-    CTL_RNG_OUT_HI = 8,
-    CTL_THRESH = 9,
-    CTL_FLAGS = 10,
-    CTL_SEL_PREFIX = 11,
-    CTL_SEL_MASK = 12,
-    CTL_SEL_RANK = 13,
-    CTL_INTS = 16,
+    SCTL_BASE = XD_SCTL_BASE,
+    CTL_VOCAB = SCTL_BASE + 0,
+    CTL_TEMPERATURE = SCTL_BASE + 1,
+    CTL_TOP_K = SCTL_BASE + 2,
+    CTL_TOP_P = SCTL_BASE + 3,
+    CTL_RNG_LO = SCTL_BASE + 4,
+    CTL_RNG_HI = SCTL_BASE + 5,
+    CTL_TOKEN_OUT = SCTL_BASE + 6,
+    CTL_RNG_OUT_LO = SCTL_BASE + 7,
+    CTL_RNG_OUT_HI = SCTL_BASE + 8,
+    CTL_THRESH = SCTL_BASE + 9,
+    CTL_FLAGS = SCTL_BASE + 10,
+    CTL_SEL_PREFIX = SCTL_BASE + 11,
+    CTL_SEL_MASK = SCTL_BASE + 12,
+    CTL_SEL_RANK = SCTL_BASE + 13,
+    // 整个块（位置 + 采样）的 int 数。`q35_sample_ctl_ints()` 返回它，
+    // Zig 侧用它核对 `@sizeOf(GraphCtl) / 4`。
+    CTL_INTS = SCTL_BASE + 16,
 };
 
 constexpr int kThreads = 256;
@@ -579,19 +592,14 @@ int q35_sample_ctl_ints(void) { return CTL_INTS; }
 // 侧仍可能拿到陈旧的副本。
 //
 // `d_scratch` 是每次发射的工作区，主机从不碰它。
+// `d_ctl` 现在由调用方（XG 的控制块，`backend.GraphCtl`）提供，这里**只**分配
+// scratch 工作区。传进来的 `d_ctl` 必须已至少 `CTL_INTS` 个 int。
 int q35_launch_sample_init(void **d_ctl, void **d_scratch) {
     if (d_ctl == nullptr || d_scratch == nullptr) return (int)cudaErrorInvalidValue;
-    if (*d_ctl == nullptr) {
-        if (cudaMalloc(d_ctl, (size_t)CTL_INTS * sizeof(int)) != cudaSuccess) {
-            *d_ctl = nullptr;
-            return (int)cudaGetLastError();
-        }
-        cudaMemset(*d_ctl, 0, (size_t)CTL_INTS * sizeof(int));
-    }
+    if (*d_ctl == nullptr) return (int)cudaErrorInvalidValue;
     if (*d_scratch == nullptr) {
         if (cudaMalloc(d_scratch, (size_t)SCRATCH_INTS * sizeof(int)) != cudaSuccess) {
-            cudaFree(*d_ctl);
-            *d_ctl = nullptr;
+            *d_scratch = nullptr;
             return (int)cudaGetLastError();
         }
         cudaMemset(*d_scratch, 0, (size_t)SCRATCH_INTS * sizeof(int));
@@ -599,8 +607,9 @@ int q35_launch_sample_init(void **d_ctl, void **d_scratch) {
     return (int)cudaSuccess;
 }
 
+// 只回收 scratch：`d_ctl` 归调用方（图的控制块）。
 void q35_launch_sample_deinit(void **d_ctl, void **d_scratch) {
-    if (d_ctl && *d_ctl) { cudaFree(*d_ctl); *d_ctl = nullptr; }
+    (void)d_ctl;
     if (d_scratch && *d_scratch) { cudaFree(*d_scratch); *d_scratch = nullptr; }
 }
 

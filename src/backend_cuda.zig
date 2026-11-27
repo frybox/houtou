@@ -1627,17 +1627,15 @@ pub const CudaBackend = struct {
 
     // ---- device sampler (src/kernels/cuda/sample.cu) ------------------------
     //
-    // `d_sample_ctl` is a RESIDENT 64-byte control block holding every
-    // per-token sampler input (temperature, top_k, top_p, PRNG state) plus the
-    // result.  It exists so the sampler can live INSIDE the captured decode
-    // graph: a captured node keeps the parameters it was recorded with, so all
-    // of them have to arrive through memory instead of through `SetParams`.
-    // `d_sample_scratch` is the kernel's working set (histogram, per-block
-    // extrema, the f64 mass), sized once by `q35_sample_scratch_ints()`.
+    // 采样器的每步参数（temperature / top_k / top_p / PRNG / outcome）已经
+    // **并入 `GraphCtl`**（见 `backend.zig` 的 `sctl_base`）：采样 kernel 是图
+    // 的最后一个节点，它读的状态和前面 65 层是同一时刻的，由同一次
+    // `publishCtl` 在 launch 之前整块写好。原先那块独立的 `d_sample_ctl`
+    // 因此删除 —— 拆成两块只让"每步要发的东西"散在两处。
     //
-    // Both are allocated lazily by `ensureSampleBufs` BEFORE any capture opens,
-    // because `cudaMalloc` is illegal inside a capture interval.
-    d_sample_ctl: ?*anyopaque = null,
+    // `d_sample_scratch` 是 kernel 的工作集（直方图、每块极值、f64 质量），
+    // 由 `q35_sample_scratch_ints()` 定尺寸，`ensureSampleBufs` 在**任何**
+    // capture 打开之前分配（capture 内 `cudaMalloc` 非法）。
     d_sample_scratch: ?*anyopaque = null,
     /// Host row for the `$QWEN35_CUDA_SAMPLE_CPU` A/B, grown on demand.
     h_sample_ab: ?[]f32 = null,
@@ -1975,9 +1973,24 @@ pub const CudaBackend = struct {
     /// `{pos, base}` 发布 448 次，所以主机镜像会把第一次之外的都短路掉。
     /// `force` 绕过这个短路（新的一步必须重新发布，即使值碰巧重复 —— 图里
     /// 其它节点可能在 `rope64` 被调用之前就读它们）。
+    /// 把采样参数填进控制块的采样段（`fillSampleCtl` 是纯函数，便于测试）。
+    fn fillSampleCtl(ctl: *backend.GraphCtl, logits_len: usize, sp: *const sampler.Sampler) void {
+        ctl.vocab = @intCast(logits_len);
+        ctl.temperature_bits = @bitCast(sp.temperature);
+        ctl.top_k = @intCast(sp.top_k);
+        ctl.top_p_bits = @bitCast(sp.top_p);
+        const seed: u64 = sp.state;
+        ctl.rng_lo = @bitCast(@as(u32, @truncate(seed)));
+        ctl.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
+    }
+
     fn publishCtl(self: *CudaBackend, ctl: backend.GraphCtl, stream: ?*anyopaque, force: bool) bool {
         _ = stream;
-        if (!force and self.ctl_valid and std.meta.eql(self.ctl_host, ctl)) return true;
+        // 短路只对"完全没有采样器"的调用成立。有采样器时每一步的 PRNG 位置
+        // 都在推进，`ctl` 的比较结果必然不同，所以这里不需要额外加条件；
+        // 但也不能在 `sample_sp != null` 时短路，否则重放的输入永远停在
+        // 第一步（实测：token 全是 0）。
+        if (!force and self.ctl_valid and self.sample_sp == null and std.meta.eql(self.ctl_host, ctl)) return true;
         const p = self.ensureCtl() orelse return false;
         const cu = &(self.cu orelse return false);
         // 一次阻塞 H2D，源是调用栈上的局部结构体。
@@ -1989,13 +2002,18 @@ pub const CudaBackend = struct {
         //
         // 为什么这里不发 kernel：一个 `k_xd_ctl_publish` 节点在 capture 期会被
         // 录进图，重放时把录制那一步的值写回设备（实测 `pos` 每步都退回 17）。
-        const rc = cu.lib.Memcpy(p, @ptrCast(&ctl), @sizeOf(backend.GraphCtl), cudart.MemcpyHostToDevice);
+        // 采样字段与位置字段**同一次**发出去：采样 kernel 是图的最后一个
+        // 节点，它要读的 temperature/PRNG 必须是这一步的。空的 `sample_sp`
+        // （prefill/自检）意味着本步不采样，字段留 0 —— kernel 不会跑。
+        var full = ctl;
+        if (self.sample_sp) |sp| fillSampleCtl(&full, self.sample_vocab, sp);
+        const rc = cu.lib.Memcpy(p, @ptrCast(&full), @sizeOf(backend.GraphCtl), cudart.MemcpyHostToDevice);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("ctl publish", rc);
             return false;
         }
         self.stat_h2d_bytes += @sizeOf(backend.GraphCtl);
-        self.ctl_host = ctl;
+        self.ctl_host = full;
         self.ctl_valid = true;
         return true;
     }
@@ -4988,8 +5006,10 @@ pub const CudaBackend = struct {
     /// "GPU 读到映射内存陈旧副本"这一类问题。
     fn ensureSampleBufs(self: *CudaBackend) bool {
         if (self.cu == null) return false;
-        if (self.d_sample_ctl == null or self.d_sample_scratch == null) {
-            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch);
+        if (self.d_sample_scratch == null) {
+            // 控制块由 `ensureCtl` 拥有（合并后的 GraphCtl），这里只负责 scratch。
+            if (self.ensureCtl() == null) return false;
+            const rc = Launch.sample_init(&self.ctl_dev, &self.d_sample_scratch);
             if (rc != cudart.cudaSuccess) {
                 self.ewLaunchFail("sample init", rc);
                 return false;
@@ -4998,27 +5018,6 @@ pub const CudaBackend = struct {
         return true;
     }
 
-    /// `q35_sample_ctl`（`src/kernels/cuda/sample.cu`）的镜像。字段顺序就是那次
-    /// 64 字节 H2D 的线格式——两边要么一起改，要么都不改。
-    const SampleCtl = extern struct {
-        vocab: c_int = 0,
-        temperature_bits: c_int = 0,
-        top_k: c_int = 0,
-        top_p_bits: c_int = 0,
-        rng_lo: c_int = 0,
-        rng_hi: c_int = 0,
-        token_out: c_int = 0,
-        rng_out_lo: c_int = 0,
-        rng_out_hi: c_int = 0,
-        thresh_bits: c_int = 0,
-        flags: c_int = 0,
-        sel_prefix: c_int = 0,
-        sel_mask: c_int = 0,
-        sel_rank: c_int = 0,
-        reserved0: c_int = 0,
-        reserved1: c_int = 0,
-    };
-
     /// 把这一步的采样参数发布进设备控制块：一次 64 字节 H2D，不发 kernel、
     /// 不做分配。
     ///
@@ -5026,37 +5025,6 @@ pub const CudaBackend = struct {
     /// 一个 token 恰好推进一次（kernel 把推进后的值写回 `rng_out_*`，
     /// `dSample_body` 收集 token 时再把它拷进 `sp.state`）。在这里发布 `state`
     /// 正是"重放的流是接着往下走、而不是从头开始"的原因。
-    fn publishSampleCtl(self: *CudaBackend, logits_len: usize, sp: *const sampler.Sampler, stream: ?*anyopaque) bool {
-        _ = stream;
-        const cu = &(self.cu orelse return false);
-        const d_ctl = self.d_sample_ctl orelse return false;
-        var hc: SampleCtl = .{};
-        hc.vocab = @intCast(logits_len);
-        hc.temperature_bits = @bitCast(sp.temperature);
-        hc.top_k = @intCast(sp.top_k);
-        hc.top_p_bits = @bitCast(sp.top_p);
-        const seed: u64 = sp.state;
-        hc.rng_lo = @bitCast(@as(u32, @truncate(seed)));
-        hc.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
-        // 一 次 64 字节阻塞 H2D，源是栈上的局部结构体。
-        //
-        // 与 `publishCtl` 同理：拷贝的下游就是图 launch（采样 kernel 是图的
-        // 最后一个节点），没有可重叠的工作，用 `MemcpyAsync` 只会强制源内存
-        // 必须 page-locked（那是 `cudaMemcpyAsync` 的 API 要求，不是"拷贝在
-        // GPU 上跑"）。
-        //
-        // 但时机比形态更要紧：这条拷贝必须发生在 capture 打开之前。落在
-        // capture 内会被录成 memcpy 节点，重放时永远用录制那一步的参数；
-        // 落在 `GraphLaunch` 之后又太晚（采样已经跑完）。
-        const rc = cu.lib.Memcpy(d_ctl, @ptrCast(&hc), @sizeOf(SampleCtl), cudart.MemcpyHostToDevice);
-        if (rc != cudart.cudaSuccess) {
-            self.ewLaunchFail("sample ctl publish", rc);
-            return false;
-        }
-        self.stat_h2d_bytes += @sizeOf(SampleCtl);
-        return true;
-    }
-
     /// 把采样 kernel 写进设备常驻块的结果读回主机：token id 与推进后的 PRNG。
     ///
     /// 一次 64 字节阻塞 D2H（一个 cache line）。读回整块而不只读 token id，
@@ -5064,21 +5032,24 @@ pub const CudaBackend = struct {
     /// 从同一个 PRNG 位置继续。
     fn collectSampledToken(self: *CudaBackend, sp: *sampler.Sampler) u32 {
         const cu = &(self.cu orelse return self.sample_token);
-        const d_ctl = self.d_sample_ctl orelse return self.sample_token;
-        var hc: SampleCtl = .{};
-        const rc = cu.lib.Memcpy(@ptrCast(&hc), d_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost);
+        const d_ctl = self.ensureCtl() orelse return self.sample_token;
+        // 只读采样那 16 个 int（偏移 `sctl_base`），不是整块：位置字段是主机
+        // 写的，不需要回读。
+        var hc: [16]i32 = @splat(0);
+        const src: [*]u8 = @ptrCast(@as([*]u8, @ptrCast(d_ctl)) + backend.sctl_base * @sizeOf(i32));
+        const rc = cu.lib.Memcpy(@ptrCast(&hc), src, hc.len * @sizeOf(i32), cudart.MemcpyDeviceToHost);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("sample token download", rc);
             return self.sample_token;
         }
-        self.stat_d2h_bytes += @sizeOf(SampleCtl);
+        self.stat_d2h_bytes += hc.len * @sizeOf(i32);
         // `Sampler.sample` consumes exactly one `nextU64` per non-greedy draw
         // (sampler.zig:120 `nextF32`), and the kernel does the same, so the state
         // it wrote back IS the position the CPU reference would be at.
         if (sp.temperature > 0.0) {
-            sp.state = (@as(u64, @as(u32, @bitCast(hc.rng_out_hi))) << 32) | @as(u32, @bitCast(hc.rng_out_lo));
+            sp.state = (@as(u64, @as(u32, @bitCast(hc[8]))) << 32) | @as(u32, @bitCast(hc[7]));
         }
-        const tok: u32 = @intCast(@as(u32, @bitCast(hc.token_out)));
+        const tok: u32 = @intCast(@as(u32, @bitCast(hc[6])));
         self.sample_token = tok;
         if (self.gpu_ev_on) self.gpuEvReadToken();
         return tok;
@@ -5184,11 +5155,22 @@ pub const CudaBackend = struct {
         // 一个 **memcpy 节点**，重放时把录制那一步的参数写回设备块（实测：
         // `QWEN35_XD_NODES` 报出 1 个 non-kernel 节点，正是它）。参数已由
         // `dGraphBegin` 在图外、图 launch 之前发布好，这里只负责把 kernel 录进去。
-        if (!self.capturing(g) and !self.publishSampleCtl(logits.len, sp, stream)) {
-            return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+        // 参数已经由本步的 `publishCtl` 整块写进控制块（采样字段与位置字段
+        // 同一次 H2D）。这里**不能**再写：capture 期间发出的拷贝会被录成
+        // 节点，重放时把录制那一步的参数写回。
+        //
+        // 但**直通路径**没有人发布过：prefill / 自检 / 图关闭时走的正是这里，
+        // 而采样 kernel 直接从控制块读 temperature/PRNG。所以只在
+        // "没有图活跃"时补这一次（此时没有 capture，写进去就生效）。
+        if (!self.graphActive(g)) {
+            var ctl = self.ctl_host;
+            CudaBackend.fillSampleCtl(&ctl, logits.len, sp);
+            if (!self.publishCtl(ctl, self.launchStream(), true)) {
+                return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
+            }
         }
         const rc = Launch.sample(g,
-            px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,
+            px, @intCast(logits.len), @ptrCast(@alignCast(self.ctl_dev.?)), self.d_sample_scratch, stream,
         );
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("sample", rc);
@@ -6822,13 +6804,7 @@ pub const CudaBackend = struct {
         //
         // 引擎每步传的是同一个 `*Sampler`（`dSample_body` 里记下的
         // `sample_sp`），所以这里拿到的 temperature/top-k/top-p/PRNG 就是当步的。
-        if (self.gs(slot).xd_phase == .live and kind == .decode) {
-            if (self.sample_sp) |sp| {
-                if (self.d_sample_ctl != null) {
-                    _ = self.publishSampleCtl(self.sample_vocab, sp, self.g_stream);
-                }
-            }
-        }
+
         const out = self.xdPhaseBegin(g);
         return out;
     }

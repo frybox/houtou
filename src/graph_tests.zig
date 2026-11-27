@@ -103,9 +103,11 @@ test "GraphCtl is a 64-byte control block" {
 }
 
 test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 保持一致" {
-    // 设备控制块是 `int32_t[XD_CTL_INTS]` = `XD_CTL_TOK(5) + XD_CTL_TOKENS(16)`
-    // = 21。Zig 侧多一个字段就是读写相邻内存，少一个则 `tok` 读不到。
-    try std.testing.expectEqual(@as(usize, 21), @sizeOf(backend.GraphCtl) / 4);
+    // 设备控制块是 `int32_t[XD_CTL_INTS]` =
+    //   `XD_SCTL_BASE(21) + XD_SCTL_INTS(16)` = 37。
+    // 前 21 个是位置/嵌入行号，后 16 个是采样器字段（见 `sctl_base`）。
+    // Zig 侧多一个字段就是读写相邻内存，少一个则某段读不到。
+    try std.testing.expectEqual(@as(usize, 37), @sizeOf(backend.GraphCtl) / 4);
     try std.testing.expectEqual(@as(usize, 4), @alignOf(backend.GraphCtl));
     // 字段顺序即布局：tok 从第 6 个 int（下标 5）开始，是 16 个一组的数组。
     var ctl = backend.GraphCtl{};
@@ -115,6 +117,11 @@ test "backend.GraphCtl 与 xd.h 的 XD_CTL_INTS 保持一致" {
     try std.testing.expectEqual(@as(i32, 12345), ints[5]);
     try std.testing.expectEqual(@as(i32, 678), ints[5 + 15]);
     try std.testing.expectEqual(@as(usize, 16), backend.ctl_tokens);
+    // 采样段紧跟其后：`sctl_base` 必须等于 5 + 16，`token_out` 落在
+    // `sctl_base + 6`（与 sample.cu 的 `CTL_TOKEN_OUT` 同一个事实）。
+    try std.testing.expectEqual(@as(usize, 21), backend.sctl_base);
+    try std.testing.expectEqual(@as(usize, backend.sctl_base * 4), @offsetOf(backend.GraphCtl, "vocab"));
+    try std.testing.expectEqual(@as(usize, (backend.sctl_base + 6) * 4), @offsetOf(backend.GraphCtl, "token_out"));
 }
 
 test "xd.Slot matches xd.h's xd_slot" {
