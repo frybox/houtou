@@ -5055,13 +5055,19 @@ pub const CudaBackend = struct {
             self.sample_vocab = logits.len;
             return 0;
         }
-        // 录制期（草稿块）：这一趟的 f32 logits 常驻在 `d_deq` 里，`dSampledToken`
-        // 在 `graphEnd` 之后要拿它做那次阻塞 D2H。只记指针：它不随步变，也不会
-        // 在 capture 里过期（`graphReserve` 提前把它分配好了）。
+        // 录制期：记下这一步的采样器，`sampledToken` 在图关闭之后要用它推进
+        // PRNG。**只有 `.nextn`（草稿块）才需要 `sample_logits`**：它的采样在
+        // 图里不是 `sample.cu` 的节点（而是 `argmax_batch`），结果得在图外用
+        // CPU 参照从那份 f32 logits 重算。
+        //
+        // decode / verify 的采样 kernel 真的在图里，答案为 `d_ctl` 的
+        // `token_out`。早先这条没有种类判断，decode 录制轮也会走到
+        // `sample_logits` 分支，从 `d_deq`（反量化用的缓冲，不是 logits）读出
+        // 一堆无关数值去采样 —— 实测 `XD=1` 输出 `101850 0 103783 109048…`。
         if (self.graphActive(g) and self.capturing(g)) {
             self.sample_sp = sp;
             self.sample_vocab = logits.len;
-            self.sample_logits = if (dBufPtr(logits) != null) self.d_deq else null;
+            self.sample_logits = if (g.kind == .nextn) (dBufPtr(logits) orelse self.d_deq) else null;
         }
         if (!self.ensureSampleBufs()) {
             return cpu_mod.CpuBackend.vtable.sample(.{}, @ptrCast(&self.cpu), logits, scratch, sp);
@@ -5613,13 +5619,16 @@ pub const CudaBackend = struct {
                     // again here -- `publishCtl` compares against the host
                     // mirror, so the 448 per-head calls cost one launch in
                     // total.
-                    _ = self.publishCtl(.{
-                        .pos = pos,
-                        .rope_base_bits = @bitCast(base),
-                        .kv_slot = self.ctl_host.kv_slot,
-                        .attn_slot = self.ctl_host.attn_slot,
-                        .rows = self.ctl_host.rows,
-                    }, self.launchStream(), false);
+                    // **必须基于 `ctl_host` 整体更新，不能只填 pos/base**：
+                    // `publishCtl` 是整块覆写，漏掉的字段（尤其 `tok[]` 与采样
+                    // 字段）会被清零。实测：这里只填 5 个字段时，`tok[0]` 被抹成
+                    // 0，图里的嵌入节点读到 token 0，`XD=1` 的输出变成
+                    // `101850 103783 103783 109048 101850…`（pos 在推进、结果不随
+                    // 之变化）。
+                    var rope_ctl = self.ctl_host;
+                    rope_ctl.pos = pos;
+                    rope_ctl.rope_base_bits = @bitCast(base);
+                    _ = self.publishCtl(rope_ctl, self.launchStream(), false);
                     const rc = Launch.rope64_dpos(g, px, 1, @intCast(n), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
                         self.stat_rope_devices += 1;
@@ -5682,13 +5691,11 @@ pub const CudaBackend = struct {
         // the captured node reads them fresh on every replay.
         if (self.graphActive(g)) {
             if (self.ensureCtl()) |ctl_dev| {
-                _ = self.publishCtl(.{
-                    .pos = pos,
-                    .rope_base_bits = @bitCast(base),
-                    .kv_slot = self.ctl_host.kv_slot,
-                    .attn_slot = self.ctl_host.attn_slot,
-                    .rows = self.ctl_host.rows,
-                }, self.launchStream(), false);
+                // 同上：整块更新，别把 `tok[]` 与采样字段清零。
+                var rope_ctl = self.ctl_host;
+                rope_ctl.pos = pos;
+                rope_ctl.rope_base_bits = @bitCast(base);
+                _ = self.publishCtl(rope_ctl, self.launchStream(), false);
                 if (dBufPtr(x)) |px| {
                     const rc = Launch.rope64_rows_dpos(g, px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), ctl_dev, self.launchStream());
                     if (rc == cudart.cudaSuccess) {
@@ -6683,6 +6690,8 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         if (!self.gpuReady() or slot >= self.g_slots.len) return false;
         if (!graphWanted() or !xdWanted()) return false;
+        // 调试：强制每次都重录，让"图内容错"与"重放动作错"可分离。
+        if (xdNoReplay()) return false;
         return self.gs(slot).xd_gexec != null;
     }
 
@@ -6719,6 +6728,12 @@ pub const CudaBackend = struct {
         // 引擎已经把采样字段填进 `ctl`（`GraphCtlBuilder`），所以这里不能再让
         // `publishCtl` 用 `sample_sp` 覆盖它 —— 那个指针可能是上一步的。
         _ = self.publishCtlRaw(ctl, null, true);
+        // 阻塞式 `Memcpy` 只是在**主机**上返回；它投递到默认流，而图在
+        // `g_stream` 上跑。``graphSyncFromDefault`` 会用事件把两条流排序，但这里
+        // 再加一道显式同步：实测缺了它时，图读到的是上一步的 `pos`/`tok`
+        // （症状：`XD=1` 的 token 流 `101850 103783 103783 109048 101850…`，
+        // 与 `XD=0` 的 `101850 103783 104145 3709…` 差一位）。
+        if (self.cu) |*cu| _ = cu.lib.StreamSynchronize(null);
     }
 
     /// `VTable.launch`：纯 `GraphLaunch`，外加与默认流的排序。
@@ -6727,7 +6742,27 @@ pub const CudaBackend = struct {
         if (!self.gpuReady() or slot >= self.g_slots.len) return;
         const s = self.gs(slot);
         if (s.xd_gexec == null) return;
+        // 重放路径也要确保流和排序事件都在：`graphSyncFromDefault` 在事件为
+        // null 时**静默 return**，那样控制块的 H2D（默认流）与图（g_stream）
+        // 之间就没有顺序，图会读到上一步的 pos/tok（实测：第 3 个 token 重复
+        // 第 2 个）。
+        if (!self.xdEnsureStream()) return;
         _ = self.xdReplay(s);
+    }
+
+    /// `$QWEN35_XD_NOREPLAY=1`（调试）：每次 `beginRecord` 都强制重录。
+    ///
+    /// 用来把"图的内容错"与"重放这个动作错"分开：如果重录也得到同样的错值，
+    /// 问题就在录制期的节点实参被固化；如果重录正确而重放错，问题在 ctl 刷新
+    /// 或流排序。
+    fn xdNoReplay() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |v| return v;
+        const v = cudart.getenv("QWEN35_XD_NOREPLAY") != null;
+        S.cached = v;
+        return v;
     }
 
     /// 图关闭之后取回本步 `sample` 写进设备控制块的那个 id。

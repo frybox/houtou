@@ -1738,7 +1738,8 @@ pub const Engine = struct {
         // （temperature/PRNG），而它也是图里的最后一个节点 —— capture 期间它
         // 只被录下、不执行，所以对录制那条路没有影响；对直通路径则是必须的。
         self.exec.publishCtl(graph_slot_decode, ctl);
-        if (!self.exec.hasGraph(graph_slot_decode)) {
+        const recorded = self.exec.hasGraph(graph_slot_decode);
+        if (!recorded) {
             self.exec.beginRecord(graph_slot_decode);
             self.graph = .{ .kind = .decode, .slot = graph_slot_decode, .ctl = ctl, .phase = .record };
             self.buildDecode(token, pos);
