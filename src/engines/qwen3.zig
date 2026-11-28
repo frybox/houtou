@@ -72,7 +72,7 @@ pub const Engine = struct {
     /// and all of them would otherwise take it just to pass it on.
     ///
     /// 它**不持有图**（qwen3 从不建图）；只是每次 op 调用传下去的上下文。
-    gctx: backend.Graph = .{},
+    gctx: backend.StepCtx = .{},
     backend_kind: backend.Kind,
 
     token_embd: LinearW,

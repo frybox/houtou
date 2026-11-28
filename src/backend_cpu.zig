@@ -888,7 +888,7 @@ pub const CpuBackend = struct {
 
     /// `g.ctl.rows` 行、每行 `row_elems` 个 f32（见 `VTable.copyRowsCtl`）。
     /// CPU 后端里控制块是普通值，直接按它算长度。
-    fn vCopyRowsCtl(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void {
+    fn vCopyRowsCtl(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void {
         _ = ctx;
         const n = @as(usize, g.ctl.rows) * row_elems;
         std.debug.assert(n <= dst.len and n <= src.len);
@@ -898,15 +898,15 @@ pub const CpuBackend = struct {
     /// 图活跃时行号取控制块的 `tok[0]`：调用方先 `graphBegin` 再调本槽，嵌入
     /// 是 span 内的第一个 op，重放时嵌的才是当步的 token。直通图（CPU 的常态）
     /// 仍用实参 `row`。
-    fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
+    fn vDequantRow(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
         _ = ctx;
-        const r: usize = if (g.ptr != null) g.ctl.tok[0] else row;
+        const r: usize = if (g.phase == .record) g.ctl.tok[0] else row;
         dequantRowInto(dst.slice(), w, r);
     }
 
     /// `g.ctl.tok[r]` 那几行展开进连续排布的 `dst`（见 `VTable.dequantRows`）。
     /// CPU 后端里控制块就是一个普通值，没有 capture 问题。
-    fn vDequantRows(g: backend.Graph, ctx: *anyopaque, dst: Buf, w: QuantRow) void {
+    fn vDequantRows(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, w: QuantRow) void {
         _ = ctx;
         const cols = w.cols();
         const rows: usize = g.ctl.rows;
@@ -916,7 +916,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vMatvec(g: backend.Graph, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
+    fn vMatvec(g: backend.StepCtx, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
         _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         switch (w) {
@@ -925,7 +925,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vMatvecBatchK(g: backend.Graph, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void {
+    fn vMatvecBatchK(g: backend.StepCtx, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void {
         _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         matvecBatchK(out.slice(), w, xK.slice(), k, self.q8K, self.q8kK, self.pool);
@@ -988,7 +988,7 @@ pub const CpuBackend = struct {
     }
 
     /// `VTable.kvAppend`: see `kvAppendRows`.
-    fn vKvAppend(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+    fn vKvAppend(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
         _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         kvAppendRows(self.kv_type, dst, src, slot, kv_dim, rows);
@@ -1030,7 +1030,7 @@ pub const CpuBackend = struct {
         return false;
     }
 
-    fn vBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.Graph {
+    fn vBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.StepCtx {
         _ = ctx;
         return .{ .kind = .decode, .slot = slot, .ctl = ctl };
     }
@@ -1086,7 +1086,7 @@ pub const CpuBackend = struct {
     // kernels need no backend state, which is why a composing backend (the CUDA
     // trampoline) can hand out these same targets unchanged.
 
-    fn vRmsnorm(g: backend.Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void {
+    fn vRmsnorm(g: backend.StepCtx, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void {
         _ = g;
         _ = ctx;
         ew.bufRmsnorm(out, x, w, eps);
@@ -1096,7 +1096,7 @@ pub const CpuBackend = struct {
     /// loop over consecutive spans, i.e. literally the per-row calls the engine
     /// used to make, so the CPU path stays bit-identical to it and this slot
     /// cannot diverge from `vRmsnorm` on any single row.
-    fn vRmsnormRows(g: backend.Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+    fn vRmsnormRows(g: backend.StepCtx, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
         _ = g;
         _ = ctx;
         const n = w.len;
@@ -1104,7 +1104,7 @@ pub const CpuBackend = struct {
         for (0..rows) |r| ew.bufRmsnorm(out.span(r * n, n), x.span(r * n, n), w, eps);
     }
 
-    fn vRope64(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
+    fn vRope64(g: backend.StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
         _ = g;
         _ = ctx;
         ew.bufRope64(x, pos, base);
@@ -1125,7 +1125,7 @@ pub const CpuBackend = struct {
     ///
     /// Kept as the per-head loop (rather than one vectorised pass) because it is
     /// the reference the device kernel is checked against.
-    fn vRope64Rows(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
+    fn vRope64Rows(g: backend.StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
         _ = g;
         _ = ctx;
         const row_len = heads * hd;
@@ -1140,7 +1140,7 @@ pub const CpuBackend = struct {
 
     /// RoPE over `rotary_dim` of each head.  `rotary_dim == 64` takes the same
     /// per-head call as `vRope64Rows`, so the two are bit-identical there.
-    fn vRopeRows(g: backend.Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn vRopeRows(g: backend.StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         _ = g;
         _ = ctx;
         const row_len = heads * hd;
@@ -1153,7 +1153,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vL2norm(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
+    fn vL2norm(g: backend.StepCtx, ctx: *anyopaque, x: Buf) void {
         _ = g;
         _ = ctx;
         ew.bufL2norm(x);
@@ -1162,7 +1162,7 @@ pub const CpuBackend = struct {
     /// Row-batched l2norm: `rows` independent rows of `n`.  Loop over the same
     /// per-row calls as `vL2norm` (see `vRmsnormRows` for why the loop shape of
     /// this slot is load-bearing on the CPU path).
-    fn vL2normRows(g: backend.Graph, ctx: *anyopaque, x: Buf, n: usize) void {
+    fn vL2normRows(g: backend.StepCtx, ctx: *anyopaque, x: Buf, n: usize) void {
         _ = g;
         _ = ctx;
         std.debug.assert(n != 0 and x.len % n == 0);
@@ -1173,13 +1173,13 @@ pub const CpuBackend = struct {
     /// Oracle for `matvecPair`: literally two `matvec` calls.  The fused device
     /// path must produce exactly these bytes, so writing the oracle as anything
     /// other than the pair would defeat the purpose.
-    fn vMatvecPair(g: backend.Graph, ctx: *anyopaque, out: Buf, a: backend.LinearW, b: backend.LinearW, x: Buf) void {
+    fn vMatvecPair(g: backend.StepCtx, ctx: *anyopaque, out: Buf, a: backend.LinearW, b: backend.LinearW, x: Buf) void {
         const r = out.len / 2;
         vMatvec(g, ctx, out.span(0, r), a, x);
         vMatvec(g, ctx, out.span(r, r), b, x);
     }
 
-    fn vScaleVec(g: backend.Graph, ctx: *anyopaque, x: Buf, s: f32) void {
+    fn vScaleVec(g: backend.StepCtx, ctx: *anyopaque, x: Buf, s: f32) void {
         _ = g;
         _ = ctx;
         ew.bufScaleVec(x, s);
@@ -1190,7 +1190,7 @@ pub const CpuBackend = struct {
     /// scalar loop) is the point -- the test asserts the device kernel agrees
     /// with the un-fused semantics, so writing the oracle any other way would
     /// hide a drift in either of them.
-    fn vL2normQkScale(g: backend.Graph, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    fn vL2normQkScale(g: backend.StepCtx, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         const nb = nk * kd;
         std.debug.assert(nk != 0 and kd != 0);
         std.debug.assert(k_offset >= nb and x.len >= k_offset + nb);
@@ -1199,49 +1199,49 @@ pub const CpuBackend = struct {
         vScaleVec(g, ctx, x.span(0, nb), qscale);
     }
 
-    fn vSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
+    fn vSiluInPlace(g: backend.StepCtx, ctx: *anyopaque, x: Buf) void {
         _ = g;
         _ = ctx;
         ew.bufSiluInPlace(x);
     }
 
-    fn vMulSilu(g: backend.Graph, ctx: *anyopaque, out: Buf, gate: Buf) void {
+    fn vMulSilu(g: backend.StepCtx, ctx: *anyopaque, out: Buf, gate: Buf) void {
         _ = g;
         _ = ctx;
         ew.bufMulSilu(out, gate);
     }
 
-    fn vMulSigmoid(g: backend.Graph, ctx: *anyopaque, out: Buf, gate: Buf) void {
+    fn vMulSigmoid(g: backend.StepCtx, ctx: *anyopaque, out: Buf, gate: Buf) void {
         _ = ctx;
         _ = g;
         ew.bufMulSigmoid(out, gate);
     }
 
-    fn vSoftmax(g: backend.Graph, ctx: *anyopaque, x: Buf) void {
+    fn vSoftmax(g: backend.StepCtx, ctx: *anyopaque, x: Buf) void {
         _ = ctx;
         _ = g;
         ew.bufSoftmax(x);
     }
 
-    fn vAddResid(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf) void {
+    fn vAddResid(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
         _ = g;
         ew.bufAddResid(dst, src);
     }
 
-    fn vSwiglu(g: backend.Graph, ctx: *anyopaque, gate: Buf, up: Buf) void {
+    fn vSwiglu(g: backend.StepCtx, ctx: *anyopaque, gate: Buf, up: Buf) void {
         _ = ctx;
         _ = g;
         ew.bufSwiglu(gate, up);
     }
 
-    fn vConvStep(g: backend.Graph, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
+    fn vConvStep(g: backend.StepCtx, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
         _ = ctx;
         _ = g;
         ew.bufConvStep(conv, y, wconv, k);
     }
 
-    fn vGdnStep(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
+    fn vGdnStep(g: backend.StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
         _ = ctx;
         _ = g;
         ew.bufGdnStep(state, k, v, q, km, delta, out, gamma, beta, vd);
@@ -1259,7 +1259,7 @@ pub const CpuBackend = struct {
     /// writes them, making the repetition a plain re-read.  (Contrast
     /// `l2norm`, which the engine must apply once per repeat because it is not
     /// idempotent.)
-    fn vGdnStepRows(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRows(g: backend.StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                     gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         _ = ctx;
         _ = g;
@@ -1286,7 +1286,7 @@ pub const CpuBackend = struct {
         }
     }
 
-    fn vAttnDecode(g: backend.Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+    fn vAttnDecode(g: backend.StepCtx, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                    gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
                    kv_dim: usize, scale: f32) void {
         _ = g;
@@ -1310,7 +1310,7 @@ pub const CpuBackend = struct {
     /// `while (t < k) forwardGdnCore(...)` loop passed, so a device kernel that
     /// fuses the loop has something meaningful to be compared against instead
     /// of a copy checked against a copy.
-    fn vGdnStepRowsChunk(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRowsChunk(g: backend.StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                          gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                          rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         if (heads == 0 or vd == 0 or nk == 0) return;
@@ -1332,7 +1332,7 @@ pub const CpuBackend = struct {
     /// CPU 参照实现 for `VTable.gdnStepRowsSnap`: 与 `vGdnStepRowsChunk` 相同的
     /// 逐行 `gdnStepRows`，外加每行结束后拷一份 state（槽 `r-1` = 第 r 行之后）。
     /// 拷贝发生在**两行之间**，这正是设备内核必须复现的性质。
-    fn vGdnStepRowsSnap(g: backend.Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    fn vGdnStepRowsSnap(g: backend.StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                         gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                         rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         if (heads == 0 or vd == 0 or nk == 0) return;
@@ -1375,7 +1375,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     /// calls the engine made before the chunk slot existed, in the same order.
     /// Keeping the naive loop here is what makes a device implementation's
     /// comparison meaningful instead of a copy checked against a copy.
-    fn vAttnChunk(g: backend.Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+    fn vAttnChunk(g: backend.StepCtx, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                   gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
                   hd: usize, kv_dim: usize, scale: f32) void {
             const row_len = heads * hd;
@@ -1390,7 +1390,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
             }
     }
 
-    fn vGdnGamma(g: backend.Graph, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+    fn vGdnGamma(g: backend.StepCtx, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         _ = ctx;
         _ = g;
         ew.bufGdnGamma(a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
@@ -1400,7 +1400,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     /// engine used to make, in the same order.  A device backend must reproduce
     /// these numbers; keeping this as the naive loop is what makes that a
     /// meaningful comparison rather than a copy against a copy.
-    fn vGdnPrefillCore(g: backend.Graph, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+    fn vGdnPrefillCore(g: backend.StepCtx, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
         ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
         ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
         gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
@@ -1446,7 +1446,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         _ = eps; // the CPU l2norm pins its own eps, exactly as `Exec.l2norm` does
     }
 
-    fn vCopyRange(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf) void {
+    fn vCopyRange(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
         _ = g;
         ew.bufCopyRange(dst, src);
@@ -1454,7 +1454,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
 
     /// KV append.  Host memory has no captured schedule, so the slot is
     /// irrelevant here and this is `copyRange` (see `VTable.copyRangeSlot`).
-    fn vCopyRangeSlot(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void {
+    fn vCopyRangeSlot(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void {
         _ = slot;
         CpuBackend.vCopyRange(g, ctx, dst, src);
     }
@@ -1462,7 +1462,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     /// Host regions on this backend, so the split is the plain per-head copy
     /// (`ew.bufDeinterleaveQG`); it exists as a slot only so a device backend
     /// can replace `2*heads` launches with one.
-    fn vDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+    fn vDeinterleaveQG(g: backend.StepCtx, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         _ = ctx;
         _ = g;
         ew.bufDeinterleaveQG(dst_q, dst_gate, src, heads, hd);
@@ -1470,7 +1470,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
 
     /// CPU oracle for `VTable.deinterleaveQGStrided`: the per-row calls, in row
     /// order.  Pure move, so this is exact, not approximate.
-    fn vDeinterleaveQGStrided(g: backend.Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf,
+    fn vDeinterleaveQGStrided(g: backend.StepCtx, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf,
                               heads: usize, hd: usize, tokens: usize) void {
         const row_len = heads * hd;
         var t: usize = 0;
@@ -1483,7 +1483,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         }
     }
 
-    fn vCopyFromHost(g: backend.Graph, ctx: *anyopaque, dst: Buf, src: []const f32) void {
+    fn vCopyFromHost(g: backend.StepCtx, ctx: *anyopaque, dst: Buf, src: []const f32) void {
         _ = ctx;
         _ = g;
         ew.bufCopyFromHost(dst, src);
@@ -1491,20 +1491,20 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
 
     /// Host slices on this backend, so the "copy" is a plain memcpy (and for
     /// the `beta`/`gamma` scalars, the very same region the caller reads).
-    fn vCopyOut(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: Buf) void {
+    fn vCopyOut(g: backend.StepCtx, ctx: *anyopaque, dst: []f32, src: Buf) void {
         _ = ctx;
         _ = g;
         std.debug.assert(dst.len <= src.len);
         @memcpy(dst, src.slice()[0..dst.len]);
     }
 
-    fn vZeroBuf(g: backend.Graph, ctx: *anyopaque, buf: Buf) void {
+    fn vZeroBuf(g: backend.StepCtx, ctx: *anyopaque, buf: Buf) void {
         _ = ctx;
         _ = g;
         @memset(buf.slice(), 0);
     }
 
-    fn vArgmax(g: backend.Graph, ctx: *anyopaque, logits: Buf) u32 {
+    fn vArgmax(g: backend.StepCtx, ctx: *anyopaque, logits: Buf) u32 {
         _ = ctx;
         _ = g;
         return ew.bufArgmax(logits);
@@ -1513,7 +1513,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     /// Host logits are free to read, so the probability costs one extra pass and
     /// the CPU is a genuine reference for it rather than a "1.0, disabled"
     /// placeholder.
-    fn vArgmaxConf(g: backend.Graph, ctx: *anyopaque, logits: Buf, p: *f32) u32 {
+    fn vArgmaxConf(g: backend.StepCtx, ctx: *anyopaque, logits: Buf, p: *f32) u32 {
         _ = ctx;
         _ = g;
         const row = logits.slice();
@@ -1538,7 +1538,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
     /// CPU oracle for `VTable.argmaxRows`: the same `bufArgmax` per row.  Host
     /// memory has no read-back cost, so this is literally the loop the device
     /// slot replaces -- which is what makes the comparison meaningful.
-    fn vArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void {
+    fn vArgmaxRows(g: backend.StepCtx, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void {
         _ = ctx;
         _ = g;
         const vocab = logits.len / rows;
@@ -1546,7 +1546,7 @@ fn bufsOverlap(a: Buf, b: Buf) bool {
         for (0..rows) |r| out[r] = ew.bufArgmax(logits.span(r * vocab, vocab));
     }
 
-    fn vSample(g: backend.Graph, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
+    fn vSample(g: backend.StepCtx, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         _ = g;
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         self.sampled = ew.bufSample(logits, scratch, sp);

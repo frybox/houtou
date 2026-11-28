@@ -144,7 +144,7 @@ pub const Draft = struct {
     /// so every op it issues uses the direct path.  S5 gives the draft chain its
     /// own graph; until then this is the explicit "no graph" value rather than a
     /// hidden implicit one.
-    graph: backend.Graph = .{},
+    gctx: backend.StepCtx = .{},
     /// Which implementation of the four bridge kernels runs (see
     /// `dspine_bridge.Kind`).  `exec` and this are chosen together: `cuda` here
     /// means `exec` is the CUDA backend's vtable AND
@@ -462,7 +462,7 @@ pub const Draft = struct {
         }
         // fc: [n*hidden, hidden] -- one matvec per context row.
         for (0..rows) |r| {
-            self.exec.matvec(self.graph, 
+            self.exec.matvec(self.gctx, 
                 self.ctx.span(r * hidden, hidden),
                 self.fc,
                 self.ctx_raw.span(r * n * hidden, n * hidden),
@@ -470,7 +470,7 @@ pub const Draft = struct {
         }
         // hidden_norm over each row
         if (rows > 0) {
-            self.exec.rmsnormRows(self.graph, 
+            self.exec.rmsnormRows(self.gctx, 
                 self.ctx.span(0, rows * hidden),
                 self.ctx.span(0, rows * hidden),
                 self.hidden_norm,
@@ -543,11 +543,11 @@ pub const Draft = struct {
             for (0..rows) |r| {
                 const krow = cache.k.span(r * kv_dim, kv_dim);
                 const vrow = cache.v.span(r * kv_dim, kv_dim);
-                self.exec.matvec(self.graph, krow, l.attn_k, self.ctx.span(r * hidden, hidden));
-                self.exec.matvec(self.graph, vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
-                self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
+                self.exec.matvec(self.gctx, krow, l.attn_k, self.ctx.span(r * hidden, hidden));
+                self.exec.matvec(self.gctx, vrow, l.attn_v, self.ctx.span(r * hidden, hidden));
+                self.exec.rmsnormRows(self.gctx, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
                 // Context rows sit at absolute positions pos0..pos0+rows-1.
-                self.exec.rope64Rows(self.graph, krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
+                self.exec.rope64Rows(self.gctx, krow, pos0 + @as(u32, @intCast(r)), c.rope_freq_base, 1, c.kv_heads, c.hd);
             }
             cache.ctx_len = @intCast(rows);
             cache.len = 0;
@@ -582,7 +582,7 @@ pub const Draft = struct {
             backend_cpu.dequantRowInto(buf[0..hidden], self.embed_rows, token);
             self.fromHost(self.resid.span(0, hidden), buf[0..hidden]);
         } else {
-            self.exec.dequantRow(self.graph, self.resid.span(0, hidden), self.embed_rows, token);
+            self.exec.dequantRow(self.gctx, self.resid.span(0, hidden), self.embed_rows, token);
         }
         // The block's first id IS the anchor: it conditions the code bridge
         // (`normalize_codes`' anchor row) and the serial table's sender for row
@@ -600,7 +600,7 @@ pub const Draft = struct {
         // last `packed` leak in as its `prev` sender.
         if (row == 0) self.prev_packed_valid = false;
         // layer 0 gets its own input_layernorm; later ones are fed by the bridge
-        self.exec.rmsnorm(self.graph, self.xin.span(0, hidden), self.resid.span(0, hidden), self.layers[0].attn_norm, c.rms_eps);
+        self.exec.rmsnorm(self.gctx, self.xin.span(0, hidden), self.resid.span(0, hidden), self.layers[0].attn_norm, c.rms_eps);
 
         const last = self.layers.len - 1;
         for (self.layers, 0..) |*l, il| {
@@ -659,19 +659,19 @@ pub const Draft = struct {
         // `ffn_norm`'s output, so the reference dump has to take it here.
         if (self.dump_dir) |root| self.dumpStage(root, il, self.dump_row, "xin", self.xin, hidden);
         // ---- attention over [context | block-prefix] ----
-        self.exec.matvec(self.graph, self.q.span(0, q_dim), l.attn_q, self.xin.span(0, hidden));
+        self.exec.matvec(self.gctx, self.q.span(0, q_dim), l.attn_q, self.xin.span(0, hidden));
         const krow = self.kv.span(0, kv_dim);
         const vrow = self.kv.span(kv_dim, kv_dim);
-        self.exec.matvec(self.graph, krow, l.attn_k, self.xin.span(0, hidden));
-        self.exec.matvec(self.graph, vrow, l.attn_v, self.xin.span(0, hidden));
+        self.exec.matvec(self.gctx, krow, l.attn_k, self.xin.span(0, hidden));
+        self.exec.matvec(self.gctx, vrow, l.attn_v, self.xin.span(0, hidden));
 
         // q_norm/k_norm are per-head RMSNorms over `hd` (=128), unlike the
         // target's 256-wide ones.
-        self.exec.rmsnormRows(self.graph, self.q.span(0, q_dim), self.q.span(0, q_dim), l.attn_q_norm, c.heads, c.rms_eps);
-        self.exec.rmsnormRows(self.graph, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, self.q.span(0, q_dim), self.q.span(0, q_dim), l.attn_q_norm, c.heads, c.rms_eps);
+        self.exec.rmsnormRows(self.gctx, krow, krow, l.attn_k_norm, c.kv_heads, c.rms_eps);
 
-        self.exec.rope64Rows(self.graph, self.q.span(0, q_dim), pos, c.rope_freq_base, 1, c.heads, c.hd);
-        self.exec.rope64Rows(self.graph, krow, pos, c.rope_freq_base, 1, c.kv_heads, c.hd);
+        self.exec.rope64Rows(self.gctx, self.q.span(0, q_dim), pos, c.rope_freq_base, 1, c.heads, c.hd);
+        self.exec.rope64Rows(self.gctx, krow, pos, c.rope_freq_base, 1, c.kv_heads, c.hd);
         if (self.hostDebug()) {
             self.emit("q", il, self.dump_row, self.q.slice()[0..q_dim]);
             self.emit("k", il, self.dump_row, krow.slice());
@@ -682,22 +682,22 @@ pub const Draft = struct {
         const slot: usize = @as(usize, cache.ctx_len) + cache.len;
         if (self.dump_dir) |root| if (self.dump_row == 0) self.dumpKv(root, il, q_dim, kv_dim, krow, vrow);
         std.debug.assert(slot < c.max_seq);
-        self.exec.kvAppend(self.graph, cache.k, krow, slot, kv_dim, 1);
-        self.exec.kvAppend(self.graph, cache.v, vrow, slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.k, krow, slot, kv_dim, 1);
+        self.exec.kvAppend(self.gctx, cache.v, vrow, slot, kv_dim, 1);
 
         // Attention covers context rows [0, ctx_len) and block rows
         // [ctx_len, slot] -- exactly the slice `attnDecode` walks (`0..=slot`),
         // which is the same mask the reference builds: context rows are always
         // visible, block rows causally (`dspine_mlx/model.py:83-99`).
         self.exec.attnDecode(
-            self.graph, self.q.span(0, q_dim), self.ones.span(0, q_dim),
+            self.gctx, self.q.span(0, q_dim), self.ones.span(0, q_dim),
             cache.k, cache.v,
             self.att.span(0, slot + 1), self.gout.span(0, q_dim),
             slot, c.heads, c.heads / c.kv_heads, c.hd, kv_dim, scale,
         );
         cache.len += 1;
 
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), l.attn_output, self.gout.span(0, q_dim));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), l.attn_output, self.gout.span(0, q_dim));
         // `x2` is reused by the MLP's down-projection, so the attention output has
         // to be captured here, not in the end-of-layer dump.
         if (self.dump_dir) |root| self.dumpStage(root, il, self.dump_row, "attn", self.x2, hidden);
@@ -706,17 +706,17 @@ pub const Draft = struct {
             self.debug_gout = maxAbs(self.gout.slice()[0..q_dim]);
             self.emit("attn", il, self.dump_row, self.gout.slice()[0..q_dim]);
         }
-        self.exec.addResid(self.graph, self.resid.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.gctx, self.resid.span(0, hidden), self.x2.span(0, hidden));
         if (self.hostDebug()) self.emit("h", il, self.dump_row, self.resid.slice()[0..hidden]);
 
         // ---- MLP ----
-        self.exec.rmsnorm(self.graph, self.xin.span(0, hidden), self.resid.span(0, hidden), l.ffn_norm, c.rms_eps);
-        self.exec.matvec(self.graph, self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
-        self.exec.matvec(self.graph, self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
+        self.exec.rmsnorm(self.gctx, self.xin.span(0, hidden), self.resid.span(0, hidden), l.ffn_norm, c.rms_eps);
+        self.exec.matvec(self.gctx, self.mlp_h.span(0, c.ffn), l.ffn_gate, self.xin.span(0, hidden));
+        self.exec.matvec(self.gctx, self.mlp_h1.span(0, c.ffn), l.ffn_up, self.xin.span(0, hidden));
         if (self.hostDebug()) self.debug_gate = maxAbs(self.mlp_h.slice()[0..c.ffn]);
-        self.exec.swiglu(self.graph, self.mlp_h.span(0, c.ffn), self.mlp_h1.span(0, c.ffn));
+        self.exec.swiglu(self.gctx, self.mlp_h.span(0, c.ffn), self.mlp_h1.span(0, c.ffn));
         if (self.hostDebug()) self.debug_swi = maxAbs(self.mlp_h.slice()[0..c.ffn]);
-        self.exec.matvec(self.graph, self.x2.span(0, hidden), l.ffn_down, self.mlp_h.span(0, c.ffn));
+        self.exec.matvec(self.gctx, self.x2.span(0, hidden), l.ffn_down, self.mlp_h.span(0, c.ffn));
         if (self.hostDebug()) self.debug_mlp = maxAbs(self.x2.slice()[0..hidden]);
         // Per-layer telemetry, on BOTH backends through `toHost` so the device
         // path never dereferences a device pointer.  `$QWEN35_DRAFT_DEBUG`
@@ -747,7 +747,7 @@ pub const Draft = struct {
             };
         }
         if (self.hostDebug()) self.emit("swiglu", il, self.dump_row, self.mlp_h.slice()[0..c.ffn]);
-        self.exec.addResid(self.graph, self.resid.span(0, hidden), self.x2.span(0, hidden));
+        self.exec.addResid(self.gctx, self.resid.span(0, hidden), self.x2.span(0, hidden));
         if (self.hostDebug()) self.emit("layer_out", il, self.dump_row, self.resid.slice()[0..hidden]);
         if (self.dump_dir) |root| self.dumpLayer(root, il, self.dump_row);
     }
@@ -755,7 +755,7 @@ pub const Draft = struct {
     /// Dequantise `token`'s codebook row into `codebook_row`.
     fn dequantCodebookRow(self: *Draft, token: u32) void {
         switch (self.codebook) {
-            .quant => |q| self.exec.dequantRow(self.graph, self.codebook_row, q, token),
+            .quant => |q| self.exec.dequantRow(self.gctx, self.codebook_row, q, token),
             .f32 => |w| {
                 const c = self.cfg.code_len;
                 const off = @as(usize, token) * c;
@@ -1008,7 +1008,7 @@ pub const Draft = struct {
         // `layer_read_weight`: the LAST layer uses `dspine_read`, the others
         // `blk.i.dspine_read` (both land in `Layer.read` at load time).
         const projected = self.projected.span(0, c.code_len);
-        self.exec.matvec(self.graph, projected, l.read, self.bridge_normed.span(0, hidden));
+        self.exec.matvec(self.gctx, projected, l.read, self.bridge_normed.span(0, hidden));
 
         // ---- 3. normalize_codes: anchors from the codebook, others L2-scaled ----
         self.dequantCodebookRow(self.anchor_tokens[if (row < self.anchor_tokens.len) row else 0]);
@@ -1049,9 +1049,9 @@ pub const Draft = struct {
         // `prev_packed`), but one slot per row is harmless there and keeps the
         // two arms reading the same memory.
         const packed_slice = self.packed_rows.span(0, 3 * c.rank);
-        self.exec.matvec(self.graph, packed_slice.span(0, c.rank), self.gate_w, codes);
-        self.exec.matvec(self.graph, packed_slice.span(c.rank, c.rank), self.pred_gate_w, codes);
-        self.exec.matvec(self.graph, packed_slice.span(2 * c.rank, c.rank), self.prev_w, codes);
+        self.exec.matvec(self.gctx, packed_slice.span(0, c.rank), self.gate_w, codes);
+        self.exec.matvec(self.gctx, packed_slice.span(c.rank, c.rank), self.pred_gate_w, codes);
+        self.exec.matvec(self.gctx, packed_slice.span(2 * c.rank, c.rank), self.prev_w, codes);
 
         // ---- 5. feature_message: gate * predecessor value, anchor zeroed ----
         // Row `row-1`'s packed triple is the `prev` sender; see
@@ -1060,7 +1060,7 @@ pub const Draft = struct {
 
         // ---- 6. write: [H, R] @ message[R] -> delta[H] ----
         const delta = self.delta.span(0, hidden);
-        self.exec.matvec(self.graph, delta, l.write, self.msg.span(0, c.rank));
+        self.exec.matvec(self.gctx, delta, l.write, self.msg.span(0, c.rank));
 
         // ---- 7. feature_finish: out = bf16(raw + rms*delta),
         //                              normed = bf16(bf16(next_norm(out)) * w) ----
@@ -1147,7 +1147,7 @@ pub const Draft = struct {
         // backends carry it across calls.  (The device arm used to rely on a
         // block-sized `packed_rows` instead; that made row r its own sender.)
         // Copy, not alias: `packed_rows` slot 0 is overwritten by the next row.
-        self.exec.copyRange(self.graph, self.prev_packed, packed_slice);
+        self.exec.copyRange(self.gctx, self.prev_packed, packed_slice);
         self.syncBridge();
         self.prev_packed_valid = true;
         // `feature_finish` now writes straight into `resid`, so there is no

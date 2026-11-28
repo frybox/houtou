@@ -592,7 +592,7 @@ pub const Engine = struct {
     /// 活跃时从 `ctl.tok[0]` 取行号（见 `VTable.dequantRow`），所以任何调用
     /// `embedTo` 的路径都必须先把当步的 `pos`/`tok` 写进来 —— 开 span 的一方
     /// 用 `GraphCtlBuilder` 填，其余单行入口用 `directCtl`。
-    gctx: backend.Graph = .{ .kind = .decode, .slot = graph_slot_decode },
+    gctx: backend.StepCtx = .{ .kind = .decode, .slot = graph_slot_decode },
     /// `step` 产出的 token。在图的范围之内写出，好让后端能在设备上采样
     /// （`Exec.sample`），随后由 `step` 读取。
     sampled: u32 = 0,
@@ -889,7 +889,7 @@ pub const Engine = struct {
     /// prefill chunk `nbatch` (1024), which would make it 1 GB.
     pub const spec_verify_rows: usize = 16;
 
-    /// 图槽号：**由引擎指定**，后端只把它记进 `Graph.slot`。三种 kind 必须在
+    /// 图槽号：**由引擎指定**，后端只把它记进 `StepCtx.slot`。三种 kind 必须在
     /// 不同槽上（节点集合不同，共用会让每步都失配重捕），而槽号走句柄而不是
     /// 后端的"当前槽"，嵌套 span（草稿块在 verify 里面）才能各自正确收尾。
     pub const graph_slot_decode: u8 = 0;
@@ -1935,7 +1935,7 @@ pub const Engine = struct {
                     if (gi.qkv.len >= k * conv_dim and gi.gamma.len >= k * 2 * nv) {
                         // 长度同样不能是主机实参（见 tap 那段）：图活跃时按
                         // `ctl.rows` 拷，直通时用 `k`。
-                        if (self.gctx.ptr != null) {
+                        if (self.gctx.phase == .record) {
                             self.exec.copyRowsCtl(self.gctx, gi.qkv, self.qkvK, conv_dim);
                             self.exec.copyRowsCtl(self.gctx, gi.gamma, self.abK, 2 * nv);
                         } else {
@@ -1999,7 +1999,7 @@ pub const Engine = struct {
                         // 由 ctl.rows 决定。
                         // 图活跃时行数取控制块（`copyRowsCtl`），直通时用 `k`
                         // —— 直通图的 ctl 是默认值，`rows` 恒为 1。
-                        if (self.gctx.ptr != null) {
+                        if (self.gctx.phase == .record) {
                             self.exec.copyRowsCtl(self.gctx,
                                 self.tap_hidden.span(ti * self.nbatch * hidden, self.nbatch * hidden),
                                 self.xK.span(0, self.nbatch * hidden),

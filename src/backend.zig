@@ -262,15 +262,16 @@ pub const Phase = enum {
     replay,
 };
 
-/// A forward pass being recorded, replayed, or run straight through.
+/// **本步的上下文**，不是图本身。
 ///
-/// `ptr == null` is the **pass-through** graph: every op behaves exactly as it
-/// did before this type existed.  The CPU backend always returns that, and so
-/// does a device backend when graphs are disabled or have not been built yet.
-/// A non-null `ptr` is a backend-owned handle (the CUDA backend stores the
-/// registry entry there), and `ctl` is this step's scalars for it.
-pub const Graph = struct {
-    ptr: ?*anyopaque = null,
+/// 图存在后端按槽号索引的 `g_slots[slot].xd_gexec` 里，跨步存活；这个结构
+/// 每步一个，携带 op 执行时需要的三件事：`slot` 指明动哪张图、`phase` 说明
+/// 这一轮是直通还是在录制、`ctl` 是本步的标量。
+///
+/// 名字从 `Graph` 改成 `StepCtx`，因为旧名字让"给 `Engine.gctx` 赋值"看起来
+/// 像是在换图 —— 它从来不是。参照实现（llama.cpp 的 `ctx`、ds4 的 `g`、
+/// Strata 的 `stream`）都是这个角色：一个一路传下去的执行上下文。
+pub const StepCtx = struct {
     kind: GraphKind = .decode,
     ctl: GraphCtl = .{},
     /// 本步是直发 / 正在录制 / 已重放。引擎据它**跳过整段构建**（见 `Phase`）。
@@ -294,7 +295,7 @@ pub const Graph = struct {
     slot: u8 = 0,
 
     /// The graph a caller passes when it wants the historical direct path.
-    pub const direct = Graph{};
+    pub const direct = StepCtx{};
 };
 
 /// The hardware boundary.  One instance per loaded model.
@@ -368,24 +369,24 @@ pub const Exec = struct {
         /// backend the destination advances one row per token exactly like the
         /// historical `copyRangeSlot` KV append (which this replaces).  Prefill
         /// calls it with `rows = k` for the chunk, outside any capture.
-        kvAppend: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void,
+        kvAppend: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void,
 
         // ---- dequantization -------------------------------------------------
         /// Expand one row of a packed weight into `dst` (f32, `cols` wide).
         /// Used by the embedding lookup, which needs values rather than dots.
-        dequantRow: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void,
+        dequantRow: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void,
 
         /// 展开 `g.ctl.rows` 行到连续排布的 `dst`，第 r 行是 `g.ctl.tok[r]` 的
         /// embedding。行号走**设备控制块**，所以这条路径可以录进图；循环调用
         /// `dequantRow` 做不到这一点（行号会被烘成录制时的值）。
-        dequantRows: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, w: QuantRow) void,
+        dequantRows: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, w: QuantRow) void,
 
         // ---- matvec ---------------------------------------------------------
         /// `out = W * x` with `W` packed, `x` `w.cols()` f32 values.  Both
         /// activation sides are `Buf`s, so on a device backend the input is the
         /// region the previous op wrote and the output is the region the next
         /// op reads: no PCIe between them.
-        matvec: *const fn (g: Graph, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void,
+        matvec: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void,
         /// `matvec(out[0..r], a, x)` then `matvec(out[r..2r], b, x)` as ONE
         /// device launch, when `a` and `b` are the *same* shape and type and
         /// their device ranges are adjacent (`a.dev + a_bytes == b.dev`), so the
@@ -403,9 +404,9 @@ pub const Exec = struct {
         ///
         /// The fallback is two plain `matvec` calls, so a backend (or a GGUF)
         /// that cannot prove adjacency pays exactly what it paid before.
-        matvecPair: *const fn (g: Graph, ctx: *anyopaque, out: Buf, a: LinearW, b: LinearW, x: Buf) void,
+        matvecPair: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, a: LinearW, b: LinearW, x: Buf) void,
         /// Same, for `k` tokens at once: `out[j*rows + r] = W[r] . x_j`.
-        matvecBatchK: *const fn (g: Graph, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void,
+        matvecBatchK: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void,
 
         /// Create the intra-op thread pool (CPU); a device backend ignores it.
         /// `nt` is the worker count, 1 = serial.
@@ -422,7 +423,7 @@ pub const Exec = struct {
         // CPU path is bit-identical to the historical engine.
 
         /// out = x * rsqrt(mean(x^2) + eps) * w, all `n` wide.
-        rmsnorm: *const fn (g: Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void,
+        rmsnorm: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void,
         /// `rows` consecutive `rmsnorm` calls on `out.span(r*h, h)` / `x.span(r*h, h)`.
         ///
         /// The ROW-BATCHED form: `out` and `x` are `rows * w.len` long and pack
@@ -436,13 +437,13 @@ pub const Exec = struct {
         /// embedding rows through this vtable: a host-only `Buf` of length
         /// `rows * n` must NOT silently become a device launch.  A batch caller
         /// has to ask for the batch reading explicitly.
-        rmsnormRows: *const fn (g: Graph, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void,
+        rmsnormRows: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void,
         /// `rows` consecutive `l2norm` calls on `x.span(r*n, n)`.  Same
         /// "explicit, never inferred" rule as `rmsnormRows`; each row's eps is
         /// inside its own sum, so the rows are fully independent.
-        l2normRows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, n: usize) void,
+        l2normRows: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, n: usize) void,
         /// Rotate the 64-dim rotary block of a row in place (cross-half pairing).
-        rope64: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
+        rope64: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
         /// `rows` consecutive `rope64` calls on `x.span(r * heads * hd, heads * hd)`
         /// with `pos + r`, i.e. row r is prefill token `pos + r`.  `heads` is the
         /// head count PER ROW, so `x.len == rows * heads * hd`.  Same
@@ -452,7 +453,7 @@ pub const Exec = struct {
         /// `rope64` calls because the decode CUDA graph identifies and retargets
         /// those nodes by host-stub address (see `q35_func_rope64`).  Prefill
         /// never captures a graph, so the batch reading is free there.
-        rope64Rows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
+        rope64Rows: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
         /// RoPE over `rotary_dim` of each head, for architectures that are not
         /// Qwen3.5/3.8.  Qwen3 rotates the WHOLE head (`rotary_dim == hd`),
         /// so `rope64Rows` cannot express it.
@@ -461,11 +462,11 @@ pub const Exec = struct {
         /// identifies and retargets by host-stub address for Qwen3.5, and adding
         /// a parameter there would invalidate every captured node.  Backends
         /// that do not implement this may fall back to their CPU twin.
-        ropeRows: *const fn (g: Graph, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
+        ropeRows: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
-        l2norm: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
+        l2norm: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf) void,
         /// x *= s
-        scaleVec: *const fn (g: Graph, ctx: *anyopaque, x: Buf, s: f32) void,
+        scaleVec: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, s: f32) void,
         /// The GDN q/k normalisation as ONE launch: `nk` q rows at `x[0..]` and
         /// `nk` k rows at `x[k_offset..]`, each an independent l2norm of `kd`
         /// floats (eps inside the sum), then the q rows scaled by `qscale`.
@@ -475,26 +476,26 @@ pub const Exec = struct {
         /// kernels, so the 48 recurrent layers' 96 saved launches are 1.8% of
         /// the token.  Added after decode RoPE batching and the GDN l2norm fix
         /// had both landed; see docs in norm.cu.
-        l2normQkScale: *const fn (g: Graph, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
+        l2normQkScale: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
         /// x = silu(x) in place
-        siluInPlace: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
+        siluInPlace: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf) void,
         /// out[i] *= silu(gate[i])
-        mulSilu: *const fn (g: Graph, ctx: *anyopaque, out: Buf, gate: Buf) void,
+        mulSilu: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// out[i] *= sigmoid(gate[i])
-        mulSigmoid: *const fn (g: Graph, ctx: *anyopaque, out: Buf, gate: Buf) void,
+        mulSigmoid: *const fn (g: StepCtx, ctx: *anyopaque, out: Buf, gate: Buf) void,
         /// softmax over the whole slice
-        softmax: *const fn (g: Graph, ctx: *anyopaque, x: Buf) void,
+        softmax: *const fn (g: StepCtx, ctx: *anyopaque, x: Buf) void,
         /// dst[i] += src[i]
-        addResid: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf) void,
+        addResid: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: Buf) void,
         /// SwiGLU: gate[i] = silu(gate[i]) * up[i], in place
-        swiglu: *const fn (g: Graph, ctx: *anyopaque, gate: Buf, up: Buf) void,
+        swiglu: *const fn (g: StepCtx, ctx: *anyopaque, gate: Buf, up: Buf) void,
         /// Gated Delta Net: one token of the causal conv (history `conv` is
         /// `y.len * 3` floats, oldest..newest) + silu, in place on `y`.
-        convStep: *const fn (g: Graph, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void,
+        convStep: *const fn (g: StepCtx, ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void,
         /// Gated Delta Net: one token of the delta-rule state update.
         /// state is [nv, kd, vd] (kd == vd == 128), `k`/`q` are kd wide,
         /// `v`/`km`/`delta`/`out` are vd wide, per head.
-        gdnStep: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void,
+        gdnStep: *const fn (g: StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void,
         /// Batched `gdnStep`: the SAME per-head call, `heads` times, in one
         /// launch instead of `heads` launches (48 of them per token per layer on
         /// this model).  Semantics are defined as "for h in 0..heads-1: the
@@ -532,7 +533,7 @@ pub const Exec = struct {
         /// must NEVER be routed through a `devConst`-style cache: those key on
         /// pointer identity and never re-upload, which would silently serve the
         /// first layer's coefficients forever.
-        gdnStepRows: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRows: *const fn (g: StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void,
 
         /// Chunk-wide twin of `gdnStepRows` for prefill: `rows` successive state
@@ -558,7 +559,7 @@ pub const Exec = struct {
         /// `2*nk*kd + heads*vd` floats, so their per-token stride is the whole
         /// row, NOT `nk*kd`.  Inferring it from the buffer length would read the
         /// gate half as if it were the next token's k.
-        gdnStepRowsChunk: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRowsChunk: *const fn (g: StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
             k_stride: usize, v_stride: usize, q_stride: usize) void,
 
@@ -572,7 +573,7 @@ pub const Exec = struct {
         ///   * `snap` 是 `nsnap * heads * kd * vd`，槽 `t` = 跑完第 t+1 行之后
         ///     的状态。第 0 行**之前**的状态不写（调用方自己有）。
         ///   * 空 `snap` 表示不要快照；被拒绝的形状同样退化为普通 chunk 递推。
-        gdnStepRowsSnap: *const fn (g: Graph, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+        gdnStepRowsSnap: *const fn (g: StepCtx, ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, snap: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
             k_stride: usize, v_stride: usize, q_stride: usize) void,
 
@@ -581,7 +582,7 @@ pub const Exec = struct {
         /// / `vcache` are this layer's WHOLE KV regions (`kv_dim` elements per
         /// token row, `slot+1` rows written so far); the backend strides them in
         /// its own `KvType` layout.
-        attnDecode: *const fn (g: Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
+        attnDecode: *const fn (g: StepCtx, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
             kv_dim: usize, scale: f32) void,
         /// Chunk-wide twin of `attnDecode` for prefill: `rows` tokens in ONE call
@@ -603,11 +604,11 @@ pub const Exec = struct {
         /// Equivalent to calling `attnDecode` once per row with
         /// `slot = slot0 + r`, ULP for ULP -- the CUDA kernel was gated against
         /// exactly that (`/tmp/gate_attn_chunk.cu`: 23 rows, bit-identical).
-        attnChunk: *const fn (g: Graph, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
+        attnChunk: *const fn (g: StepCtx, ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
             hd: usize, kv_dim: usize, scale: f32) void,
         /// GDN per-token beta/gamma from the raw a/b projections.
-        gdnGamma: *const fn (g: Graph, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
+        gdnGamma: *const fn (g: StepCtx, ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
 
         /// GDN chunk prelude: the three per-token GDN steps that do NOT depend on
         /// the running state, done for a whole prefill chunk in a handful of
@@ -631,19 +632,19 @@ pub const Exec = struct {
         ///   l2k   [t*row_stride + kq_offset ..]  the k run, same
         /// `nk_reps` is `nv / nk` and is applied to each run in exactly the order
         /// the per-head loop did (q then k, then the q scale, repeated).
-        gdnPrefillCore: *const fn (g: Graph, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf,
+        gdnPrefillCore: *const fn (g: StepCtx, ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf,
             ab: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf,
             tokens: usize, conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
             ab_stride: usize, gamma_stride: usize,
             kq_dim: usize, nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void,
         /// Region-to-region copy (KV writes, GDN state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
-        copyRange: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf) void,
+        copyRange: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: Buf) void,
 
         /// 拷贝 `g.ctl.rows` 行、每行 `row_elems` 个 f32；`cap` 是 `dst` 能装下
         /// 的上界。行数走**设备控制块**，所以录进图之后 k 变化仍然正确 ——
         /// `copyRange` 的长度是主机实参，会被烘死成录制那一轮的 k。
-        copyRowsCtl: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void,
+        copyRowsCtl: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, row_elems: usize) void,
         /// `copyRange` whose destination advances once per token: the KV cache
         /// append, `dst = cache.k/v + slot * kv_dim`.
         ///
@@ -654,7 +655,7 @@ pub const Exec = struct {
         /// token attends to the prefix it saw the first time.  Wrong numbers, no
         /// error, so the slot has to be declared rather than inferred: a bare
         /// device pointer carries no trace of which row of which cache it is.
-        copyRangeSlot: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void,
+        copyRangeSlot: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void,
         /// Split the interleaved `attn_q` projection into `q` and `gate`.
         ///
         /// The GGUF `attn_q` rows are ordered `[h][q_head | gate_head]` -- one
@@ -667,15 +668,15 @@ pub const Exec = struct {
         /// go.
         ///
         /// `dst_q.len == dst_gate.len == heads*hd`, `src.len == 2*heads*hd`.
-        deinterleaveQG: *const fn (g: Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
+        deinterleaveQG: *const fn (g: StepCtx, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
         /// Chunk-wide twin of `deinterleaveQG`: `tokens` rows in ONE call.
         /// Row t's `[q|gate]` block starts `t * 2 * heads * hd` floats into
         /// `src`, and row t's q/gate start `t * heads * hd` into each output.
         /// Pure move, no arithmetic -- exactly `tokens` per-row calls.
-        deinterleaveQGStrided: *const fn (g: Graph, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void,
+        deinterleaveQGStrided: *const fn (g: StepCtx, ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void,
         /// Copy a host tensor row into a backend region (the f32 embedding row
         /// when token_embd is unquantized).
-        copyFromHost: *const fn (g: Graph, ctx: *anyopaque, dst: Buf, src: []const f32) void,
+        copyFromHost: *const fn (g: StepCtx, ctx: *anyopaque, dst: Buf, src: []const f32) void,
         /// Copy a small backend region back into a host slice.
         ///
         /// NOT on the per-token path any more: its one historical user was the
@@ -686,17 +687,17 @@ pub const Exec = struct {
         /// style tooling, debug paths).  Never use it to bring activations
         /// back -- that is what P2c removed, and a device->host copy also
         /// serialises the stream.
-        copyOut: *const fn (g: Graph, ctx: *anyopaque, dst: []f32, src: Buf) void,
+        copyOut: *const fn (g: StepCtx, ctx: *anyopaque, dst: []f32, src: Buf) void,
         /// Zero a region (reset of the conv history / GDN state).
-        zeroBuf: *const fn (g: Graph, ctx: *anyopaque, buf: Buf) void,
+        zeroBuf: *const fn (g: StepCtx, ctx: *anyopaque, buf: Buf) void,
         /// Greedy argmax over logits.  On a device backend this runs on the
         /// device and the token id is the only thing that comes back.
-        argmax: *const fn (g: Graph, ctx: *anyopaque, logits: Buf) u32,
+        argmax: *const fn (g: StepCtx, ctx: *anyopaque, logits: Buf) u32,
         /// `argmax` plus the top-1 softmax probability, for the speculative
         /// drafter's confidence early stop.  `p` receives a value in (0, 1];
         /// a backend that cannot produce it cheaply reports 1.0, which makes
         /// the stop a no-op rather than changing any output.
-        argmaxConf: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, p: *f32) u32,
+        argmaxConf: *const fn (g: StepCtx, ctx: *anyopaque, logits: Buf, p: *f32) u32,
         /// `rows` independent argmaxes over `rows * vocab` contiguous logits
         /// (the batched speculative verify's output), written to `out[0..rows)`.
         ///
@@ -704,13 +705,13 @@ pub const Exec = struct {
         /// device each `argmax` ends in a BLOCKING read-back: measured on 27B
         /// MTP, five per-row calls cost 6.5 ms of host wait each against a 9 us
         /// kernel.  One launch + one copy removes that.
-        argmaxRows: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void,
+        argmaxRows: *const fn (g: StepCtx, ctx: *anyopaque, logits: Buf, rows: usize, out: []u32) void,
         /// Sampling.  The policy/PRNG object stays in the engine (set from the
         /// CLI); the backend runs the algorithm wherever the logits live, so a
         /// device backend samples on the device and returns a 4-byte token id.
         /// Passing the sampler by pointer keeps its PRNG state advancing
         /// identically on both paths.
-        sample: *const fn (g: Graph, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
+        sample: *const fn (g: StepCtx, ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
 
 
         // ---- explicit compute graph (XG) ------------------------------------
@@ -739,13 +740,11 @@ pub const Exec = struct {
         /// 打开 capture。这一轮随后发出的每个 op 都会被录进图；**不执行**。
         /// 槽里已有一张图时先销毁它（形状变了就必须重录）。
         ///
-        /// 返回本步的 `Graph` 句柄：`phase = .record`，且 `ptr` 指向后端为该槽
-        /// 保存的状态。**调用方必须把它赋给 `Engine.gctx`** —— 各 op 用
-        /// `g.ptr != null` 判断"我是不是在图里"（例如 `dequantRow` 走设备行号
-        /// 还是主机行号）。早先这里返回 void、引擎自己拼了一个 `ptr == null`
-        /// 的句柄，于是所有 op 都以为自己在直通路径上，嵌入行号被固化成了
-        /// 录制那一轮的值。
-        beginRecord: *const fn (ctx: *anyopaque, slot: u8, ctl: GraphCtl) Graph,
+        /// 返回本步的 `StepCtx`：`phase = .record`。**调用方必须把它赋给
+        /// `Engine.gctx`** —— 各 op 用 `g.phase == .record` 判断"我现在是在
+        /// 录制吗"（例如 `dequantRow` 走设备行号还是主机行号）。capture 打不开
+        /// 时返回 `phase = .direct` 的上下文，那一轮就退化成直通。
+        beginRecord: *const fn (ctx: *anyopaque, slot: u8, ctl: GraphCtl) StepCtx,
         /// 关 capture 并 instantiate。**只做这两件事** —— 不发布、不 launch。
         /// 失败时槽保持"没有图"，随后的 `launch` 是空操作。
         endRecord: *const fn (ctx: *anyopaque, slot: u8) void,
@@ -840,119 +839,119 @@ pub const Exec = struct {
     }
     /// Quantize `rows` f32 rows into the KV cache `dst` at row `slot`; see
     /// `VTable.kvAppend`.
-    pub fn kvAppend(self: Exec, g: Graph, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
+    pub fn kvAppend(self: Exec, g: StepCtx, dst: Buf, src: Buf, slot: usize, kv_dim: usize, rows: usize) void {
         self.vtable.kvAppend(g, self.ptr, dst, src, slot, kv_dim, rows);
     }
-    pub fn dequantRow(self: Exec, g: Graph, dst: Buf, w: QuantRow, row: usize) void {
+    pub fn dequantRow(self: Exec, g: StepCtx, dst: Buf, w: QuantRow, row: usize) void {
         self.vtable.dequantRow(g, self.ptr, dst, w, row);
     }
     /// 展开 `g.ctl.rows` 行，行号取 `g.ctl.tok[r]`（见 `VTable.dequantRows`）。
-    pub fn dequantRows(self: Exec, g: Graph, dst: Buf, w: QuantRow) void {
+    pub fn dequantRows(self: Exec, g: StepCtx, dst: Buf, w: QuantRow) void {
         self.vtable.dequantRows(g, self.ptr, dst, w);
     }
-    pub fn matvec(self: Exec, g: Graph, out: Buf, w: LinearW, x: Buf) void {
+    pub fn matvec(self: Exec, g: StepCtx, out: Buf, w: LinearW, x: Buf) void {
         self.vtable.matvec(g, self.ptr, out, w, x);
     }
     /// Two same-shape matvecs over adjacent weights, as one launch when the
     /// backend can prove the layout.  `out` is `2*rows` long, `a`'s result
     /// first.  Semantically identical to two `matvec` calls.
-    pub fn matvecPair(self: Exec, g: Graph, out: Buf, a: LinearW, b: LinearW, x: Buf) void {
+    pub fn matvecPair(self: Exec, g: StepCtx, out: Buf, a: LinearW, b: LinearW, x: Buf) void {
         self.vtable.matvecPair(g, self.ptr, out, a, b, x);
     }
-    pub fn matvecBatchK(self: Exec, g: Graph, out: Buf, w: LinearW, xK: Buf, k: usize) void {
+    pub fn matvecBatchK(self: Exec, g: StepCtx, out: Buf, w: LinearW, xK: Buf, k: usize) void {
         self.vtable.matvecBatchK(g, self.ptr, out, w, xK, k);
     }
-    pub fn rmsnorm(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, eps: f32) void {
+    pub fn rmsnorm(self: Exec, g: StepCtx, out: Buf, x: Buf, w: Buf, eps: f32) void {
         self.vtable.rmsnorm(g, self.ptr, out, x, w, eps);
     }
     /// See `VTable.rmsnormRows`: `out` / `x` are `rows * w.len` long, `w` is one
     /// row.  Equivalent to `rows` calls of `rmsnorm` on consecutive sub-rows.
-    pub fn rmsnormRows(self: Exec, g: Graph, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+    pub fn rmsnormRows(self: Exec, g: StepCtx, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
         self.vtable.rmsnormRows(g, self.ptr, out, x, w, rows, eps);
     }
-    pub fn rope64(self: Exec, g: Graph, x: Buf, pos: u32, base: f32) void {
+    pub fn rope64(self: Exec, g: StepCtx, x: Buf, pos: u32, base: f32) void {
         self.vtable.rope64(g, self.ptr, x, pos, base);
     }
     /// See `VTable.rope64Rows`: `x` is `rows * heads * hd` long, row r (prefill
     /// token `pos + r`) is `heads * hd` floats.
-    pub fn rope64Rows(self: Exec, g: Graph, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
+    pub fn rope64Rows(self: Exec, g: StepCtx, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
         self.vtable.rope64Rows(g, self.ptr, x, pos, base, rows, heads, hd);
     }
     /// RoPE over `rotary_dim` of each head (`rotary_dim == 64` reproduces
     /// `rope64Rows` exactly).
-    pub fn ropeRows(self: Exec, g: Graph, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    pub fn ropeRows(self: Exec, g: StepCtx, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         self.vtable.ropeRows(g, self.ptr, x, pos, base, rows, heads, hd, rotary_dim);
     }
-    pub fn l2norm(self: Exec, g: Graph, x: Buf) void {
+    pub fn l2norm(self: Exec, g: StepCtx, x: Buf) void {
         self.vtable.l2norm(g, self.ptr, x);
     }
     /// See `VTable.l2normRows`: `x` is `rows * n` long.  Equivalent to `rows`
     /// calls of `l2norm` on `x.span(r*n, n)`.
-    pub fn l2normRows(self: Exec, g: Graph, x: Buf, n: usize) void {
+    pub fn l2normRows(self: Exec, g: StepCtx, x: Buf, n: usize) void {
         self.vtable.l2normRows(g, self.ptr, x, n);
     }
-    pub fn scaleVec(self: Exec, g: Graph, x: Buf, s: f32) void {
+    pub fn scaleVec(self: Exec, g: StepCtx, x: Buf, s: f32) void {
         self.vtable.scaleVec(g, self.ptr, x, s);
     }
     /// One-launch form of `l2normRows(x[0..nk*kd], kd)`,
     /// `l2normRows(x[k_offset..k_offset+nk*kd], kd)` and
     /// `scaleVec(x[0..nk*kd], qscale)`.  The eps is the GDN one (1e-6), which
     /// the three-call form also uses via `l2normRows`.
-    pub fn l2normQkScale(self: Exec, g: Graph, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    pub fn l2normQkScale(self: Exec, g: StepCtx, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         self.vtable.l2normQkScale(g, self.ptr, x, nk, kd, k_offset, qscale);
     }
-    pub fn siluInPlace(self: Exec, g: Graph, x: Buf) void {
+    pub fn siluInPlace(self: Exec, g: StepCtx, x: Buf) void {
         self.vtable.siluInPlace(g, self.ptr, x);
     }
-    pub fn mulSilu(self: Exec, g: Graph, out: Buf, gate: Buf) void {
+    pub fn mulSilu(self: Exec, g: StepCtx, out: Buf, gate: Buf) void {
         self.vtable.mulSilu(g, self.ptr, out, gate);
     }
-    pub fn mulSigmoid(self: Exec, g: Graph, out: Buf, gate: Buf) void {
+    pub fn mulSigmoid(self: Exec, g: StepCtx, out: Buf, gate: Buf) void {
         self.vtable.mulSigmoid(g, self.ptr, out, gate);
     }
-    pub fn softmax(self: Exec, g: Graph, x: Buf) void {
+    pub fn softmax(self: Exec, g: StepCtx, x: Buf) void {
         self.vtable.softmax(g, self.ptr, x);
     }
-    pub fn addResid(self: Exec, g: Graph, dst: Buf, src: Buf) void {
+    pub fn addResid(self: Exec, g: StepCtx, dst: Buf, src: Buf) void {
         self.vtable.addResid(g, self.ptr, dst, src);
     }
-    pub fn swiglu(self: Exec, g: Graph, gate: Buf, up: Buf) void {
+    pub fn swiglu(self: Exec, g: StepCtx, gate: Buf, up: Buf) void {
         self.vtable.swiglu(g, self.ptr, gate, up);
     }
-    pub fn convStep(self: Exec, g: Graph, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
+    pub fn convStep(self: Exec, g: StepCtx, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
         self.vtable.convStep(g, self.ptr, conv, y, wconv, k);
     }
-    pub fn gdnStep(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
+    pub fn gdnStep(self: Exec, g: StepCtx, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
         self.vtable.gdnStep(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, vd);
     }
     /// Batched `gdnStep` -- see `VTable.gdnStepRows` for the per-head strides.
     /// Byte-for-byte the `heads` single calls it replaces; the engine uses this
     /// one (the single-row slot is kept for fallback and for A/B).
-    pub fn gdnStepRows(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRows(self: Exec, g: StepCtx, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                        gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         self.vtable.gdnStepRows(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
     /// See `VTable.gdnStepRowsChunk`: `rows` sequential `gdnStepRows` steps in
     /// one call, on the successive slices of every strided operand.
-    pub fn gdnStepRowsChunk(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRowsChunk(self: Exec, g: StepCtx, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
                             rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         self.vtable.gdnStepRowsChunk(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
     /// `gdnStepRowsChunk` 加每行的状态快照，见 `VTable.gdnStepRowsSnap`。
-    pub fn gdnStepRowsSnap(self: Exec, g: Graph, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+    pub fn gdnStepRowsSnap(self: Exec, g: StepCtx, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                            gamma: Buf, beta: Buf, snap: Buf,
                            heads: usize, nk: usize, kd: usize, vd: usize,
                            rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
         self.vtable.gdnStepRowsSnap(g, self.ptr, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
-    pub fn attnDecode(self: Exec, g: Graph, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
+    pub fn attnDecode(self: Exec, g: StepCtx, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         self.vtable.attnDecode(g, self.ptr, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
     /// `rows` tokens of prefill attention in one call; see `VTable.attnChunk`
     /// for the preconditions and the equivalence to the per-row form.
-    pub fn attnChunk(self: Exec, g: Graph, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
+    pub fn attnChunk(self: Exec, g: StepCtx, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                      slot0: usize, rows: usize, heads: usize, gqa: usize, hd: usize,
                      kv_dim: usize, scale: f32) void {
         self.vtable.attnChunk(g, self.ptr, q, gate, kcache, vcache, att, gout, slot0, rows, heads, gqa, hd, kv_dim, scale);
@@ -963,24 +962,24 @@ pub const Exec = struct {
     /// writes alpha as `abK[0..k*nv]` and beta as `abK[k*nv..]` -- two
     /// non-contiguous regions -- while the serial path passes the two halves
     /// of one row.
-    pub fn gdnGamma(self: Exec, g: Graph, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+    pub fn gdnGamma(self: Exec, g: StepCtx, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         self.vtable.gdnGamma(g, self.ptr, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
     /// GDN chunk prelude -- see `VTable.gdnPrefillCore` for the contract.
-    pub fn gdnPrefillCore(self: Exec, g: Graph, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+    pub fn gdnPrefillCore(self: Exec, g: StepCtx, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
         ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
         ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
         gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
         conv_k: usize, eps: f32) void {
         self.vtable.gdnPrefillCore(g, self.ptr, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens, conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim, nv, nk, kd, conv_k, eps);
     }
-    pub fn copyRange(self: Exec, g: Graph, dst: Buf, src: Buf) void {
+    pub fn copyRange(self: Exec, g: StepCtx, dst: Buf, src: Buf) void {
         self.vtable.copyRange(g, self.ptr, dst, src);
     }
 
     /// 拷贝 `g.ctl.rows` 行（每行 `row_elems` 个 f32），行数取设备控制块。
-    pub fn copyRowsCtl(self: Exec, g: Graph, dst: Buf, src: Buf, row_elems: usize) void {
+    pub fn copyRowsCtl(self: Exec, g: StepCtx, dst: Buf, src: Buf, row_elems: usize) void {
         self.vtable.copyRowsCtl(g, self.ptr, dst, src, row_elems);
     }
 
@@ -990,7 +989,7 @@ pub const Exec = struct {
     /// SOURCE is a backend region, so a host destination (wrapped as a `Buf`)
     /// is written through as if it were device memory, which aborts the context
     /// on CUDA.  Any caller holding a host buffer uses this instead.
-    pub fn copyOut(self: Exec, g: Graph, dst: []f32, src: Buf) void {
+    pub fn copyOut(self: Exec, g: StepCtx, dst: []f32, src: Buf) void {
         std.debug.assert(dst.len >= src.len);
         self.vtable.copyOut(g, self.ptr, dst[0..src.len], src);
     }
@@ -999,37 +998,37 @@ pub const Exec = struct {
     /// KV-cache append: `copyRange` whose destination is `base + slot * stride`.
     /// See `VTable.copyRangeSlot` for why a replaying backend needs the slot
     /// spelled out.
-    pub fn copyRangeSlot(self: Exec, g: Graph, dst: Buf, src: Buf, slot: usize) void {
+    pub fn copyRangeSlot(self: Exec, g: StepCtx, dst: Buf, src: Buf, slot: usize) void {
         self.vtable.copyRangeSlot(g, self.ptr, dst, src, slot);
     }
-    pub fn deinterleaveQG(self: Exec, g: Graph, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+    pub fn deinterleaveQG(self: Exec, g: StepCtx, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         self.vtable.deinterleaveQG(g, self.ptr, dst_q, dst_gate, src, heads, hd);
     }
-    pub fn deinterleaveQGStrided(self: Exec, g: Graph, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void {
+    pub fn deinterleaveQGStrided(self: Exec, g: StepCtx, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void {
         self.vtable.deinterleaveQGStrided(g, self.ptr, dst_q, dst_gate, src, heads, hd, tokens);
     }
-    pub fn copyFromHost(self: Exec, g: Graph, dst: Buf, src: []const f32) void {
+    pub fn copyFromHost(self: Exec, g: StepCtx, dst: Buf, src: []const f32) void {
         self.vtable.copyFromHost(g, self.ptr, dst, src);
     }
-    pub fn copyToHost(self: Exec, g: Graph, dst: []f32, src: Buf) void {
+    pub fn copyToHost(self: Exec, g: StepCtx, dst: []f32, src: Buf) void {
         self.vtable.copyOut(g, self.ptr, dst, src);
     }
-    pub fn zeroBuf(self: Exec, g: Graph, buf: Buf) void {
+    pub fn zeroBuf(self: Exec, g: StepCtx, buf: Buf) void {
         self.vtable.zeroBuf(g, self.ptr, buf);
     }
-    pub fn argmax(self: Exec, g: Graph, logits: Buf) u32 {
+    pub fn argmax(self: Exec, g: StepCtx, logits: Buf) u32 {
         return self.vtable.argmax(g, self.ptr, logits);
     }
     /// See `VTable.argmaxConf`.
-    pub fn argmaxConf(self: Exec, g: Graph, logits: Buf, p: *f32) u32 {
+    pub fn argmaxConf(self: Exec, g: StepCtx, logits: Buf, p: *f32) u32 {
         return self.vtable.argmaxConf(g, self.ptr, logits, p);
     }
     /// `rows` argmaxes over `rows * vocab` logits, one launch and one
     /// read-back on a device backend.  See `VTable.argmaxRows`.
-    pub fn argmaxRows(self: Exec, g: Graph, logits: Buf, rows: usize, out: []u32) void {
+    pub fn argmaxRows(self: Exec, g: StepCtx, logits: Buf, rows: usize, out: []u32) void {
         self.vtable.argmaxRows(g, self.ptr, logits, rows, out);
     }
-    pub fn sample(self: Exec, g: Graph, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
+    pub fn sample(self: Exec, g: StepCtx, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         return self.vtable.sample(g, self.ptr, logits, scratch, sp);
     }
     pub fn profPhase(self: Exec, on: bool) void {
@@ -1044,13 +1043,13 @@ pub const Exec = struct {
     /// Open / close one decode step.  See the vtable comments: this is a
     /// boundary hint the backend may ignore, and the CPU backend does.
     /// `slot` 由调用方指定（同一时刻不同 kind 的图必须落在不同槽），后端只
-    /// 原样记进句柄。见 `Graph.slot` 的说明：槽号走句柄而不是后端全局，才能
+    /// 原样记进句柄。见 `StepCtx.slot` 的说明：槽号走句柄而不是后端全局，才能
     /// 让嵌套 span 正确收尾。
     /// 这个槽里是否已有一张可重放的图（见 `VTable.hasGraph`）。
     pub fn hasGraph(self: Exec, slot: u8) bool {
         return self.vtable.hasGraph(self.ptr, slot);
     }
-    pub fn beginRecord(self: Exec, slot: u8, ctl: GraphCtl) Graph {
+    pub fn beginRecord(self: Exec, slot: u8, ctl: GraphCtl) StepCtx {
         return self.vtable.beginRecord(self.ptr, slot, ctl);
     }
     pub fn endRecord(self: Exec, slot: u8) void {

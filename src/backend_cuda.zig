@@ -276,26 +276,16 @@ fn stubNoCudaKernels() c_int {
     return 98;
 }
 
-/// 决定 `Launch.*` 调用在图的范围内该做什么的唯一一处。
+/// 计时用的"当前槽"。**op 里没有任何"该不该发射"的判断** —— 引擎在
+/// `.replay` 时整段跳过构建，op 根本不会被调用，所以后端不需要 gate。
 ///
-/// 语义只有一条：**`g.ptr` 非空表示"这一步由图在跑，主机侧不要再发射"**。
-///
-///   off / rec  `dGraphBegin` 返回 `ptr == null` 的直通图 → 这里返回 false，
-///              op 照常发射。`rec` 期间这在 CUDA 里是期望行为：capture 会把
-///              每一次发射记进图（参照项目同样如此，capture 期没有任何特殊
-///              分支）。
-///   live       `dGraphBegin` 在 `GraphLaunch` 之后返回带 `ptr` 的图 → 这里
-///              返回 true，op 被跳过。不跳过就是在默认流上把整步再算一遍，
-///              结果会和图的输出交错。
-///
-/// 这样就不需要 op 表，也不需要按 op 分别记账：判断依据是"这一 token 的
-/// 工作是否已经由图承担"。
+/// 这个变量只服务于 `$QWEN35_PROF` 的槽级计时。
 /// 当前正在执行的那一层图。它由 **每个 op 的定时包装**（`vMatvec`、
 /// `dAddResid` …）在调用 body 之前压入、之后弹回，而不是由"当前 span"全局
 /// 决定 —— 后者在嵌套 span（草稿块在 verify 里面）下会拿错槽。
 ///
 /// 它只服务于 `$QWEN35_PROF` 的槽级计时：录制/重放由引擎显式决定
-/// （`Graph.phase`），后端不猜，op 里也没有任何"该不该发射"的判断。
+/// （`StepCtx.phase`），后端不猜，op 里也没有任何"该不该发射"的判断。
 var xg_cur_slot: u8 = 0;
 /// 压入 `slot`，返回先前那个（供 `defer` 恢复）。
 inline fn xg_push_slot(slot: u8) u8 {
@@ -316,128 +306,128 @@ const Launch = if (cuda_linked) struct {
     const quantize_q8_k_mmq = Kernels.q35_launch_quantize_q8_K_mmq;
     const mmq_dp4a_wants = Kernels.q35_mmq_dp4a_wants;
     const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
-    fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize(g: backend.StepCtx, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_dequantize(ttype, d_src, d_dst, nblocks, stream);
     }
-    fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize_row(g: backend.StepCtx, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
     }
     /// 多行行反量化，行号从每步控制块读。见 `api.h`。
-    fn dequantize_rows_ctl(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize_rows_ctl(g: backend.StepCtx, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_dequantize_rows_ctl(ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, rows, scratch, scratch_ints, stream);
     }
-    fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec(g: backend.StepCtx, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_mul_mat_vec(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
-    fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec_f32(g: backend.StepCtx, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_mul_mat_vec_f32(d_w, d_x, d_out, rows, cols, tokens, stream);
     }
-    fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec_w16(g: backend.StepCtx, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_mul_mat_vec_w16(d_w, d_x, d_out, rows, cols, tokens, ttype, stream);
     }
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
-    fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn scale_vec(g: backend.StepCtx, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
     }
-    fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
+    fn l2norm_qk_scale(g: backend.StepCtx, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_l2norm_qk_scale(d_x, nk, kd, k_offset, eps, qscale, stream);
     }
     /// 是转发器，不是别名。`g` 决定这次发射是被录制、被重放还是直接执行（见
     /// `graphDispatch`）；其余参数就是 kernel 自己的参数，所以调用点上的
     /// `Launch.x(a, b, c)` 读起来和它包装的 launcher 一模一样。
-    fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn add_resid(g: backend.StepCtx, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_add_resid(dst, src, n, stream);
     }
-    fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn copy_range(g: backend.StepCtx, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
-    fn copy_range_rows_ctl(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
+    fn copy_range_rows_ctl(g: backend.StepCtx, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_copy_range_rows_ctl(d_dst, d_src, row_elems, d_ctl, cap_elems, stream);
     }
-    fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant(g: backend.StepCtx, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
     }
-    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant_dslot(g: backend.StepCtx, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, kind, stream);
     }
-    fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_chunk_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_chunk_dyn(d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
-    fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
+    fn deinterleave_qg(g: backend.StepCtx, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
     }
-    fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+    fn deinterleave_qg_strided(g: backend.StepCtx, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_deinterleave_qg_strided(d_q, d_gate, d_src, heads, hd, tokens, stream);
     }
-    fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn zero_buf(g: backend.StepCtx, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_zero_buf(d_buf, n, stream);
     }
-    fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+    fn rmsnorm(g: backend.StepCtx, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
     }
-    fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+    fn l2norm(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_l2norm(d_x, rows, n, eps, stream);
     }
-    fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn silu(g: backend.StepCtx, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_silu(d_x, n, stream);
     }
-    fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn mul_silu(g: backend.StepCtx, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_mul_silu(d_out, d_gate, n, stream);
     }
-    fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn mul_sigmoid(g: backend.StepCtx, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_mul_sigmoid(d_out, d_gate, n, stream);
     }
-    fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn swiglu(g: backend.StepCtx, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
     }
-    fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn softmax(g: backend.StepCtx, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_softmax(d_x, n, stream);
     }
-    fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn conv_step(g: backend.StepCtx, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
-    fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
+    fn argmax(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
     }
-    fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+    fn argmax_batch(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
     }
-    fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+    fn argmax_conf(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_argmax_conf(d_x, n, d_out, stream);
     }
-    fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
+    fn sample(g: backend.StepCtx, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
     }
@@ -445,55 +435,55 @@ const Launch = if (cuda_linked) struct {
     const sample_deinit = Kernels.q35_launch_sample_deinit;
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
-    fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_decode(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
-    fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_chunk(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_chunk(d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_max_rows = Kernels.q35_attn_chunk_max_rows;
-    fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_decode_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
-    fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_coal(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_decode_coal(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
-    fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_split2(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_decode_split2(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
-    fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_split_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_attn_decode_split_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
     const set_int1 = Kernels.q35_launch_set_int1;
     const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
-    fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step(g: backend.StepCtx, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_step(d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream);
     }
-    fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_step_rows(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream);
     }
-    fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows_chunk(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_step_rows_chunk(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
-    fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows_snap(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_step_rows_snap(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream);
     }
-    fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_wy(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_step_wy(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
-    fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_gamma(g: backend.StepCtx, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_gamma(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream);
     }
@@ -502,40 +492,40 @@ const Launch = if (cuda_linked) struct {
     // `dGdnPrefillCore` 的调用点曾直接写 `Kernels.q35_launch_*`，那让这 4 个 stub
     // 变成死代码，并让 `zig build`（不带 -Dcuda）在**链接期**因未定义符号失败
     // —— 这类失败是上面的类型错误抓不到的。
-    fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
+    fn conv_step_rows(g: backend.StepCtx, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_conv_step_rows(d_conv, d_y, d_wconv, n, tokens, y_stride, stream);
     }
-    fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_gamma_rows(g: backend.StepCtx, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_gdn_gamma_rows(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream);
     }
-    fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
+    fn l2norm_strided(g: backend.StepCtx, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_l2norm_strided(d_x, row_offset, rows, n, eps, tokens, row_stride, stream);
     }
-    fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
+    fn scale_vec_strided(g: backend.StepCtx, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_scale_vec_strided(d_x, offset, s, n, tokens, stride, stream);
     }
-    fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
+    fn rope64(g: backend.StepCtx, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rope64(d_x, heads, hd, pos, base, stream);
     }
-    fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    fn rope64_dpos(g: backend.StepCtx, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rope64_dpos(d_x, heads, hd, d_ctl, stream);
     }
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
-    fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
+    fn rope64_rows(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rope64_rows(d_x, rows, heads, hd, pos0, base, stream);
     }
-    fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
+    fn rope_rows_dim(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rope_rows_dim(d_x, rows, heads, hd, pos0, base, rotary_dim, stream);
     }
-    fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    fn rope64_rows_dpos(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         return Kernels.q35_launch_rope64_rows_dpos(d_x, rows, heads, hd, d_ctl, stream);
     }
@@ -563,32 +553,32 @@ const Launch = if (cuda_linked) struct {
     fn mmq_act_block_bytes() c_int {
         return 288;
     }
-    fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize(g: backend.StepCtx, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ ttype, d_src, d_dst, nblocks, stream };
         return stubNoCudaKernels();
     }
-    fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize_row(g: backend.StepCtx, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ ttype, d_src_row, d_dst, cols, stream };
         return stubNoCudaKernels();
     }
-    fn dequantize_rows_ctl(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
+    fn dequantize_rows_ctl(g: backend.StepCtx, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, rows, scratch, scratch_ints, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec(g: backend.StepCtx, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_w, d_xq, d_out, rows, cols, tokens, ttype, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec_f32(g: backend.StepCtx, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_w, d_x, d_out, rows, cols, tokens, stream };
         return stubNoCudaKernels();
     }
-    fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
+    fn mul_mat_vec_w16(g: backend.StepCtx, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_w, d_x, d_out, rows, cols, tokens, ttype, stream };
         return stubNoCudaKernels();
@@ -603,32 +593,32 @@ const Launch = if (cuda_linked) struct {
     fn tables_bytes() callconv(.c) c_ulonglong {
         return 0;
     }
-    fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn scale_vec(g: backend.StepCtx, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, s, n, stream };
         return stubNoCudaKernels();
     }
-    fn add_resid(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn add_resid(g: backend.StepCtx, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
-    fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn copy_range(g: backend.StepCtx, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_dst, d_src, n, stream };
         return stubNoCudaKernels();
     }
-    fn copy_range_rows_ctl(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
+    fn copy_range_rows_ctl(g: backend.StepCtx, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_dst, d_src, row_elems, d_ctl, cap_elems, stream };
         return stubNoCudaKernels();
     }
-    fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant(g: backend.StepCtx, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, d_out, nblocks, kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_chunk_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
@@ -637,7 +627,7 @@ const Launch = if (cuda_linked) struct {
         _ = .{ hd, kv_kind };
         return 0;
     }
-    fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
+    fn kv_quant_dslot(g: backend.StepCtx, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, kind, stream };
         return stubNoCudaKernels();
@@ -645,72 +635,72 @@ const Launch = if (cuda_linked) struct {
     fn func_kv_quant_dslot() callconv(.c) ?*anyopaque {
         return null;
     }
-    fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
+    fn deinterleave_qg(g: backend.StepCtx, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_src, heads, hd, stream };
         return stubNoCudaKernels();
     }
-    fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn zero_buf(g: backend.StepCtx, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_buf, n, stream };
         return stubNoCudaKernels();
     }
-    fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+    fn rmsnorm(g: backend.StepCtx, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_out, d_x, d_w, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
+    fn l2norm(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, rows, n, eps, stream };
         return stubNoCudaKernels();
     }
-    fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn silu(g: backend.StepCtx, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
-    fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn mul_silu(g: backend.StepCtx, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_out, d_gate, n, stream };
         return stubNoCudaKernels();
     }
-    fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn mul_sigmoid(g: backend.StepCtx, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_out, d_gate, n, stream };
         return stubNoCudaKernels();
     }
-    fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn swiglu(g: backend.StepCtx, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_gate, d_up, n, stream };
         return stubNoCudaKernels();
     }
-    fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn softmax(g: backend.StepCtx, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, n, stream };
         return stubNoCudaKernels();
     }
-    fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
+    fn conv_step(g: backend.StepCtx, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_conv, d_y, d_wconv, n, stream };
         return stubNoCudaKernels();
     }
-    fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+    fn argmax_batch(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, n, rows, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
+    fn argmax(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
+    fn argmax_conf(g: backend.StepCtx, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
     }
-    fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
+    fn sample(g: backend.StepCtx, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_logits, n, d_ctl, d_scratch, stream };
         return stubNoCudaKernels();
@@ -728,12 +718,12 @@ const Launch = if (cuda_linked) struct {
     fn sample_ctl_ints() callconv(.c) c_int {
         return 0;
     }
-    fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_chunk(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
@@ -745,7 +735,7 @@ const Launch = if (cuda_linked) struct {
         _ = .{ slot0, hd, kv_kind };
         return 0;
     }
-    fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
+    fn deinterleave_qg_strided(g: backend.StepCtx, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_src, heads, hd, tokens, stream };
         return stubNoCudaKernels();
@@ -754,22 +744,22 @@ const Launch = if (cuda_linked) struct {
     // 这里都必须有对应成员，否则以后新加的调用点会让 `zig build`（不带 -Dcuda）
     // 报 `no member named ...` —— `set_int1` 和三个 `attn_decode_*` 变体正是这样
     // 漏过去的：它们被起了别名、被调用，而这个结构体已经很久没人读了。
-    fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_coal(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_split2(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
     }
-    fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
+    fn attn_decode_split_dyn(g: backend.StepCtx, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream };
         return stubNoCudaKernels();
@@ -786,64 +776,64 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_ctl, pos, base_bits, kv_slot, attn_slot, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step(g: backend.StepCtx, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows_chunk(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_rows_snap(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_step_wy(g: backend.StepCtx, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_gamma(g: backend.StepCtx, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
     // 仅 prefill 使用的孪生版本，现在和其它 launcher 一样经 `Launch` 到达
     // （见 CUDA 分支里的说明：它们曾绕过这条接缝）。
-    fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
+    fn conv_step_rows(g: backend.StepCtx, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_conv, d_y, d_wconv, n, tokens, y_stride, stream };
         return stubNoCudaKernels();
     }
-    fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
+    fn gdn_gamma_rows(g: backend.StepCtx, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
+    fn l2norm_strided(g: backend.StepCtx, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, row_offset, rows, n, eps, tokens, row_stride, stream };
         return stubNoCudaKernels();
     }
-    fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
+    fn scale_vec_strided(g: backend.StepCtx, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, offset, s, n, tokens, stride, stream };
         return stubNoCudaKernels();
     }
-    fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
+    fn rope64(g: backend.StepCtx, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, heads, hd, pos, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    fn rope64_dpos(g: backend.StepCtx, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, heads, hd, d_ctl, stream };
         return stubNoCudaKernels();
@@ -852,22 +842,22 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_dyn, pos, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
+    fn rope64_rows(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, rows, heads, hd, pos0, base, stream };
         return stubNoCudaKernels();
     }
-    fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
+    fn rope_rows_dim(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, rows, heads, hd, pos0, base, rotary_dim, stream };
         return stubNoCudaKernels();
     }
-    fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
+    fn rope64_rows_dpos(g: backend.StepCtx, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, rows, heads, hd, d_ctl, stream };
         return stubNoCudaKernels();
     }
-    fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
+    fn l2norm_qk_scale(g: backend.StepCtx, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
         _ = g;
         _ = .{ d_x, nk, kd, k_offset, eps, qscale, stream };
         return stubNoCudaKernels();
@@ -1670,7 +1660,7 @@ pub const CudaBackend = struct {
     //              must be redirectable to `g_stream`.
     //   live    -- `g_exec` holds a replayable graph.
 
-    /// 三张图的槽。槽号由引擎经 `Graph.slot` 传进来（`xdPhaseBegin` 只看
+    /// 三张图的槽。槽号由引擎经 `StepCtx.slot` 传进来（`xdPhaseBegin` 只看
     /// `g.slot`），后端没有"当前槽"这种全局状态：
     /// 0 = decode（1 行）、1 = verify（k 行）、2 = nextn（草稿块）。
     /// 形状不同就不能共用一槽：节点集合一变，每步都要重捕，等于没有图。
@@ -2180,8 +2170,8 @@ pub const CudaBackend = struct {
     var g_graph_cached: ?bool = null;
     var g_xd_cached: ?bool = null;
 
-    /// 槽 `i`。**没有"当前槽"这种全局状态**：调用方一律把 `Graph.slot` 传进
-    /// 来（见 `backend.Graph.slot` 的说明 —— 嵌套 span 下全局当前槽会让外层
+    /// 槽 `i`。**没有"当前槽"这种全局状态**：调用方一律把 `StepCtx.slot` 传进
+    /// 来（见 `backend.StepCtx.slot` 的说明 —— 嵌套 span 下全局当前槽会让外层
     /// `graphEnd` 收尾到错误的槽上）。
     inline fn gs(self: anytype, slot: u8) if (@TypeOf(self) == *CudaBackend) *GraphSlot else *const GraphSlot {
         std.debug.assert(slot < self.g_slots.len);
@@ -2312,7 +2302,7 @@ pub const CudaBackend = struct {
     ///
     /// 必须按图问：不同槽的 capture 状态不同，问"后端有没有在录"会把 A 图
     /// 的录制误当成 B 图的（草稿块就嵌在 verify 的调用栈里面）。
-    fn capturing(self: *const CudaBackend, g: backend.Graph) bool {
+    fn capturing(self: *const CudaBackend, g: backend.StepCtx) bool {
         if (g.slot >= self.g_slots.len) return false;
         return self.g_slots[g.slot].xd_phase == .rec;
     }
@@ -2340,7 +2330,7 @@ pub const CudaBackend = struct {
 
     /// 这张图是（或即将是）`rec`/`live` 吗 —— 即它的 op 必须走设备控制块
     /// 形态，好让重放的节点读到当步的标量。同样按图问，理由同 `capturing`。
-    fn graphActive(self: *const CudaBackend, g: backend.Graph) bool {
+    fn graphActive(self: *const CudaBackend, g: backend.StepCtx) bool {
         if (g.slot >= self.g_slots.len) return false;
         const ph = self.g_slots[g.slot].xd_phase;
         return ph == .rec or ph == .live;
@@ -2365,7 +2355,7 @@ pub const CudaBackend = struct {
     ///
     /// 按图而不是"扫描所有槽"：嵌套 span 下（草稿块在 verify 里面）扫描会
     /// 关掉外层的 capture 而把内层的留着，结果两个槽的状态都不对。
-    fn graphAbandon(self: *CudaBackend, g: backend.Graph, why: []const u8) void {
+    fn graphAbandon(self: *CudaBackend, g: backend.StepCtx, why: []const u8) void {
         if (g.slot >= self.g_slots.len) return;
         if (self.g_slots[g.slot].xd_phase != .rec) return;
         self.stat_g_abandon += 1;
@@ -2755,7 +2745,7 @@ pub const CudaBackend = struct {
     /// is already device memory (the CUDA-graph decode path), otherwise into the
     /// shared staging buffer and downloads.  Returns the launch result code so the
     /// caller reports it; 0 (cudaSuccess) means the work is queued/done.
-    fn launchW16(self: *CudaBackend, g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32,
+    fn launchW16(self: *CudaBackend, g: backend.StepCtx, d_w: ?*const anyopaque, d_x: ?[*]const f32,
                  ttype: gguf.TensorType, rows: usize, cols: usize, tokens: usize,
                  outBuf: backend.Buf) c_int {
         const n = tokens * rows;
@@ -2797,7 +2787,7 @@ pub const CudaBackend = struct {
     /// The activation is read straight from a device pointer, which after P2d is
     /// normally the caller's own resident buffer (`xBuf`), not a `d_act` staging
     /// area -- staging is only written when a caller hands over a host slice.
-    fn quantizeActFrom(self: *CudaBackend, g: backend.Graph, d_src: [*]const f32, ttype: gguf.TensorType, cols: usize) !usize {
+    fn quantizeActFrom(self: *CudaBackend, g: backend.StepCtx, d_src: [*]const f32, ttype: gguf.TensorType, cols: usize) !usize {
         const cu = &self.cu.?;
         const nb = cols / actBlockElems(ttype);
         std.debug.assert(nb * actBlockElems(ttype) == cols);
@@ -3038,7 +3028,7 @@ pub const CudaBackend = struct {
     ///
     /// The engine calls this once per row (token embedding, lm_head), so it is a
     /// latency path rather than a throughput one.
-    fn vDequantRow_body(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow_body(g: backend.StepCtx, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: dequantRow: {s}\n", .{self.needHelp()});
@@ -3085,7 +3075,7 @@ pub const CudaBackend = struct {
         //
         // 调用方必须先 `graphBegin` 再调本槽，否则 `g.ctl.tok[0]` 还是上一轮
         // 的值 —— 嵌入必须是 span **内**的第一个 op。
-        const gated = g.ptr != null and self.ctl_dev != null and
+        const gated = g.phase == .record and self.ctl_dev != null and
             row < w.rows and cols % gguf.blockElems(w.ttype) == 0 and gguf.blockElems(w.ttype) != 0;
         const rc = blk: {
             if (gated) {
@@ -3164,7 +3154,7 @@ pub const CudaBackend = struct {
     /// padding between the two tensors would break that (it does not here --
     /// checked for all 48 layers), and gluing across a pad would make the kernel
     /// read the pad as a block, so the test is exact rather than approximate.
-    fn vMatvecPair_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvecPair_body(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const r = outBuf.len / 2;
         if (outBuf.len % 2 != 0 or r == 0) {
@@ -3217,7 +3207,7 @@ pub const CudaBackend = struct {
         };
     }
 
-    fn vMatvec_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvec_body(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
@@ -3538,7 +3528,7 @@ pub const CudaBackend = struct {
     /// in one `cudaMemcpy`, quantized as `K` consecutive block groups in one buffer
     /// (`d_xq`, group `j` at `j * actBytes(ttype, cols)`), then a single launch
     /// computes `K*rows` outputs and one download returns them.
-    fn vMatvecBatchK_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+    fn vMatvecBatchK_body(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvecBatchK: {s}\n", .{self.needHelp()});
@@ -4013,7 +4003,7 @@ pub const CudaBackend = struct {
     /// recorded so the graph retargets it one row per token exactly like the
     /// f32 append.  The CPU path is the correctness net for a broken/missing
     /// device (mirrors `dCopyRange`), never the normal route.
-    fn dKvAppend_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
+    fn dKvAppend_body(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
         const self = self_(ctx);
         if (rows == 0) return;
         // f32: the historical path, unchanged (and graph-identical) -- except
@@ -4203,7 +4193,7 @@ pub const CudaBackend = struct {
     /// kernel is claimed to be bit-identical to that three-call sequence.
     const gdn_l2_eps: f32 = 1e-6;
 
-    fn dL2normQkScale_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    fn dL2normQkScale_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         const self = self_(ctx);
         const nb = nk * kd;
         if (nk != 0 and kd != 0 and k_offset >= nb and x.len >= k_offset + nb) {
@@ -4253,7 +4243,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.l2normQkScale(.{}, @ptrCast(&l2qk_cpu), cpu_buf, nk, kd, k_offset, qscale);
         // Device side: run the kernel on `px` itself, then read it back.
         // `$QWEN35_L2QK_CHECK` 是同步的逐元素对拍，永远不参与图，所以传直通图。
-        _ = Launch.l2norm_qk_scale(backend.Graph.direct, px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
+        _ = Launch.l2norm_qk_scale(backend.StepCtx.direct, px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
         _ = lib.DeviceSynchronize();
         _ = lib.Memcpy(host.ptr, px, bytes, cudart.MemcpyDeviceToHost);
         var worst: f32 = 0;
@@ -4272,7 +4262,7 @@ pub const CudaBackend = struct {
         std.debug.print("L2QKCHECK nk={d} kd={d} k_off={d} total={d} worst={e:.3} at {d} (>1e-6: {d})\n", .{ nk, kd, k_offset, total, worst, worst_i, bad });
     }
 
-    fn dScaleVec_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
+    fn dScaleVec_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -4284,7 +4274,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.scaleVec(.{}, @ptrCast(&self.cpu), x, s);
     }
 
-    fn dAddResid_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dAddResid_body(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
         // zips the two slices).  A mismatch is an engine bug, so refuse to guess
@@ -4338,12 +4328,12 @@ pub const CudaBackend = struct {
     /// launch is a graph node like any other, so a replay re-runs it with the
     /// pointers it was captured with.  `slot` is part of the caller's contract
     /// (`kvAppend` decides which row) and is not needed here.
-    fn dCopyRangeSlot_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
+    fn dCopyRangeSlot_body(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         _ = slot;
         CudaBackend.dCopyRange_body(g, ctx, dst, src);
     }
 
-    fn dCopyRange_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dCopyRange_body(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         // Same contract as `addResid`: `elementwise.bufCopyRange` is a plain
         // `@memcpy`, which requires equal lengths.  Mismatch = engine bug ->
@@ -4373,7 +4363,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.copyRange(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
-    fn dZeroBuf_body(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
+    fn dZeroBuf_body(g: backend.StepCtx, ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(buf)) |p| {
@@ -4401,7 +4391,7 @@ pub const CudaBackend = struct {
     //
     // Everything else in this file is device-to-device.
 
-    fn dCopyFromHost_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+    fn dCopyFromHost_body(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
         // The bytes behind `dst` just changed, so anything quantised from it is
         // stale.  Conservative and free: the next matvec re-quantises.
@@ -4444,7 +4434,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.copyFromHost(.{}, @ptrCast(&self.cpu), dst, src);
     }
 
-    fn dCopyToHost_body(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+    fn dCopyToHost_body(g: backend.StepCtx, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
         const self = self_(ctx);
         std.debug.assert(dst.len <= src.len);
         if (self.capturing(g)) self.graphAbandon(g, "device-to-host copy inside forward");
@@ -4485,7 +4475,7 @@ pub const CudaBackend = struct {
     //     uploaded exactly once at load time (`loadVecF32`); each call just reads
     //     the resident device pointer -- no per-token upload.
 
-    fn dRmsnorm_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+    fn dRmsnorm_body(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
         // The CPU reference asserts out.len == x.len == w.len (one row).  The
         // kernel supports several rows (w reused per row) for the shape the
@@ -4514,7 +4504,7 @@ pub const CudaBackend = struct {
     ///
     /// Falls back to the per-row loop (`rmsnormRows` semantics) whenever the
     /// geometry does not hold, which is what the CPU side does anyway.
-    fn dRmsnormRows_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+    fn dRmsnormRows_body(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
         const n = w.len;
         if (rows_in != 0 and n != 0 and x.len == rows_in * n and out.len == rows_in * n and self.cu != null) {
@@ -4533,7 +4523,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.rmsnormRows(.{}, @ptrCast(&self.cpu), out, x, w, rows_in, eps);
     }
 
-    fn dL2norm_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dL2norm_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -4551,7 +4541,7 @@ pub const CudaBackend = struct {
     /// normalising its own `n`-element row with its own eps-inside-the-sum
     /// reduction.  `k_l2norm` already strides by `blockIdx.x * n`, so this is
     /// the same arithmetic as `x.len / n` single-row launches.
-    fn dL2normRows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, n_in: usize) void {
+    fn dL2normRows_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, n_in: usize) void {
         const self = self_(ctx);
         const n = n_in;
         if (n != 0 and x.len % n == 0 and self.cu != null) {
@@ -4567,7 +4557,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.l2normRows(.{}, @ptrCast(&self.cpu), x, n);
     }
 
-    fn dSiluInPlace_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dSiluInPlace_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -4579,7 +4569,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.siluInPlace(.{}, @ptrCast(&self.cpu), x);
     }
 
-    fn dMulSilu_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSilu_body(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
@@ -4598,7 +4588,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.mulSilu(.{}, @ptrCast(&self.cpu), out, gate);
     }
 
-    fn dMulSigmoid_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSigmoid_body(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
@@ -4617,7 +4607,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.mulSigmoid(.{}, @ptrCast(&self.cpu), out, gate);
     }
 
-    fn dSwiglu_body(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+    fn dSwiglu_body(g: backend.StepCtx, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
         if (up.len != gate.len) {
             std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
@@ -4636,7 +4626,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.swiglu(.{}, @ptrCast(&self.cpu), gate, up);
     }
 
-    fn dSoftmax_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dSoftmax_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -4669,7 +4659,7 @@ pub const CudaBackend = struct {
     /// 36 such calls totalled 235 ms of host wait against 9 us of kernel time --
     /// each one waited on the whole preceding round's launches, so paying that
     /// wait five times per round was pure loss.
-    fn dArgmaxRows(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
+    fn dArgmaxRows(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf, rows: usize, out: []u32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -4724,7 +4714,7 @@ pub const CudaBackend = struct {
         const cu = &self.cu.?;
         ensureBuf(&cu.lib, &self.d_conf, &self.d_conf_bytes, 3 * @sizeOf(c_int)) catch return 0;
         // 直通图：本函数紧跟一次阻塞 D2H（读回 12 字节），不可能被捕获。
-        const rc = Launch.argmax_conf(backend.Graph.direct, px, @intCast(logits.len), @ptrCast(@alignCast(self.d_conf)), null);
+        const rc = Launch.argmax_conf(backend.StepCtx.direct, px, @intCast(logits.len), @ptrCast(@alignCast(self.d_conf)), null);
         if (rc != cudart.cudaSuccess) {
             self.ewLaunchFail("argmax_conf", rc);
             return cpuConfFallback(self, logits, out_p);
@@ -4760,14 +4750,14 @@ pub const CudaBackend = struct {
         return bi;
     }
 
-    fn dArgmaxConf(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
+    fn dArgmaxConf(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf, p: *f32) u32 {
         _ = g;
         const self = self_(ctx);
         if (self.anySlotLive()) p.* = 1.0; // the graph already ran it
         return self.argmaxConf(logits, p);
     }
 
-    fn dArgmax_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
+    fn dArgmax_body(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
             if (dBufPtr(logits)) |px| {
@@ -4947,7 +4937,7 @@ pub const CudaBackend = struct {
     ///   * 捕获路径上**不**在这里下载结果。D2H 无法被捕获；由 `stepEnd` 在图
     ///     关闭之后执行它，`sampledToken` 再把值交给引擎。直接发射路径上下载
     ///     当场发生，`sampledToken` 是恒等。
-    fn dSample_body(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+    fn dSample_body(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
         // A/B 开关：在 GPU 自己产出的 logits 上跑 CPU 参照采样器。
         //
@@ -5088,7 +5078,7 @@ pub const CudaBackend = struct {
     // attn.cu): accumulation order follows the CPU reference element by
     // element, and neither is bit-exact (FMA contraction on the device side).
 
-    fn dGdnStep_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStep_body(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
@@ -5130,7 +5120,7 @@ pub const CudaBackend = struct {
     /// per-head views the kernel computes must lie inside the buffers the
     /// caller handed us (a head whose slice overruns would read a neighbouring
     /// head's state, which is silent garbage rather than a fault).
-    fn dGdnStepRows_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRows_body(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize) void {
@@ -5187,7 +5177,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.gdnStepRows(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
-    fn dGdnGamma_body(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+    fn dGdnGamma_body(g: backend.StepCtx, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
         // Every operand here is a backend region.  The two weight rows
@@ -5228,7 +5218,7 @@ pub const CudaBackend = struct {
     /// Falls back to the CPU body when any region is not device-resident or a
     /// launch fails -- same policy as every other forwarder here (numbers stay
     /// right, only the speedup is lost).
-    fn dGdnPrefillCore_body(g: backend.Graph, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+    fn dGdnPrefillCore_body(g: backend.StepCtx, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
                             wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
                             dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
                             conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
@@ -5340,7 +5330,7 @@ pub const CudaBackend = struct {
         };
     }
 
-    fn dAttnDecode_body(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnDecode_body(g: backend.StepCtx, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
@@ -5527,7 +5517,7 @@ pub const CudaBackend = struct {
     /// token would otherwise publish 448 times).  Returns true if it launched the
     /// writer, i.e. if the caller must not assume the values are already there.
 
-    fn dRope64_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+    fn dRope64_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         const max_head: usize = 256;
         var host: [max_head]f32 = undefined;
@@ -5624,7 +5614,7 @@ pub const CudaBackend = struct {
     /// NEVER used during a decode capture: this slot would add a node the graph
     /// cannot retarget (it matches `q35_func_rope64` node-by-node), so it bails
     /// out to the per-row loop when a capture is live.  Prefill does not capture.
-    fn dRope64Rows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+    fn dRope64Rows_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
         const row_len = heads_in * hd_in;
         if (!ropeOnDevice() or
@@ -5671,7 +5661,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.rope64Rows(.{}, @ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
     }
 
-    fn dConvStep_body(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+    fn dConvStep_body(g: backend.StepCtx, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
         // `conv` is the GDN sliding window and is BOTH read and written (the
         // kernel shifts it in place); `y` likewise (read as the 4th tap, then
@@ -6651,9 +6641,9 @@ pub const CudaBackend = struct {
 
     /// `VTable.beginRecord`：打开 capture。这一轮随后发出的 op 全部被录进图，
     /// **不执行**。槽里已有旧图时先销毁（形状变了必须重录）。
-    fn dBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.Graph {
+    fn dBeginRecord(ctx: *anyopaque, slot: u8, ctl: backend.GraphCtl) backend.StepCtx {
         const self = self_(ctx);
-        const direct = backend.Graph{ .kind = .decode, .slot = slot, .ctl = ctl };
+        const direct = backend.StepCtx{ .kind = .decode, .slot = slot, .ctl = ctl };
         if (!self.gpuReady() or slot >= self.g_slots.len) return direct;
         if (!graphWanted() or !xdWanted()) return direct;
         const s = self.gs(slot);
@@ -6664,8 +6654,7 @@ pub const CudaBackend = struct {
         s.xd_launched = false;
         s.xd_phase = .rec;
         if (!self.xdStartCapture(s)) return direct;
-        // `ptr` 必须非空：各 op 用 `g.ptr != null` 判断"我是不是在图里"。
-        return .{ .kind = .decode, .slot = slot, .ctl = ctl, .ptr = @ptrCast(s), .phase = .record };
+        return .{ .kind = .decode, .slot = slot, .ctl = ctl, .phase = .record };
     }
 
     /// `VTable.endRecord`：关 capture + instantiate。**只做这两件事**。
@@ -6903,7 +6892,7 @@ pub const CudaBackend = struct {
 
     /// The `dequantRow` slot, timed (`$QWEN35_PROF`).
     /// `VTable.copyRowsCtl`：行数取设备控制块的 `rows`。
-    fn vCopyRowsCtl(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, row_elems: usize) void {
+    fn vCopyRowsCtl(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, row_elems: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -6926,7 +6915,7 @@ pub const CudaBackend = struct {
         @memcpy(dst.slice()[0..n], src.slice()[0..n]);
     }
 
-    fn vDequantRow(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow(g: backend.StepCtx, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -6939,7 +6928,7 @@ pub const CudaBackend = struct {
     ///
     /// 两条发射：先把 `ctl.tok` 在设备上展开成每块的源偏移表，再按类型解量化。
     /// 两者实参全是模型常量，所以整条路径可以录进图。
-    fn vDequantRows(g: backend.Graph, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow) void {
+    fn vDequantRows(g: backend.StepCtx, ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -6999,7 +6988,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `matvec` slot, timed (`$QWEN35_PROF`).
-    fn vMatvec(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvec(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7011,7 +7000,7 @@ pub const CudaBackend = struct {
 
     /// The `matvecPair` slot; charged to `matvec` since it IS a matvec launch
     /// (or two), and a separate slot would only split the same total.
-    fn vMatvecPair(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvecPair(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7022,7 +7011,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `matvecBatchK` slot, timed (`$QWEN35_PROF`).
-    fn vMatvecBatchK(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+    fn vMatvecBatchK(g: backend.StepCtx, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7059,12 +7048,12 @@ pub const CudaBackend = struct {
     /// The GDN q/k normalisation as one launch (see `backend.Exec`).
     /// Not a timed slot of its own: it replaces `l2norm_rows` x2 + `scale_vec`,
     /// whose slots it would otherwise have to charge in fractions.
-    fn dL2normQkScale(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+    fn dL2normQkScale(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
         dL2normQkScale_body(g, ctx, x, nk, kd, k_offset, qscale);
     }
 
     /// The `scaleVec` slot, timed (`$QWEN35_PROF`).
-    fn dScaleVec(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
+    fn dScaleVec(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7075,7 +7064,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `addResid` slot, timed (`$QWEN35_PROF`).
-    fn dAddResid(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dAddResid(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7086,7 +7075,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `copyRange` slot, timed (`$QWEN35_PROF`).
-    fn dCopyRange(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dCopyRange(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7112,7 +7101,7 @@ pub const CudaBackend = struct {
     /// only difference is that the capture records its destination).  Kept
     /// apart from `dCopyRange` so the recording cannot be reached from the
     /// generic path, where a moving destination does not exist.
-    fn dCopyRangeSlot(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
+    fn dCopyRangeSlot(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7137,7 +7126,7 @@ pub const CudaBackend = struct {
     /// `2*heads` `copyRange` launches.  Not a `cudaMemcpy`: the two halves of a
     /// head are interleaved with the *other* half, so no single linear copy
     /// can produce the dense layout -- hence the kernel.
-    fn dDeinterleaveQG(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
+    fn dDeinterleaveQG(g: backend.StepCtx, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf, src: backend.Buf, heads: usize, hd: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7163,7 +7152,7 @@ pub const CudaBackend = struct {
     /// Chunk-wide `deinterleaveQG`: `tokens` rows in one launch.  Same move as
     /// `dDeinterleaveQG`, so this is exact; it exists because the per-row form
     /// cost 940 launches per 525-token prefill (1.2% of device time at 6 us).
-    fn dDeinterleaveQGStrided(g: backend.Graph, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
+    fn dDeinterleaveQGStrided(g: backend.StepCtx, ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
                               src: backend.Buf, heads: usize, hd: usize, tokens: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
@@ -7189,7 +7178,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `zeroBuf` slot, timed (`$QWEN35_PROF`).
-    fn dZeroBuf(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
+    fn dZeroBuf(g: backend.StepCtx, ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7200,7 +7189,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `copyFromHost` slot, timed (`$QWEN35_PROF`).
-    fn dCopyFromHost(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+    fn dCopyFromHost(g: backend.StepCtx, ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7211,7 +7200,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `copyToHost` slot, timed (`$QWEN35_PROF`).
-    fn dCopyToHost(g: backend.Graph, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+    fn dCopyToHost(g: backend.StepCtx, ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7221,7 +7210,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `rmsnorm` slot, timed (`$QWEN35_PROF`).
-    fn dRmsnorm(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+    fn dRmsnorm(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7234,7 +7223,7 @@ pub const CudaBackend = struct {
     /// Row-batched twin of `dRmsnorm`.  Charged to the `rmsnorm` slot so the
     /// `PROF-SLOT` total for rmsnorm stays comparable across the change (only
     /// its `calls` count moves, which is the point of the merge).
-    fn dRmsnormRows(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+    fn dRmsnormRows(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7245,7 +7234,7 @@ pub const CudaBackend = struct {
     }
 
     /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
-    fn dL2norm(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dL2norm(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7256,7 +7245,7 @@ pub const CudaBackend = struct {
     }
 
     /// Row-batched twin of `dL2norm`; charged to the `l2norm` slot.
-    fn dL2normRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, n: usize) void {
+    fn dL2normRows(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, n: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7266,7 +7255,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
-    fn dSiluInPlace(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dSiluInPlace(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7277,7 +7266,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `mulSilu` slot, timed (`$QWEN35_PROF`).
-    fn dMulSilu(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSilu(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7288,7 +7277,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `mulSigmoid` slot, timed (`$QWEN35_PROF`).
-    fn dMulSigmoid(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSigmoid(g: backend.StepCtx, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7299,7 +7288,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `swiglu` slot, timed (`$QWEN35_PROF`).
-    fn dSwiglu(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+    fn dSwiglu(g: backend.StepCtx, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7310,7 +7299,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `softmax` slot, timed (`$QWEN35_PROF`).
-    fn dSoftmax(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
+    fn dSoftmax(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7321,7 +7310,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `argmax` slot, timed (`$QWEN35_PROF`).
-    fn dArgmax(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf) u32 {
+    fn dArgmax(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7332,7 +7321,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `sample` slot, timed (`$QWEN35_PROF`).
-    fn dSample(g: backend.Graph, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+    fn dSample(g: backend.StepCtx, ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7343,7 +7332,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `gdnStep` slot, timed (`$QWEN35_PROF`).
-    fn dGdnStep(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStep(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
@@ -7357,7 +7346,7 @@ pub const CudaBackend = struct {
     /// single-row one: it does the same work for all heads, so the `PROF-SLOT`
     /// line stays comparable across the change (calls drops by `heads`x, which
     /// is the check that the batching actually took effect).
-    fn dGdnStepRows(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRows(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                     q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                     gamma: backend.Buf, beta: backend.Buf,
                     heads: usize, nk: usize, kd: usize, vd: usize) void {
@@ -7376,7 +7365,7 @@ pub const CudaBackend = struct {
     /// 10,500 launches for a 525-token prefill (48 GDN layers), whose device
     /// time was 42 ms but whose wall clock was 641 ms.  Deleting the loop
     /// outright (measurement only) took prefill 299 -> 453 tok/s.
-    fn dGdnStepRowsChunk_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsChunk_body(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                               q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                               gamma: backend.Buf, beta: backend.Buf,
                               heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -7495,7 +7484,7 @@ pub const CudaBackend = struct {
     ///
     /// 代价：只有 decode 的 verify 会调（`rows <= spec_verify_rows`），prefill
     /// 热路径完全不受影响。
-    fn dGdnStepRowsSnap_body(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsSnap_body(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                              q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                              gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
                              heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -7551,7 +7540,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.gdnStepRowsSnap(.{}, @ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
-    fn dGdnStepRowsSnap(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsSnap(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                         q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                         gamma: backend.Buf, beta: backend.Buf, snap: backend.Buf,
                         heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -7563,7 +7552,7 @@ pub const CudaBackend = struct {
         dGdnStepRowsSnap_body(g, ctx, state, k, v, q, km, delta, out, gamma, beta, snap, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
 
-    fn dGdnStepRowsChunk(g: backend.Graph, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStepRowsChunk(g: backend.StepCtx, ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                          q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
@@ -7576,7 +7565,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `gdnGamma` slot, timed (`$QWEN35_PROF`).
-    fn dGdnGamma(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+    fn dGdnGamma(g: backend.StepCtx, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
@@ -7587,7 +7576,7 @@ pub const CudaBackend = struct {
 
     /// The prefill-only GDN prelude, timed separately so a profile shows
     /// directly how many launches the per-token form used to cost.
-    fn dGdnPrefillCore(g: backend.Graph, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+    fn dGdnPrefillCore(g: backend.StepCtx, ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
                        wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
                        dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
                        conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
@@ -7602,7 +7591,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `attnDecode` slot, timed (`$QWEN35_PROF`).
-    fn dAttnDecode(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnDecode(g: backend.StepCtx, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
@@ -7620,7 +7609,7 @@ pub const CudaBackend = struct {
     /// a size violation degrades to known-good behaviour instead of a launch on
     /// bad pointers.  The CUDA kernel was gated bit-identical against exactly
     /// that per-row form (`/tmp/gate_attn_chunk.cu`).
-    fn dAttnChunk(g: backend.Graph, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnChunk(g: backend.StepCtx, ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                   vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot0: usize,
                   rows: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize,
                   scale: f32) void {
@@ -7741,7 +7730,7 @@ pub const CudaBackend = struct {
     }
 
     /// `rope64(slot)`, timed (`$QWEN35_PROF`).
-    fn dRope64(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+    fn dRope64(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7785,7 +7774,7 @@ pub const CudaBackend = struct {
     /// live" line and no abandon message with or without this kernel).  It is
     /// kept because that is a property of `graphBegin` for that engine, not of
     /// this op, and it must not become a silent corruption if it changes.
-    fn dRopeRows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn dRopeRows(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7795,7 +7784,7 @@ pub const CudaBackend = struct {
         dRopeRows_body(g, ctx, x, pos, base, rows, heads, hd, rotary_dim);
     }
 
-    fn dRopeRows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
+    fn dRopeRows_body(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize, rotary_dim: usize) void {
         const self = self_(ctx);
         const row_len = heads * hd;
         if (rotary_dim == 64) {
@@ -7827,7 +7816,7 @@ pub const CudaBackend = struct {
     }
 
 
-    fn dRope64Rows(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+    fn dRope64Rows(g: backend.StepCtx, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
@@ -7838,7 +7827,7 @@ pub const CudaBackend = struct {
     }
 
     /// The `convStep` slot, timed (`$QWEN35_PROF`).
-    fn dConvStep(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+    fn dConvStep(g: backend.StepCtx, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
