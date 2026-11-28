@@ -1202,8 +1202,6 @@ const GraphSlot = struct {
     /// 本次重放是否已经把图交给 GPU：只有越过 launch 的失败才意味着
     /// "状态已推进、不能再重跑本步"。
     xd_launched: bool = false,
-    /// capture 已经打开、尚未关闭。防止同一调用栈里重入 `graphBegin`。
-    xd_capturing: bool = false,
     /// 这一槽的图是按多少行录的（`GraphCtl.rows` 的原值）。只有 `.verify`
     /// 需要它：它的行数是草稿块长度，逐轮会变，而一张图的节点数和 buffer
     /// 行数都烘死在录制那一刻。
@@ -2316,13 +2314,13 @@ pub const CudaBackend = struct {
     /// 的录制误当成 B 图的（草稿块就嵌在 verify 的调用栈里面）。
     fn capturing(self: *const CudaBackend, g: backend.Graph) bool {
         if (g.slot >= self.g_slots.len) return false;
-        return self.g_slots[g.slot].xd_capturing;
+        return self.g_slots[g.slot].xd_phase == .rec;
     }
 
     /// 后端级问题：**有没有任何**槽在录。只给拿不到图的统计路径用。
     fn anySlotCapturing(self: *const CudaBackend) bool {
         for (self.g_slots) |s| {
-            if (s.xd_capturing) return true;
+            if (s.xd_phase == .rec) return true;
         }
         return false;
     }
@@ -2357,7 +2355,7 @@ pub const CudaBackend = struct {
     fn graphAbandonAny(self: *CudaBackend, why: []const u8) void {
         var i: u8 = 0;
         while (i < self.g_slots.len) : (i += 1) {
-            if (!self.g_slots[i].xd_capturing) continue;
+            if (self.g_slots[i].xd_phase != .rec) continue;
             self.graphAbandon(.{ .slot = i }, why);
             return;
         }
@@ -2369,7 +2367,7 @@ pub const CudaBackend = struct {
     /// 关掉外层的 capture 而把内层的留着，结果两个槽的状态都不对。
     fn graphAbandon(self: *CudaBackend, g: backend.Graph, why: []const u8) void {
         if (g.slot >= self.g_slots.len) return;
-        if (!self.g_slots[g.slot].xd_capturing) return;
+        if (self.g_slots[g.slot].xd_phase != .rec) return;
         self.stat_g_abandon += 1;
         if (self.stat_g_abandon == 1) {
             std.debug.print(
@@ -2380,8 +2378,7 @@ pub const CudaBackend = struct {
         // ORDER MATTERS: the capture has to be CLOSED first, because until
         // `cudaStreamEndCapture` returns the stream is still "capturing" and any
         // subsequent launch on it fails with `cudaErrorStreamCaptureUnsupported`.
-        self.g_slots[g.slot].xd_capturing = false;
-        if (self.g_slots[g.slot].xd_phase == .rec) self.g_slots[g.slot].xd_phase = .off;
+        self.g_slots[g.slot].xd_phase = .off;
         if (self.cu) |*cu| {
             var cap: ?*anyopaque = null;
             _ = cu.lib.StreamEndCapture(self.g_stream, &cap);
@@ -2523,7 +2520,7 @@ pub const CudaBackend = struct {
             slot.xd_phase = .off;
             return false;
         }
-        slot.xd_capturing = true;
+
         return true;
     }
 
@@ -2584,7 +2581,7 @@ pub const CudaBackend = struct {
             std.debug.print("[gate] batchK_calls={d}\n", .{g_bk_stat.calls});
         }
         var graph: ?*anyopaque = null;
-        s.xd_capturing = false;
+
         const erc = cu.lib.StreamEndCapture(self.g_stream, &graph);
         if (erc != cudart.cudaSuccess or graph == null) {
             if (graph) |gr| _ = cu.lib.GraphDestroy(gr);
@@ -2709,7 +2706,6 @@ pub const CudaBackend = struct {
                     sl.xd_gexec = null;
                 }
                 sl.xd_phase = .off;
-                sl.xd_capturing = false;
             }
             if (self.gs(0).xd_gexec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
@@ -2730,7 +2726,6 @@ pub const CudaBackend = struct {
         }
         for (&self.g_slots) |*sl| {
             sl.xd_phase = .off;
-            sl.xd_capturing = false;
         }
         if (self.stat_g_replay != 0 or self.stat_g_abandon != 0) {
             std.debug.print("cuda: graph replays={d} abandoned-tokens={d}\n", .{
@@ -6678,7 +6673,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         if (!self.gpuReady() or slot >= self.g_slots.len) return;
         const s = self.gs(slot);
-        if (!s.xd_capturing) return;
+        if (s.xd_phase != .rec) return;
         self.xdFinishCapture(s);
     }
 
