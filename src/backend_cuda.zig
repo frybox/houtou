@@ -294,8 +294,8 @@ fn stubNoCudaKernels() c_int {
 /// `dAddResid` …）在调用 body 之前压入、之后弹回，而不是由"当前 span"全局
 /// 决定 —— 后者在嵌套 span（草稿块在 verify 里面）下会拿错槽。
 ///
-/// 现在它只服务于 `$QWEN35_PROF` 的槽级计时，`graphGate` 不再读它：
-/// 录制/重放由引擎显式决定（`Graph.phase`），后端不猜。
+/// 它只服务于 `$QWEN35_PROF` 的槽级计时：录制/重放由引擎显式决定
+/// （`Graph.phase`），后端不猜，op 里也没有任何"该不该发射"的判断。
 var xg_cur_slot: u8 = 0;
 /// 压入 `slot`，返回先前那个（供 `defer` 恢复）。
 inline fn xg_push_slot(slot: u8) u8 {
@@ -304,29 +304,8 @@ inline fn xg_push_slot(slot: u8) u8 {
     return prev;
 }
 
-/// `$QWEN35_GATEDBG` 的累计计数：`graphGate` 被调用多少次、其中多少次是
-/// "图已重放"（即跳过发射）。
-var g_gate_stat: struct { calls: u64 = 0, replayed: u64 = 0, last_kind: []const u8 = "" } = .{};
 /// `$QWEN35_GATEDBG`：`matvecBatchK` 被调用多少次、实际发射多少次。
 var g_bk_stat: struct { calls: u64 = 0, launches: u64 = 0 } = .{};
-
-fn graphGate(g: backend.Graph) bool {
-    // `$QWEN35_GATEDBG`：统计每张图被 gate 跳过多少次、以及最后一次是哪个槽
-    // 的什么 phase。用来回答"capture 里的 op 到底有没有发射"。
-    if (cudart.getenv("QWEN35_GATEDBG") != null) {
-        const st = &g_gate_stat;
-        st.calls += 1;
-        if (g.phase == .replay) st.replayed += 1;
-        st.last_kind = @tagName(g.kind);
-        if (cudart.getenv("QWEN35_GATEDBG").?[0] == '2' and g.phase == .replay) {
-            std.debug.print("[gate] REPLAYED kind={s} slot={d}\n", .{ @tagName(g.kind), g.slot });
-        }
-    }
-    // `.record` 期 op 必须照常发射（CUDA 才录得到），`.replay` 期一律抑制。
-    // 引擎已经在 `.replay` 时整段跳过构建，所以这个 gate 只是第二道防线
-    // （例如某个 op 在跳过的分支之外被发出）。
-    return g.phase == .replay;
-}
 
 /// 编译期解析的 launcher 表。`cuda_linked` 是 comptime 已知的，所以每个字段都
 /// 塌成 extern 或 stub 之一 —— 运行期没有间接跳转
@@ -338,128 +317,128 @@ const Launch = if (cuda_linked) struct {
     const mmq_dp4a_wants = Kernels.q35_mmq_dp4a_wants;
     const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
     fn dequantize(g: backend.Graph, ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_dequantize(ttype, d_src, d_dst, nblocks, stream);
     }
     fn dequantize_row(g: backend.Graph, ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_dequantize_row(ttype, d_src_row, d_dst, cols, stream);
     }
     /// 多行行反量化，行号从每步控制块读。见 `api.h`。
     fn dequantize_rows_ctl(g: backend.Graph, ttype: c_int, d_src_base: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, row_bytes: c_int, d_ctl: ?*const anyopaque, rows: c_int, scratch: ?[*]c_int, scratch_ints: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_dequantize_rows_ctl(ttype, d_src_base, d_dst, cols, row_bytes, d_ctl, rows, scratch, scratch_ints, stream);
     }
     fn mul_mat_vec(g: backend.Graph, d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_mul_mat_vec(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
     fn mul_mat_vec_f32(g: backend.Graph, d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_mul_mat_vec_f32(d_w, d_x, d_out, rows, cols, tokens, stream);
     }
     fn mul_mat_vec_w16(g: backend.Graph, d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_mul_mat_vec_w16(d_w, d_x, d_out, rows, cols, tokens, ttype, stream);
     }
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
     fn scale_vec(g: backend.Graph, d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_scale_vec(d_x, s, n, stream);
     }
     fn l2norm_qk_scale(g: backend.Graph, d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_l2norm_qk_scale(d_x, nk, kd, k_offset, eps, qscale, stream);
     }
     /// 是转发器，不是别名。`g` 决定这次发射是被录制、被重放还是直接执行（见
     /// `graphDispatch`）；其余参数就是 kernel 自己的参数，所以调用点上的
     /// `Launch.x(a, b, c)` 读起来和它包装的 launcher 一模一样。
     fn add_resid(g: backend.Graph, dst: ?[*]f32, src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_add_resid(dst, src, n, stream);
     }
     fn copy_range(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_copy_range(d_dst, d_src, n, stream);
     }
     fn copy_range_rows_ctl(g: backend.Graph, d_dst: ?[*]f32, d_src: ?[*]const f32, row_elems: c_int, d_ctl: ?*const anyopaque, cap_elems: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_copy_range_rows_ctl(d_dst, d_src, row_elems, d_ctl, cap_elems, stream);
     }
     fn kv_quant(g: backend.Graph, d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_kv_quant(d_x, d_out, nblocks, kind, stream);
     }
     fn kv_quant_dslot(g: backend.Graph, d_x: ?[*]const f32, d_out_base: ?*anyopaque, d_slot: ?*const c_int, nblocks_per_row: c_int, rows_this: c_int, row_bytes: c_int, kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_kv_quant_dslot(d_x, d_out_base, d_slot, nblocks_per_row, rows_this, row_bytes, kind, stream);
     }
     fn attn_chunk_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, d_slot0: ?[*]const c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_chunk_dyn(d_q, d_gate, d_kcache, d_vcache, d_gout, d_slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_dyn_smem = Kernels.q35_attn_chunk_dyn_smem;
     const func_kv_quant_dslot = Kernels.q35_func_kv_quant_dslot;
     fn deinterleave_qg(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_deinterleave_qg(d_q, d_gate, d_src, heads, hd, stream);
     }
     fn deinterleave_qg_strided(g: backend.Graph, d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_deinterleave_qg_strided(d_q, d_gate, d_src, heads, hd, tokens, stream);
     }
     fn zero_buf(g: backend.Graph, d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_zero_buf(d_buf, n, stream);
     }
     fn rmsnorm(g: backend.Graph, d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rmsnorm(d_out, d_x, d_w, rows, n, eps, stream);
     }
     fn l2norm(g: backend.Graph, d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_l2norm(d_x, rows, n, eps, stream);
     }
     fn silu(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_silu(d_x, n, stream);
     }
     fn mul_silu(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_mul_silu(d_out, d_gate, n, stream);
     }
     fn mul_sigmoid(g: backend.Graph, d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_mul_sigmoid(d_out, d_gate, n, stream);
     }
     fn swiglu(g: backend.Graph, d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_swiglu(d_gate, d_up, n, stream);
     }
     fn softmax(g: backend.Graph, d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_softmax(d_x, n, stream);
     }
     fn conv_step(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_conv_step(d_conv, d_y, d_wconv, n, stream);
     }
     fn argmax(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_argmax(d_x, n, d_out, stream);
     }
     fn argmax_batch(g: backend.Graph, d_x: ?[*]const f32, n: c_int, rows: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_argmax_batch(d_x, n, rows, d_out, stream);
     }
     fn argmax_conf(g: backend.Graph, d_x: ?[*]const f32, n: c_int, d_out: ?[*]c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_argmax_conf(d_x, n, d_out, stream);
     }
     fn sample(g: backend.Graph, d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_sample(d_logits, n, d_ctl, d_scratch, stream);
     }
     const sample_init = Kernels.q35_launch_sample_init;
@@ -467,55 +446,55 @@ const Launch = if (cuda_linked) struct {
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
     fn attn_decode(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_decode(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_chunk(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_chunk(d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     const attn_chunk_max_rows = Kernels.q35_attn_chunk_max_rows;
     fn attn_decode_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_decode_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_decode_coal(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_decode_coal(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, kv_kind, stream);
     }
     fn attn_decode_split2(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_decode_split2(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
     fn attn_decode_split_dyn(g: backend.Graph, d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, kv_kind: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_attn_decode_split_dyn(d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, kv_kind, stream);
     }
     const set_int1 = Kernels.q35_launch_set_int1;
     const copy_range_dslot = Kernels.q35_launch_copy_range_dslot;
     const xd_ctl_publish = Kernels.q35_launch_xd_ctl_publish;
     fn gdn_step(g: backend.Graph, d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_step(d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream);
     }
     fn gdn_step_rows(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_step_rows(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream);
     }
     fn gdn_step_rows_chunk(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_step_rows_chunk(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_step_rows_snap(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, d_snap: ?[*]f32, nsnap: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_step_rows_snap(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, d_snap, nsnap, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_step_wy(g: backend.Graph, d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_step_wy(d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream);
     }
     fn gdn_gamma(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_gamma(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream);
     }
     // 仅 prefill 使用的按行/跨步孪生版本。列在这里（并在 stub 分支里以同样顺序
@@ -524,40 +503,40 @@ const Launch = if (cuda_linked) struct {
     // 变成死代码，并让 `zig build`（不带 -Dcuda）在**链接期**因未定义符号失败
     // —— 这类失败是上面的类型错误抓不到的。
     fn conv_step_rows(g: backend.Graph, d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_conv_step_rows(d_conv, d_y, d_wconv, n, tokens, y_stride, stream);
     }
     fn gdn_gamma_rows(g: backend.Graph, d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_gdn_gamma_rows(d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream);
     }
     fn l2norm_strided(g: backend.Graph, d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_l2norm_strided(d_x, row_offset, rows, n, eps, tokens, row_stride, stream);
     }
     fn scale_vec_strided(g: backend.Graph, d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_scale_vec_strided(d_x, offset, s, n, tokens, stride, stream);
     }
     fn rope64(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rope64(d_x, heads, hd, pos, base, stream);
     }
     fn rope64_dpos(g: backend.Graph, d_x: ?[*]f32, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rope64_dpos(d_x, heads, hd, d_ctl, stream);
     }
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
     fn rope64_rows(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rope64_rows(d_x, rows, heads, hd, pos0, base, stream);
     }
     fn rope_rows_dim(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, rotary_dim: c_int, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rope_rows_dim(d_x, rows, heads, hd, pos0, base, rotary_dim, stream);
     }
     fn rope64_rows_dpos(g: backend.Graph, d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_ctl: ?*const anyopaque, stream: ?*anyopaque) c_int {
-        if (graphGate(g)) return 0;
+        _ = g;
         return Kernels.q35_launch_rope64_rows_dpos(d_x, rows, heads, hd, d_ctl, stream);
     }
 } else struct {
@@ -2602,7 +2581,7 @@ pub const CudaBackend = struct {
             std.debug.print("[xg] finish capture, phase={s}\n", .{@tagName(s.xd_phase)});
         }
         if (cudart.getenv("QWEN35_GATEDBG") != null) {
-            std.debug.print("[gate] total={d} replayed={d} batchK_calls={d}\n", .{ g_gate_stat.calls, g_gate_stat.replayed, g_bk_stat.calls });
+            std.debug.print("[gate] batchK_calls={d}\n", .{g_bk_stat.calls});
         }
         var graph: ?*anyopaque = null;
         s.xd_capturing = false;
@@ -3245,7 +3224,6 @@ pub const CudaBackend = struct {
 
     fn vMatvec_body(g: backend.Graph, ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
             self.clearDevBuf(outBuf);
@@ -4042,7 +4020,6 @@ pub const CudaBackend = struct {
     /// device (mirrors `dCopyRange`), never the normal route.
     fn dKvAppend_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize, kv_dim: usize, rows: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (rows == 0) return;
         // f32: the historical path, unchanged (and graph-identical) -- except
         // that a replayed/recorded step takes its ROW from the control block so
@@ -4302,7 +4279,6 @@ pub const CudaBackend = struct {
 
     fn dScaleVec_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.scale_vec(g, px, s, @intCast(x.len), self.launchStream());
@@ -4315,7 +4291,6 @@ pub const CudaBackend = struct {
 
     fn dAddResid_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
         // zips the two slices).  A mismatch is an engine bug, so refuse to guess
         // rather than silently truncating to the shorter.
@@ -4370,7 +4345,6 @@ pub const CudaBackend = struct {
     /// (`kvAppend` decides which row) and is not needed here.
     fn dCopyRangeSlot_body(g: backend.Graph, ctx: *anyopaque, dst: backend.Buf, src: backend.Buf, slot: usize) void {
         _ = slot;
-        if (graphGate(g)) return;
         CudaBackend.dCopyRange_body(g, ctx, dst, src);
     }
 
@@ -4406,7 +4380,6 @@ pub const CudaBackend = struct {
 
     fn dZeroBuf_body(g: backend.Graph, ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (self.cu != null) {
             if (dBufPtr(buf)) |p| {
                 const rc = Launch.zero_buf(g, p, @intCast(buf.len), self.launchStream());
@@ -4519,7 +4492,6 @@ pub const CudaBackend = struct {
 
     fn dRmsnorm_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // The CPU reference asserts out.len == x.len == w.len (one row).  The
         // kernel supports several rows (w reused per row) for the shape the
         // engine does not currently produce, so the only mismatch worth
@@ -4549,7 +4521,6 @@ pub const CudaBackend = struct {
     /// geometry does not hold, which is what the CPU side does anyway.
     fn dRmsnormRows_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         const n = w.len;
         if (rows_in != 0 and n != 0 and x.len == rows_in * n and out.len == rows_in * n and self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -4603,7 +4574,6 @@ pub const CudaBackend = struct {
 
     fn dSiluInPlace_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.silu(g, px, @intCast(x.len), self.launchStream());
@@ -4616,7 +4586,6 @@ pub const CudaBackend = struct {
 
     fn dMulSilu_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
             cpu_mod.CpuBackend.vtable.mulSilu(.{}, @ptrCast(&self.cpu), out, gate);
@@ -4636,7 +4605,6 @@ pub const CudaBackend = struct {
 
     fn dMulSigmoid_body(g: backend.Graph, ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
             cpu_mod.CpuBackend.vtable.mulSigmoid(.{}, @ptrCast(&self.cpu), out, gate);
@@ -4656,7 +4624,6 @@ pub const CudaBackend = struct {
 
     fn dSwiglu_body(g: backend.Graph, ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (up.len != gate.len) {
             std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
             cpu_mod.CpuBackend.vtable.swiglu(.{}, @ptrCast(&self.cpu), gate, up);
@@ -4676,7 +4643,6 @@ pub const CudaBackend = struct {
 
     fn dSoftmax_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
                 const rc = Launch.softmax(g, px, @intCast(x.len), self.launchStream());
@@ -5131,7 +5097,6 @@ pub const CudaBackend = struct {
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // vd != 128 is the CPU `gdnFused`'s slow path (four separate kernels);
         // the device kernel is written for the fast path only, so route the odd
         // shape to the CPU rather than launching a kernel that would refuse.
@@ -5175,7 +5140,6 @@ pub const CudaBackend = struct {
                          gamma: backend.Buf, beta: backend.Buf,
                          heads: usize, nk: usize, kd: usize, vd: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and
             gamma.len >= heads and beta.len >= heads and
             state.len >= heads * kd * vd and k.len >= nk * kd and q.len >= nk * kd and
@@ -5231,7 +5195,6 @@ pub const CudaBackend = struct {
     fn dGdnGamma_body(g: backend.Graph, ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // Every operand here is a backend region.  The two weight rows
         // (`ssm_a`, `dt_bias`) are per-layer constants and, like the norm
         // weights, are device `Buf`s uploaded exactly once at load time
@@ -5386,7 +5349,6 @@ pub const CudaBackend = struct {
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // `kcache`/`vcache` 是本层 cache 的前 `slot+1` 行，所以它们的尺寸是
         // (slot+1)*kv_dim 而不是 max_seq*kv_dim（引擎传的就是这段跨度）。`att`
         // 需要 slot+1 个 float。
@@ -5572,7 +5534,6 @@ pub const CudaBackend = struct {
 
     fn dRope64_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         const max_head: usize = 256;
         var host: [max_head]f32 = undefined;
         const n = @min(x.len, max_head);
@@ -5670,7 +5631,6 @@ pub const CudaBackend = struct {
     /// out to the per-row loop when a capture is live.  Prefill does not capture.
     fn dRope64Rows_body(g: backend.Graph, ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         const row_len = heads_in * hd_in;
         if (!ropeOnDevice() or
             heads_in == 0 or hd_in < 64 or rows_in == 0 or
@@ -5718,7 +5678,6 @@ pub const CudaBackend = struct {
 
     fn dConvStep_body(g: backend.Graph, ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
-        if (graphGate(g)) return;
         // `conv` is the GDN sliding window and is BOTH read and written (the
         // kernel shifts it in place); `y` likewise (read as the 4th tap, then
         // overwritten).  Both are device-resident, so both are passed directly.
@@ -6953,7 +6912,6 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const xg_prev = xg_push_slot(g.slot);
         defer xg_cur_slot = xg_prev;
-        if (graphGate(g)) return;
         if (row_elems == 0) return;
         const cap = @min(dst.len, src.len);
         if (cap == 0) return;
@@ -6992,7 +6950,6 @@ pub const CudaBackend = struct {
         defer xg_cur_slot = xg_prev;
         const t0 = self.slotEnter();
         defer self.slotExit(.dequant_row, t0);
-        if (graphGate(g)) return;
 
         const rows: usize = g.ctl.rows;
         const cols = w.cols();
